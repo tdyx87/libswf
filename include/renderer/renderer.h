@@ -748,9 +748,7 @@ private:
     void applyFillStyle(Gdiplus::Graphics& g, const Gdiplus::GraphicsPath& path,
                         const FillStyle& fill, const ColorTransform& cx);
 #else
-    // Software rendering methods (default on Windows without GDI+)
-    void renderFrameSoftware();
-    // Software rendering methods for Linux
+    // Software rendering methods (default on Windows without GDI+ and Linux)
     void renderFrameSoftware();
     void renderShapeSoftware(const ShapeTag* shape, const Matrix& matrix, const ColorTransform& cx);
     void applyFillStyleSoftware(const FillStyle& fill, const ColorTransform& cx);
