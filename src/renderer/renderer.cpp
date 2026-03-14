@@ -2399,5 +2399,8 @@ void ImageBuffer::composite(const ImageBuffer& src, int32 dstX, int32 dstY, Blen
 
 // ============================================================================
 
+#endif // RENDERER_GDIPLUS
+
+#endif // RENDERER_GDIPLUS
 
 } // namespace libswf
