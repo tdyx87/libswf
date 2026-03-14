@@ -197,9 +197,9 @@ libswf 是一个用于解析和操作 SWF (Shockwave Flash) 文件的 C++ 库。
   - `lineStyle(thickness, color, alpha)` - 设置线条样式 ✅
   - `clear()` - 清除绘图 ✅
 
-##### Native 方法完善
-- **String**: `fromCharCode`, `charAt`, `charCodeAt`, `indexOf`, `lastIndexOf`, `substr`, `substring`, `split`, `toLowerCase`, `toUpperCase` 等
-- **Array**: `push`, `pop`, `shift`, `unshift`, `join`, `slice`, `splice`, `reverse`, `sort`, `concat`, `indexOf`, `forEach` 等
+##### Native 方法完善 ✅
+- **String**: `fromCharCode`, `charAt`, `charCodeAt`, `indexOf`, `lastIndexOf`, `substr`, `substring`, `split`, `toLowerCase`, `toUpperCase`, `trim`, `replace`, `match`, `search` ✅
+- **Array**: `push`, `pop`, `shift`, `unshift`, `join`, `slice`, `splice`, `reverse`, `sort`, `concat`, `indexOf`, `forEach`, `map`, `filter`, `reduce`, `find`, `includes`, `every`, `some` ✅
 
 #### 3. 渲染器完善 ✅ 已完成
 - [x] Linux Cairo 渲染实现 (PNG/PDF 导出)
@@ -212,7 +212,7 @@ libswf 是一个用于解析和操作 SWF (Shockwave Flash) 文件的 C++ 库。
 #### 4. 工具链
 - [x] **资源提取工具** (swf_extract) - 从 SWF 中提取图片、声音、字体、形状
 - [ ] SWF 编辑器
-- [ ] SWF 优化器
+- [x] **SWF 优化器** (swf_optimizer) - 压缩、移除未使用资源、优化形状数据
 
 ## 构建说明
 
@@ -266,6 +266,31 @@ make -j4
 # - output_dir/fonts/     - 字体信息
 # - output_dir/shapes/    - 形状描述
 # - output_dir/report.txt - 提取报告
+```
+
+### SWF 优化器工具
+```bash
+# 分析 SWF 文件结构
+./bin/swf_optimizer analyze input.swf
+
+# 优化 SWF 文件（默认配置）
+./bin/swf_optimizer optimize input.swf output.swf
+
+# 自定义优化选项
+./bin/swf_optimizer optimize input.swf output.swf --no-metadata --quality 90
+
+# 优化选项:
+# --no-metadata    - 保留元数据标签
+# --no-debug       - 保留调试信息
+# --no-compress    - 输出未压缩的 SWF
+# --quality <N>    - JPEG 压缩质量 (1-100, 默认: 85)
+
+# 优化器功能:
+# - 移除元数据和调试标签
+# - 移除未使用的符号定义
+# - 优化形状数据
+# - 压缩图像数据
+# - 生成详细的优化报告
 ```
 
 ## 使用示例
