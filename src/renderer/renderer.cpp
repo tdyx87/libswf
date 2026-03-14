@@ -2399,3 +2399,5 @@ void ImageBuffer::composite(const ImageBuffer& src, int32 dstX, int32 dstY, Blen
 
 // ============================================================================
 
+
+} // namespace libswf
