@@ -1804,11 +1804,6 @@ void SWFRenderer::clearDynamicDisplayObjects() {
 // ImageBuffer Blend Modes and Filter Effects Implementation
 // ============================================================================
 
-namespace libswf {
-
-// Note: ImageBuffer is a standalone struct (not in libswf namespace)
-// But its methods need to be in libswf namespace to match header declaration
-// ============================================================================
 // Note: ImageBuffer is a standalone struct (not in libswf namespace)
 
 std::vector<float> ImageBuffer::createGaussianKernel(float radius) {
@@ -2410,5 +2405,3 @@ void ImageBuffer::composite(const ImageBuffer& src, int32 dstX, int32 dstY, Blen
 #endif // RENDERER_GDIPLUS
 
 #endif // RENDERER_GDIPLUS
-
-} // namespace libswf
