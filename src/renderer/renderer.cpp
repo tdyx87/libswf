@@ -1799,7 +1799,15 @@ void SWFRenderer::clearDynamicDisplayObjects() {
 
 } // namespace libswf
 
+
+// ============================================================================
 // ImageBuffer Blend Modes and Filter Effects Implementation
+// ============================================================================
+
+namespace libswf {
+
+// Note: ImageBuffer is a standalone struct (not in libswf namespace)
+// But its methods need to be in libswf namespace to match header declaration
 // ============================================================================
 // Note: ImageBuffer is a standalone struct (not in libswf namespace)
 
