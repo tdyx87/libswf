@@ -1796,9 +1796,10 @@ void SWFRenderer::clearDynamicDisplayObjects() {
     dynamicDisplayObjects_.clear();
 }
 
+#endif // RENDERER_GDIPLUS
+#endif // RENDERER_GDIPLUS
 
 } // namespace libswf
-
 
 // ============================================================================
 // ImageBuffer Blend Modes and Filter Effects Implementation
@@ -2402,6 +2403,6 @@ void ImageBuffer::composite(const ImageBuffer& src, int32 dstX, int32 dstY, Blen
 
 // ============================================================================
 
-#endif // RENDERER_GDIPLUS
+#ifdef RENDERER_GDIPLUS
 
 #endif // RENDERER_GDIPLUS
