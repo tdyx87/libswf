@@ -1,0 +1,1 @@
+conan install . -of out/conan/x86-static-debug -pr:h conan/profiles/win-x86-static-release-2017 -pr:b conan/profiles/win-x86-static-release-2017 --build=missing -s compiler.runtime=static -s build_type=Debug
