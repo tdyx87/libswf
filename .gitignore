@@ -1,0 +1,81 @@
+补充C++标准忽略模板
+# C++标准库
+*.o
+*.obj
+*.so
+*.dll
+*.exe
+*.out
+*.a
+*.dylib
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+# CMake构建文件
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+# Visual Studio生成文件
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.suo
+*.user
+*.ncb
+*.sdf
+*.opensdf
+*.cache
+*.pdb
+# 其他常见的构建文件
+build/
+dist/
+out/
+*.zip
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.7z
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+# 忽略IDE和编辑器生成的文件
+.idea/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+# 忽略操作系统生成的文件
+.DS_Store
+Thumbs.db
+# 忽略其他不必要的文件
+*.env
+*.local
+*.cache
+*.config
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+# 忽略特定的文件或目录
+# 例如：
+# 忽略特定的源文件
+# src/secret.cpp
+# 忽略特定的头文件
+# include/secret.h
+# 忽略特定的资源文件
+# resources/secret.txt
+# 忽略特定的测试文件
+# tests/secret_test.cpp
+# 忽略特定的文档文件
+# docs/secret.md
+# 忽略特定的配置文件
+# config/secret_config.yaml
+# 忽略特定的日志文件
+# logs/secret.log
+# 忽略特定的临时文件
+# temp/secret.tmp

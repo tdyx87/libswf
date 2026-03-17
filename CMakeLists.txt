@@ -1,3 +1,7 @@
 cmake_minimum_required(VERSION 3.18)
 project(proj)
+find_package(ZLIB REQUIRED)
 add_executable(proj main.cpp)
+target_compile_definitions(proj PRIVATE _UNICODE)
+target_compile_options(proj PRIVATE "/utf-8")
+target_link_libraries(proj ZLIB::ZLIB)
