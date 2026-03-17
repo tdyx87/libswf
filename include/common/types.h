@@ -98,6 +98,44 @@ struct Matrix {
         x = newX + translateX;
         y = newY + translateY;
     }
+    
+    // Multiply this matrix by another (this = other * this)
+    Matrix multiply(const Matrix& other) const {
+        Matrix result;
+        
+        // Combine scale
+        if (hasScale || other.hasScale) {
+            result.scaleX = (hasScale ? scaleX : 1.0f) * (other.hasScale ? other.scaleX : 1.0f);
+            result.scaleY = (hasScale ? scaleY : 1.0f) * (other.hasScale ? other.scaleY : 1.0f);
+            result.hasScale = true;
+        }
+        
+        // Combine rotation (simplified - full 2x2 matrix multiply)
+        if (hasRotate || other.hasRotate) {
+            float a = hasScale ? scaleX : 1.0f;
+            float b = hasRotate ? rotate0 : 0.0f;
+            float c = hasRotate ? rotate1 : 0.0f;
+            float d = hasScale ? scaleY : 1.0f;
+            
+            float e = other.hasScale ? other.scaleX : 1.0f;
+            float f = other.hasRotate ? other.rotate0 : 0.0f;
+            float g = other.hasRotate ? other.rotate1 : 0.0f;
+            float h = other.hasScale ? other.scaleY : 1.0f;
+            
+            result.rotate0 = a * f + b * h;
+            result.rotate1 = c * f + d * h;
+            result.scaleX = a * e + b * g;
+            result.scaleY = c * e + d * g;
+            result.hasRotate = (result.rotate0 != 0.0f || result.rotate1 != 0.0f);
+            result.hasScale = (result.scaleX != 1.0f || result.scaleY != 1.0f);
+        }
+        
+        // Combine translation
+        result.translateX = translateX + other.translateX;
+        result.translateY = translateY + other.translateY;
+        
+        return result;
+    }
 };
 
 // Color transform (CXFORM)

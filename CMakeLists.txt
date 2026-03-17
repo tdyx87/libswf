@@ -64,6 +64,10 @@ set(PARSER_SOURCES
 
 set(RENDERER_SOURCES
     src/renderer/renderer.cpp
+    src/renderer/unified_renderer.cpp
+    src/renderer/software_backend.cpp
+    src/renderer/cairo_backend.cpp
+    src/renderer/gdiplus_backend.cpp
 )
 
 set(AVM2_SOURCES

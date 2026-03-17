@@ -61,3 +61,8 @@ target_include_directories(swf_extract PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_executable(swf_optimizer swf_optimizer.cpp)
 target_link_libraries(swf_optimizer PRIVATE swf)
 target_include_directories(swf_optimizer PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+# Renderer Abstraction Demo
+add_executable(renderer_abstraction_demo renderer_abstraction_demo.cpp)
+target_link_libraries(renderer_abstraction_demo PRIVATE swf)
+target_include_directories(renderer_abstraction_demo PRIVATE ${CMAKE_SOURCE_DIR}/include)

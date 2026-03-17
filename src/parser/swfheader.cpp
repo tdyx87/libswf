@@ -15,8 +15,8 @@
 namespace libswf {
 
 SWFHeader SWFHeaderParser::parse(const std::vector<uint8>& data) {
-    if (data.size() < 12) {
-        throw std::runtime_error("SWF file too small");
+    if (data.size() < 8) {
+        throw std::runtime_error("SWF file too small (need at least 8 bytes)");
     }
     
     SWFHeader header;
@@ -38,12 +38,22 @@ SWFHeader SWFHeaderParser::parse(const std::vector<uint8>& data) {
     // Read file length (little-endian, same as x86)
     memcpy(&header.fileLength, &data[4], 4);
     
-    // For ZWS (LZMA), the header is larger
-    size_t headerOffset = 8;
-    if (header.signature == "ZWS") {
-        // ZWS has additional LZMA properties before the RECT
-        headerOffset = 17;  // 8 + 4 (compressed size) + 5 (LZMA properties)
+    // For CWS/ZWS, we can't parse RECT/frameRate/frameCount until decompressed
+    // Just return basic info for now - will be re-parsed after decompression
+    if (header.compressed) {
+        header.frameSize = Rect();
+        header.frameRate = 0;
+        header.frameCount = 0;
+        header.headerSize = 8;  // Minimum for parsing tags after decompression
+        return header;
     }
+    
+    // For FWS (uncompressed), parse full header
+    if (data.size() < 12) {
+        throw std::runtime_error("Uncompressed SWF file too small for full header");
+    }
+    
+    size_t headerOffset = 8;
     
     // Parse frame size (RECT)
     BitStream bs(data.data() + headerOffset, data.size() - headerOffset);
@@ -59,11 +69,17 @@ SWFHeader SWFHeaderParser::parse(const std::vector<uint8>& data) {
     
     // Read frame rate (fixed8) - little endian
     size_t pos = bs.bytePos();
+    if (headerOffset + pos + 2 > data.size()) {
+        throw std::runtime_error("SWF file too small for frame rate");
+    }
     uint16 frameRateValue = data[headerOffset + pos] | (data[headerOffset + pos + 1] << 8);
     header.frameRate = frameRateValue / 256.0f;
     pos += 2;
     
     // Read frame count - little endian
+    if (headerOffset + pos + 2 > data.size()) {
+        throw std::runtime_error("SWF file too small for frame count");
+    }
     header.frameCount = data[headerOffset + pos] | (data[headerOffset + pos + 1] << 8);
     pos += 2;
     
@@ -121,6 +137,22 @@ SWFHeader SWFHeaderParser::parseFromFile(const std::string& filename) {
 std::vector<uint8> SWFHeaderParser::decompressZlib(const uint8* compressed,
                                                        uint32 compressedSize,
                                                        uint32 uncompressedSize) {
+    // Sanity check on sizes
+    if (compressedSize == 0) {
+        throw std::runtime_error("Compressed data is empty");
+    }
+    if (uncompressedSize == 0) {
+        throw std::runtime_error("Uncompressed size is zero");
+    }
+    // Reasonable limit: 500MB
+    const uint32 MAX_SIZE = 500 * 1024 * 1024;
+    if (uncompressedSize > MAX_SIZE) {
+        throw std::runtime_error("Uncompressed size exceeds maximum allowed (500MB)");
+    }
+    if (compressedSize > MAX_SIZE) {
+        throw std::runtime_error("Compressed size exceeds maximum allowed (500MB)");
+    }
+    
     std::vector<uint8> result(uncompressedSize);
     
     z_stream stream = {};
@@ -137,8 +169,21 @@ std::vector<uint8> SWFHeaderParser::decompressZlib(const uint8* compressed,
     ret = inflate(&stream, Z_FINISH);
     inflateEnd(&stream);
     
-    if (ret != Z_STREAM_END) {
-        throw std::runtime_error("Failed to decompress zlib data");
+    if (ret == Z_NEED_DICT) {
+        throw std::runtime_error("Decompression failed: preset dictionary needed");
+    } else if (ret == Z_DATA_ERROR) {
+        throw std::runtime_error("Decompression failed: corrupted data");
+    } else if (ret == Z_MEM_ERROR) {
+        throw std::runtime_error("Decompression failed: insufficient memory");
+    } else if (ret != Z_STREAM_END) {
+        throw std::runtime_error("Decompression failed: incomplete or corrupt data");
+    }
+    
+    // Verify we got the expected amount of data
+    if (stream.total_out != uncompressedSize) {
+        // This can happen if fileLength is wrong
+        // Resize to actual size and return anyway
+        result.resize(stream.total_out);
     }
     
     return result;

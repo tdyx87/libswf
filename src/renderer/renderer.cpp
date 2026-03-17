@@ -1,7 +1,6 @@
 #include "renderer/renderer.h"
 #include "avm2/avm2.h"
 #include "avm2/avm2_renderer_bridge.h"
-#include "audio/audio_player.h"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -10,21 +9,6 @@
 namespace libswf {
 
 #ifdef _WIN32
-    // Prevent min/max macro conflicts
-    #ifndef NOMINMAX
-        #define NOMINMAX
-    #endif
-    #ifndef WIN32_LEAN_AND_MEAN
-        #define WIN32_LEAN_AND_MEAN
-    #endif
-    
-    #include <windows.h>
-    
-    #ifdef RENDERER_GDIPLUS
-        #include "common/gdiplus_fix.h"
-    #endif
-
-#ifdef RENDERER_GDIPLUS
 // GDI+ startup
 static ULONG_PTR gdiplusToken = 0;
 static bool gdiplusInitialized = false;
@@ -48,12 +32,6 @@ void ShutdownGdiPlus() {
         gdiplusInitialized = false;
     }
 }
-#else
-// GDI mode - no GDI+ initialization needed
-void InitGdiPlus() {}
-void ShutdownGdiPlus() {}
-#endif
-
 #else
 // Linux stubs
 void InitGdiPlus() {}
@@ -172,7 +150,7 @@ std::shared_ptr<DisplayObject> SWFRenderer::createDisplayObject(uint16 character
 }
 
 void SWFRenderer::render(HDC hdc, int width, int height) {
-#ifdef RENDERER_GDIPLUS
+#ifdef _WIN32
     // Create graphics from HDC
     std::unique_ptr<Gdiplus::Graphics> graphics(Gdiplus::Graphics::FromHDC(hdc));
     
@@ -200,21 +178,21 @@ void SWFRenderer::render(HDC hdc, int width, int height) {
     // Render frame
     renderFrame(*graphics);
 #else
-    // Software rendering stub
-    std::cout << "SWFRenderer::render() - Software rendering stub: " << width << "x" << height << std::endl;
+    // Linux: stub implementation
+    std::cout << "SWFRenderer::render() - Linux stub: " << width << "x" << height << std::endl;
     calculateScale(width, height);
 #endif
 }
 
 void SWFRenderer::renderToImage(int width, int height) {
-#ifdef RENDERER_GDIPLUS
+#ifdef _WIN32
     // Create bitmap
     renderBitmap_ = std::make_unique<Gdiplus::Bitmap>(width, height, PixelFormat32bppARGB);
     renderGraphics_ = std::make_unique<Gdiplus::Graphics>(renderBitmap_.get());
 
     render(renderGraphics_->GetHDC(), width, height);
 #else
-    // Software rendering with ImageBuffer
+    // Linux: use software rendering with ImageBuffer
     imageBuffer_.resize(width, height);
 
     // Clear background
@@ -302,7 +280,7 @@ void SWFRenderer::renderFrame(Gdiplus::Graphics& g) {
             
             // Apply parent's transform would go here in full implementation
             
-            #ifdef RENDERER_GDIPLUS
+            #ifdef _WIN32
             // If object has filters, render to temporary bitmap first
             if (!item.object->filters.empty()) {
                 // Get object bounds for creating temporary bitmap
@@ -366,7 +344,7 @@ void SWFRenderer::renderFrame(Gdiplus::Graphics& g) {
 #ifdef RENDERER_GDIPLUS
 void SWFRenderer::renderShape(Gdiplus::Graphics& g, const ShapeTag* shape,
                                const Matrix& matrix, const ColorTransform& cx) {
-#ifdef RENDERER_GDIPLUS
+#ifdef _WIN32
     if (!shape || shape->records.empty()) {
         return;
     }
@@ -463,12 +441,8 @@ void SWFRenderer::renderShape(Gdiplus::Graphics& g, const ShapeTag* shape,
 #endif
 }
 
-#ifndef RENDERER_GDIPLUS
-// Software rendering implementations for non-GDI+ platforms
-void SWFRenderer::renderFrameSoftware() {
-    // Implementation added above with renderToImage
-}
-
+#ifndef _WIN32
+// Software rendering implementations for Linux
 void SWFRenderer::renderShapeSoftware(const ShapeTag* shape, const Matrix& matrix,
                                        const ColorTransform& cx) {
     if (!shape || shape->records.empty()) return;
@@ -609,7 +583,48 @@ void SWFRenderer::renderShapeSoftware(const ShapeTag* shape, const Matrix& matri
 }
 #endif
 
+#endif // RENDERER_GDIPLUS
+
+#ifndef _WIN32
+// Software rendering for Linux
+void SWFRenderer::renderFrameSoftware() {
+    // Clear display list
+    displayList_.clear();
+    
+    // Build display list from frame data
+    if (currentFrame_ < document_->frames.size()) {
+        const Frame& frame = document_->frames[currentFrame_];
+        
+        // Process display list operations
+        for (const auto& op : frame.displayListOps) {
+            if (op.type == DisplayItem::Type::PLACE) {
+                auto displayObj = createDisplayObject(op.characterId, 1); // type 1 = shape
+                if (displayObj) {
+                    DisplayListItem item;
+                    item.depth = op.depth;
+                    item.characterId = op.characterId;
+                    item.object = displayObj;
+                    item.matrix = op.matrix;
+                    item.cxform = op.cxform;
+                    displayList_.push_back(item);
+                }
+            }
+        }
+    }
+    
+    // Render all display objects to image buffer
+    for (auto& item : displayList_) {
+        if (item.object && item.object->visible) {
+            Matrix worldMatrix = item.matrix;
+            ColorTransform worldCX = item.cxform;
+            item.object->renderSoftware(imageBuffer_, worldMatrix, worldCX);
+        }
+    }
+}
+#endif // !_WIN32
+
 #ifdef RENDERER_GDIPLUS
+#ifdef _WIN32
 // Apply fill style to path
 void SWFRenderer::applyFillStyle(Gdiplus::Graphics& g, const Gdiplus::GraphicsPath& path,
                                   const FillStyle& fill, const ColorTransform& cx) {
@@ -696,19 +711,18 @@ void SWFRenderer::applyFillStyle(Gdiplus::Graphics& g, const Gdiplus::GraphicsPa
             break;
     }
 }
-#endif
+#endif // _WIN32
+#endif // RENDERER_GDIPLUS
 
 #ifdef RENDERER_GDIPLUS
 void SWFRenderer::renderBitmap(Gdiplus::Graphics& g, uint16 bitmapId,
                                const Matrix& matrix, const ColorTransform& cx) {
     // Would load and render bitmap
 }
-#endif
 
-#ifdef RENDERER_GDIPLUS
 void SWFRenderer::renderText(Gdiplus::Graphics& g, const TextTag* text,
                              const Matrix& matrix, const ColorTransform& cx) {
-#ifdef RENDERER_GDIPLUS
+#ifdef _WIN32
     if (!text || text->records.empty()) return;
     
     // Save graphics state
@@ -789,6 +803,7 @@ void SWFRenderer::renderText(Gdiplus::Graphics& g, const TextTag* text,
     // a font rasterization library like FreeType
 #endif
 }
+#endif // RENDERER_GDIPLUS
 
 void SWFRenderer::calculateScale(int windowWidth, int windowHeight) {
     if (stageWidth_ == 0 || stageHeight_ == 0) {
@@ -927,21 +942,8 @@ bool SWFRenderer::isSoundPlaying() const {
 
 // SoundManager implementation
 void SoundManager::registerSound(const SoundTag* sound) {
-    if (!sound) return;
-    
-    sounds_[sound->soundId] = sound;
-    
-    // Also load into audio player if available
-    auto* audioPlayer = GetGlobalAudioPlayer();
-    if (!audioPlayer) {
-        auto player = std::make_unique<AudioPlayer>();
-        if (player->initialize()) {
-            SetGlobalAudioPlayer(std::move(player));
-            audioPlayer = GetGlobalAudioPlayer();
-        }
-    }
-    if (audioPlayer) {
-        audioPlayer->loadSound(sound->soundId, *sound);
+    if (sound) {
+        sounds_[sound->soundId] = sound;
     }
 }
 
@@ -967,50 +969,20 @@ void SoundManager::playSound(const StartSoundTag* soundInfo, uint32_t currentTim
         }
     }
     
-    // Initialize and use audio player for actual playback
-    auto* audioPlayer = GetGlobalAudioPlayer();
-    if (!audioPlayer) {
-        auto player = std::make_unique<AudioPlayer>();
-        if (player->initialize()) {
-            player->loadSound(soundInfo->soundId, *it->second);
-            SetGlobalAudioPlayer(std::move(player));
-            audioPlayer = GetGlobalAudioPlayer();
-        }
-    }
-    
-    if (audioPlayer && !audioPlayer->hasSound(soundInfo->soundId)) {
-        audioPlayer->loadSound(soundInfo->soundId, *it->second);
-    }
-    
-    if (audioPlayer) {
-        // Create playback parameters
-        SoundPlayback params;
-        params.startTime = currentTime;
-        params.loopCount = soundInfo->loopCount;
-        params.volume = 1.0f;
-        params.pan = 0.0f;
-        params.isStream = false;
-        
-        // Envelope data would be parsed from additional tag data
-        // For now, simplified implementation
-        (void)soundInfo->hasEnvelope;
-        
-        // Play via audio system
-        audioPlayer->playSound(soundInfo->soundId, params);
-    }
-    
-    // Also track in active sounds list for state management
+    // Create active sound
     ActiveSound active;
     active.soundId = soundInfo->soundId;
     active.startTime = currentTime;
     active.currentLoop = 0;
     active.position = soundInfo->hasInPoint ? soundInfo->inPoint : 0;
     active.isPlaying = true;
-    active.isStream = false;
+    active.isStream = false; // Will be set by stream sync
     
-    // Envelope data would be parsed from additional tag data
-    // For now, simplified implementation
-    (void)soundInfo->hasEnvelope;
+    // Parse envelope if present
+    if (soundInfo->hasEnvelope) {
+        // Envelope data would be parsed from tag data
+        // For now, simplified implementation
+    }
     
     activeSounds_.push_back(active);
 }
@@ -1045,12 +1017,6 @@ bool SoundManager::syncWithFrame(uint16 frameNum, uint32_t currentTime) {
 }
 
 void SoundManager::update(uint32_t currentTime) {
-    // Update audio player
-    auto* audioPlayer = GetGlobalAudioPlayer();
-    if (audioPlayer) {
-        audioPlayer->update(currentTime);
-    }
-    
     // Update all active sounds
     for (auto& active : activeSounds_) {
         if (!active.isPlaying) continue;
@@ -1091,23 +1057,31 @@ void SoundManager::update(uint32_t currentTime) {
         activeSounds_.end());
 }
 
-#ifdef RENDERER_GDIPLUS
 // ShapeDisplayObject implementation
+#ifdef RENDERER_GDIPLUS
 void ShapeDisplayObject::render(Gdiplus::Graphics& g, const Matrix& parentMatrix,
                                  const ColorTransform& parentCX) {
+#ifdef _WIN32
     // This would need to parse the records and render
     // Simplified version
     (void)g; (void)parentMatrix; (void)parentCX;
-}
 #else
-void ShapeDisplayObject::render(Gdiplus::Graphics& g, const Matrix& parentMatrix,
-                                 const ColorTransform& parentCX) {
     (void)g; (void)parentMatrix; (void)parentCX;
-}
 #endif
+}
+#endif // RENDERER_GDIPLUS
 
+#ifndef RENDERER_GDIPLUS
+void ShapeDisplayObject::renderSoftware(ImageBuffer& buffer, const Matrix& parentMatrix,
+                                        const ColorTransform& parentCX) {
+    // Software rendering implementation for Linux
+    (void)buffer; (void)parentMatrix; (void)parentCX;
+    // TODO: Implement shape rendering using ImageBuffer
+}
+#endif // !RENDERER_GDIPLUS
+
+// BitmapDisplayObject implementation
 #ifdef RENDERER_GDIPLUS
-// BitmapDisplayObject implementation  
 void BitmapDisplayObject::render(Gdiplus::Graphics& g, const Matrix& parentMatrix,
                                   const ColorTransform& parentCX) {
 #ifdef _WIN32
@@ -1134,8 +1108,17 @@ void BitmapDisplayObject::render(Gdiplus::Graphics& g, const Matrix& parentMatri
 }
 #endif // RENDERER_GDIPLUS
 
-#ifdef RENDERER_GDIPLUS
+#ifndef RENDERER_GDIPLUS
+void BitmapDisplayObject::renderSoftware(ImageBuffer& buffer, const Matrix& parentMatrix,
+                                          const ColorTransform& parentCX) {
+    // Software rendering implementation for Linux
+    (void)buffer; (void)parentMatrix; (void)parentCX;
+    // TODO: Implement bitmap rendering using ImageBuffer
+}
+#endif // !RENDERER_GDIPLUS
+
 // TextDisplayObject implementation
+#ifdef RENDERER_GDIPLUS
 void TextDisplayObject::render(Gdiplus::Graphics& g, const Matrix& parentMatrix,
                                 const ColorTransform& parentCX) {
 #ifdef _WIN32
@@ -1218,8 +1201,17 @@ void TextDisplayObject::render(Gdiplus::Graphics& g, const Matrix& parentMatrix,
 }
 #endif // RENDERER_GDIPLUS
 
-#ifdef RENDERER_GDIPLUS
+#ifndef RENDERER_GDIPLUS
+void TextDisplayObject::renderSoftware(ImageBuffer& buffer, const Matrix& parentMatrix,
+                                        const ColorTransform& parentCX) {
+    // Software rendering implementation for Linux
+    (void)buffer; (void)parentMatrix; (void)parentCX;
+    // TODO: Implement text rendering using ImageBuffer
+}
+#endif // !RENDERER_GDIPLUS
+
 // MovieClipDisplayObject implementation
+#ifdef RENDERER_GDIPLUS
 void MovieClipDisplayObject::render(Gdiplus::Graphics& g, const Matrix& parentMatrix,
                                      const ColorTransform& parentCX) {
     for (auto& child : children) {
@@ -1229,6 +1221,18 @@ void MovieClipDisplayObject::render(Gdiplus::Graphics& g, const Matrix& parentMa
     }
 }
 #endif // RENDERER_GDIPLUS
+
+#ifndef RENDERER_GDIPLUS
+void MovieClipDisplayObject::renderSoftware(ImageBuffer& buffer, const Matrix& parentMatrix,
+                                             const ColorTransform& parentCX) {
+    // Software rendering implementation for Linux
+    for (auto& child : children) {
+        if (child && child->visible) {
+            child->renderSoftware(buffer, parentMatrix, parentCX);
+        }
+    }
+}
+#endif // !RENDERER_GDIPLUS
 
 void MovieClipDisplayObject::gotoAndPlay(uint16 frame) {
     currentFrame = frame;
@@ -1309,8 +1313,8 @@ void MovieClipDisplayObject::update() {
     }
 }
 
-#ifdef RENDERER_GDIPLUS
 // ButtonDisplayObject implementation
+#ifdef RENDERER_GDIPLUS
 void ButtonDisplayObject::render(Gdiplus::Graphics& g, const Matrix& parentMatrix,
                                   const ColorTransform& parentCX) {
 #ifdef _WIN32
@@ -1335,6 +1339,15 @@ void ButtonDisplayObject::render(Gdiplus::Graphics& g, const Matrix& parentMatri
 #endif
 }
 #endif // RENDERER_GDIPLUS
+
+#ifndef RENDERER_GDIPLUS
+void ButtonDisplayObject::renderSoftware(ImageBuffer& buffer, const Matrix& parentMatrix,
+                                          const ColorTransform& parentCX) {
+    // Software rendering implementation for Linux
+    (void)buffer; (void)parentMatrix; (void)parentCX;
+    // TODO: Implement button rendering using ImageBuffer
+}
+#endif // !RENDERER_GDIPLUS
 
 const ButtonRecord* ButtonDisplayObject::getRecordForState(ButtonVisualState state) const {
     if (!buttonTag) return nullptr;
@@ -1796,15 +1809,11 @@ void SWFRenderer::clearDynamicDisplayObjects() {
     dynamicDisplayObjects_.clear();
 }
 
-#endif // RENDERER_GDIPLUS
-#endif // RENDERER_GDIPLUS
 
 } // namespace libswf
 
-// ============================================================================
 // ImageBuffer Blend Modes and Filter Effects Implementation
 // ============================================================================
-
 // Note: ImageBuffer is a standalone struct (not in libswf namespace)
 
 std::vector<float> ImageBuffer::createGaussianKernel(float radius) {
@@ -2400,9 +2409,3 @@ void ImageBuffer::composite(const ImageBuffer& src, int32 dstX, int32 dstY, Blen
         }
     }
 }
-
-// ============================================================================
-
-#ifdef RENDERER_GDIPLUS
-
-#endif // RENDERER_GDIPLUS

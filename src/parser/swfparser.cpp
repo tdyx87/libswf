@@ -54,13 +54,49 @@ bool SWFParser::parseFile(const std::string& filename) {
             // Get header first
             document_.header = SWFHeaderParser::parse(data);
             
+            // Validate fileLength
+            if (document_.header.fileLength < 8) {
+                error_ = "Invalid fileLength in header (too small)";
+                return false;
+            }
+            const uint32 MAX_FILE_SIZE = 500 * 1024 * 1024;  // 500MB
+            if (document_.header.fileLength > MAX_FILE_SIZE) {
+                error_ = "File size exceeds maximum allowed (500MB)";
+                return false;
+            }
+            
             // Decompress
             if (sig == "CWS") {
+                // Validate compressed data size
+                if (data.size() <= 8) {
+                    error_ = "Compressed data is too small";
+                    return false;
+                }
+                
                 uint32 compressedSize = static_cast<uint32>(data.size()) - 8;
                 uint32 uncompressedSize = document_.header.fileLength - 8;
                 
+                // Sanity check: compressed data should generally be smaller than uncompressed
+                // unless the data is very small
+                if (compressedSize > uncompressedSize * 2 && uncompressedSize > 1024) {
+                    // This is suspicious but not necessarily an error
+                    // Log a warning but continue
+                }
+                
                 std::vector<uint8> decompressed = SWFHeaderParser::decompressZlib(
                     data.data() + 8, compressedSize, uncompressedSize);
+                
+                // Verify decompressed size matches expected
+                if (decompressed.size() != uncompressedSize) {
+                    int64_t diff = static_cast<int64_t>(decompressed.size()) - static_cast<int64_t>(uncompressedSize);
+                    if (std::abs(diff) > 1024 && std::abs(diff) > uncompressedSize / 10) {
+                        error_ = "Decompressed size mismatch: expected " + 
+                                 std::to_string(uncompressedSize) + ", got " + 
+                                 std::to_string(decompressed.size());
+                        return false;
+                    }
+                    document_.header.fileLength = 8 + decompressed.size();
+                }
                 
                 // Replace with decompressed data (keep first 8 bytes: signature, version, length)
                 data.resize(8 + decompressed.size());
@@ -68,13 +104,36 @@ bool SWFParser::parseFile(const std::string& filename) {
                 data[0] = 'F';  // Change to uncompressed signature
             } else if (sig == "ZWS") {
                 // ZWS format: signature(3) + version(1) + uncompressed_size(4) + compressed_size(4) + lzma_props(5) + compressed_data
+                if (data.size() < 12) {
+                    error_ = "ZWS data is too small for header";
+                    return false;
+                }
+                
                 uint32 compressedSize;
                 memcpy(&compressedSize, data.data() + 8, 4);  // Compressed size at offset 8
                 uint32 uncompressedSize = document_.header.fileLength - 8;
                 
+                // Validate compressedSize
+                if (compressedSize > data.size() - 12) {
+                    error_ = "Invalid compressedSize in ZWS header";
+                    return false;
+                }
+                
                 // LZMA properties are at offset 12 (5 bytes)
                 std::vector<uint8> decompressed = SWFHeaderParser::decompressLZMA(
                     data.data() + 12, compressedSize + 5, uncompressedSize);
+                
+                // Verify decompressed size
+                if (decompressed.size() != uncompressedSize) {
+                    int64_t diff = static_cast<int64_t>(decompressed.size()) - static_cast<int64_t>(uncompressedSize);
+                    if (std::abs(diff) > 1024 && std::abs(diff) > uncompressedSize / 10) {
+                        error_ = "Decompressed size mismatch: expected " + 
+                                 std::to_string(uncompressedSize) + ", got " + 
+                                 std::to_string(decompressed.size());
+                        return false;
+                    }
+                    document_.header.fileLength = 8 + decompressed.size();
+                }
                 
                 // Replace with decompressed data
                 data.resize(8 + decompressed.size());
@@ -87,8 +146,13 @@ bool SWFParser::parseFile(const std::string& filename) {
         }
     }
     
-    // Parse header
-    document_.header = SWFHeaderParser::parse(data);
+    // Parse full header (for CWS this re-parses after decompression)
+    try {
+        document_.header = SWFHeaderParser::parse(data);
+    } catch (const std::exception& e) {
+        error_ = std::string("Header parsing failed: ") + e.what();
+        return false;
+    }
     
     // Parse tags
     return parseInternal(data);
@@ -108,35 +172,108 @@ bool SWFParser::parse(const std::vector<uint8>& data) {
     
     document_.header = SWFHeaderParser::parse(data);
     
+    // Validate fileLength
+    if (document_.header.fileLength < 8) {
+        error_ = "Invalid fileLength in header (too small)";
+        return false;
+    }
+    const uint32 MAX_FILE_SIZE = 500 * 1024 * 1024;  // 500MB
+    if (document_.header.fileLength > MAX_FILE_SIZE) {
+        error_ = "File size exceeds maximum allowed (500MB)";
+        return false;
+    }
+    
     // If compressed, decompress
     std::vector<uint8> workData = data;
     if (document_.header.compressed) {
         if (document_.header.signature == "CWS") {
+            if (data.size() <= 8) {
+                error_ = "Compressed data is too small";
+                return false;
+            }
+            
             uint32 compressedSize = static_cast<uint32>(data.size()) - 8;
             uint32 uncompressedSize = document_.header.fileLength - 8;
+            
             try {
                 std::vector<uint8> decompressed = SWFHeaderParser::decompressZlib(
                     data.data() + 8, compressedSize, uncompressedSize);
+                
+                // Verify decompressed size matches expected
+                if (decompressed.size() != uncompressedSize) {
+                    // Size mismatch - could be corrupted file or wrong fileLength
+                    // Allow if it's within 10% tolerance for safety
+                    int64_t diff = static_cast<int64_t>(decompressed.size()) - static_cast<int64_t>(uncompressedSize);
+                    if (std::abs(diff) > 1024 && std::abs(diff) > uncompressedSize / 10) {
+                        error_ = "Decompressed size mismatch: expected " + 
+                                 std::to_string(uncompressedSize) + ", got " + 
+                                 std::to_string(decompressed.size());
+                        return false;
+                    }
+                    // Update expected fileLength to match actual
+                    document_.header.fileLength = 8 + decompressed.size();
+                }
+                
                 workData.resize(8 + decompressed.size());
                 memcpy(workData.data() + 8, decompressed.data(), decompressed.size());
                 workData[0] = 'F';
+                
+                // Re-parse header after decompression
+                try {
+                    document_.header = SWFHeaderParser::parse(workData);
+                } catch (const std::exception& e) {
+                    error_ = std::string("Header parsing failed: ") + e.what();
+                    return false;
+                }
             } catch (const std::exception& e) {
                 error_ = std::string("Decompression failed: ") + e.what();
                 return false;
             }
         } else if (document_.header.signature == "ZWS") {
             // ZWS format: signature(3) + version(1) + uncompressed_size(4) + compressed_size(4) + lzma_props(5) + compressed_data
+            if (data.size() < 12) {
+                error_ = "ZWS data is too small for header";
+                return false;
+            }
+            
             uint32 compressedSize;
             memcpy(&compressedSize, data.data() + 8, 4);  // Compressed size at offset 8
             uint32 uncompressedSize = document_.header.fileLength - 8;
+            
+            // Validate compressedSize
+            if (compressedSize > data.size() - 12) {
+                error_ = "Invalid compressedSize in ZWS header";
+                return false;
+            }
             
             try {
                 // LZMA properties are at offset 12 (5 bytes), followed by compressed data
                 std::vector<uint8> decompressed = SWFHeaderParser::decompressLZMA(
                     data.data() + 12, compressedSize + 5, uncompressedSize);
+                
+                // Verify decompressed size
+                if (decompressed.size() != uncompressedSize) {
+                    int64_t diff = static_cast<int64_t>(decompressed.size()) - static_cast<int64_t>(uncompressedSize);
+                    if (std::abs(diff) > 1024 && std::abs(diff) > uncompressedSize / 10) {
+                        error_ = "Decompressed size mismatch: expected " + 
+                                 std::to_string(uncompressedSize) + ", got " + 
+                                 std::to_string(decompressed.size());
+                        return false;
+                    }
+                    document_.header.fileLength = 8 + decompressed.size();
+                }
+                
                 workData.resize(8 + decompressed.size());
                 memcpy(workData.data() + 8, decompressed.data(), decompressed.size());
                 workData[0] = 'F';
+                
+                // Re-parse header after decompression
+                try {
+                    document_.header = SWFHeaderParser::parse(workData);
+                } catch (const std::exception& e) {
+                    error_ = std::string("Header parsing failed: ") + e.what();
+                    return false;
+                }
             } catch (const std::exception& e) {
                 error_ = std::string("Decompression failed: ") + e.what();
                 return false;
