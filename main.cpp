@@ -3,6 +3,7 @@
 #include <zlib.h>
 #include <stdexcept>
 #include <fstream>
+#include <swf.h>
 std::vector<unsigned char> decompressData(const std::vector<unsigned char>& compressedData) {
     if (compressedData.empty()) {
         return std::vector<unsigned char>();
@@ -83,19 +84,10 @@ std::vector<unsigned char> decompressDataKnownSize(
     return decompressedData;
 }
 
-
-int main(int argc, char* argv[])
+void decompress(const char*src, const char*dst)
 {
-	if (argc < 2) {
-		std::cerr << "请提供输入文件路径" << std::endl;
-		return 1;
-	}	
-	std::ifstream inputFile(argv[1], std::ios::binary);
-	if (!inputFile) {
-		std::cerr << "无法打开文件" << std::endl;
-		return 1;
-	}
-	try {
+try {
+    std::ifstream inputFile(src, std::ios::binary);
 		inputFile.seekg(0, std::ios::end);
 		size_t fileSize = inputFile.tellg();
 		inputFile.seekg(0, std::ios::beg);
@@ -105,10 +97,10 @@ int main(int argc, char* argv[])
 		std::vector<unsigned char> compressedData(fileSize - 8);
 		inputFile.read(reinterpret_cast<char*>(compressedData.data()), fileSize - 8);
 		std::vector<unsigned char> decompressedData = decompressData(compressedData);
-		std::ofstream outputFile("decompressed_data.bin", std::ios::binary);
+		std::ofstream outputFile(dst, std::ios::binary);
 		if (!outputFile) {
 			std::cerr << "无法创建输出文件" << std::endl;
-			return 1;
+			return;
 		}
 		header[0] = 'F'; // 修改头部标识为未压缩
 		outputFile.write(reinterpret_cast<const char*>(header.data()), header.size());
@@ -116,7 +108,39 @@ int main(int argc, char* argv[])
 		std::cout << "解压成功，输出文件已创建" << std::endl;
 	} catch (const std::exception& e) {
 		std::cerr << "解压失败: " << e.what() << std::endl;
-		return 1;
+		return;
 	}
+}
+
+#define BIT(n) (1 << n) 
+
+void readUB(uint32_t &value, size_t nbits)
+{
+	//01111000
+    uint8_t bitpos = 3;
+	value = 0;
+	if (nbits == 0) return;
+    uint8_t cur_byte =  0x78;
+    for(int i = 0 ; i < nbits;i++)
+    {
+		value += (((cur_byte << bitpos) & (1 << 7)) >> 7) << (nbits- 1 - i);
+        bitpos++;
+        if(bitpos >= 8)
+        {
+            bitpos = 0;
+        }
+    }
+}
+
+
+int main(int argc, char* argv[])
+{
+    uint32_t value;
+    readUB(value, 5);
+    std::cout << "Value: " << value << std::endl;
+
+
+	 SWF swf("F:\\project\\product\\libswf\\test.swf");
+     swf.parse();
 	return 0;
 }
