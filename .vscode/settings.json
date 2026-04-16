@@ -1,5 +1,6 @@
 {
     "editor.defaultFormatter": "ms-vscode.cpptools",
+    "editor.formatOnSave": true,
     "files.exclude": {
         "**/out": true
     }
