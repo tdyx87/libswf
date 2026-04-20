@@ -1,146 +1,42 @@
-#include <iostream>
-#include <vector>
-#include <zlib.h>
-#include <stdexcept>
-#include <fstream>
-#include <swf.h>
-std::vector<unsigned char> decompressData(const std::vector<unsigned char>& compressedData) {
-    if (compressedData.empty()) {
-        return std::vector<unsigned char>();
-    }
+#include "raylib.h"
 
-    // 初始化 zlib 流
-    z_stream stream;
-    stream.zalloc = Z_NULL;
-    stream.zfree = Z_NULL;
-    stream.opaque = Z_NULL;
-    stream.avail_in = 0;
-    stream.next_in = Z_NULL;
+#include <stdlib.h>   
+#include <string.h>
+#include <string>
 
-    // 初始化解压（使用 inflate）
-    int ret = inflateInit(&stream);
-    if (ret != Z_OK) {
-        throw std::runtime_error("inflateInit 失败");
-    }
-
-    std::vector<unsigned char> decompressedData;
-    const size_t CHUNK_SIZE = 16384;  // 16KB 块大小
-    std::vector<unsigned char> outBuffer(CHUNK_SIZE);
-
-    // 设置输入数据
-    stream.avail_in = compressedData.size();
-    stream.next_in = const_cast<Bytef*>(compressedData.data());
-
-    // 解压循环
-    do {
-        stream.avail_out = CHUNK_SIZE;
-        stream.next_out = outBuffer.data();
-
-        ret = inflate(&stream, Z_NO_FLUSH);
-        
-        if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
-            inflateEnd(&stream);
-            throw std::runtime_error("解压过程中发生错误");
-        }
-
-        // 将解压出的数据添加到结果中
-        size_t have = CHUNK_SIZE - stream.avail_out;
-        if (have > 0) {
-            decompressedData.insert(decompressedData.end(), 
-                                   outBuffer.begin(), 
-                                   outBuffer.begin() + have);
-        }
-    } while (ret != Z_STREAM_END);
-
-    // 清理
-    inflateEnd(&stream);
-
-    return decompressedData;
-}
-
-// 简化版本 - 如果知道解压后的大小
-std::vector<unsigned char> decompressDataKnownSize(
-    const std::vector<unsigned char>& compressedData, 
-    size_t decompressedSize) {
-    
-    std::vector<unsigned char> decompressedData(decompressedSize);
-    
-    z_stream stream = {};
-    inflateInit(&stream);
-    
-    stream.avail_in = compressedData.size();
-    stream.next_in = const_cast<Bytef*>(compressedData.data());
-    stream.avail_out = decompressedSize;
-    stream.next_out = decompressedData.data();
-    
-    int ret = inflate(&stream, Z_FINISH);
-    
-    if (ret != Z_STREAM_END) {
-        inflateEnd(&stream);
-        throw std::runtime_error("解压失败");
-    }
-    
-    inflateEnd(&stream);
-    return decompressedData;
-}
-
-void decompress(const char*src, const char*dst)
+ 
+int main(void)
 {
-try {
-    std::ifstream inputFile(src, std::ios::binary);
-		inputFile.seekg(0, std::ios::end);
-		size_t fileSize = inputFile.tellg();
-		inputFile.seekg(0, std::ios::beg);
-		std::vector<unsigned char> header(8);
-		inputFile.read(reinterpret_cast<char*>(header.data()), 8);
-		inputFile.seekg(8, std::ios::beg);
-		std::vector<unsigned char> compressedData(fileSize - 8);
-		inputFile.read(reinterpret_cast<char*>(compressedData.data()), fileSize - 8);
-		std::vector<unsigned char> decompressedData = decompressData(compressedData);
-		std::ofstream outputFile(dst, std::ios::binary);
-		if (!outputFile) {
-			std::cerr << "无法创建输出文件" << std::endl;
-			return;
-		}
-		header[0] = 'F'; // 修改头部标识为未压缩
-		outputFile.write(reinterpret_cast<const char*>(header.data()), header.size());
-		outputFile.write(reinterpret_cast<const char*>(decompressedData.data()), decompressedData.size());
-		std::cout << "解压成功，输出文件已创建" << std::endl;
-	} catch (const std::exception& e) {
-		std::cerr << "解压失败: " << e.what() << std::endl;
-		return;
-	}
-}
-
-#define BIT(n) (1 << n) 
-
-void readUB(uint32_t &value, size_t nbits)
-{
-	//01111000
-    uint8_t bitpos = 3;
-	value = 0;
-	if (nbits == 0) return;
-    uint8_t cur_byte =  0x78;
-    for(int i = 0 ; i < nbits;i++)
+    const int screenWidth = 800;
+    const int screenHeight = 450;
+    InitWindow(screenWidth, screenHeight, "swf播放器");
+    Font font = LoadFontEx("C:/Windows/Fonts/simhei.ttf", 48, nullptr, 30000);
+    SetTextureFilter(font.texture, TEXTURE_FILTER_BILINEAR);
+    SetTargetFPS(60);
+    int seconds = 1;
+    int times = 1;
+    while (!WindowShouldClose()) 
     {
-		value += (((cur_byte << bitpos) & (1 << 7)) >> 7) << (nbits- 1 - i);
-        bitpos++;
-        if(bitpos >= 8)
+        char buffer[100];
+        std::string loading = "Loading";
+        for (int i = 0; i < times; i++)
         {
-            bitpos = 0;
+            loading += ".";
         }
+        if (seconds % 20 == 0)
+        {
+            times++;
+            seconds = 0;
+        }
+            
+        seconds++;
+        if (times == 10) times = 1;
+        BeginDrawing();
+        ClearBackground(RAYWHITE);
+        DrawTextEx(font, loading.c_str(),  { 160, 110 }, 48, 0, BLACK);
+        EndDrawing();
     }
-}
-
-
-int main(int argc, char* argv[])
-{
-    uint32_t value;
-    readUB(value, 5);
-    std::cout << "Value: " << value << std::endl;
-
-
-	 SWF swf("F:\\project\\product\\libswf\\test.swf");
-     swf.parse();
-	return 0;
+    UnloadFont(font);  
+    CloseWindow(); 
+    return 0;
 }
