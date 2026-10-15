@@ -123,8 +123,9 @@ void plot(std::uint8_t* buf, int W, int H, int px, int py, const Color& c) {
 }
 
 // even-odd 扫描线填充一组轮廓（设备坐标），按 Paint 上色
+// alphaMul：对象级透明度（运行时 DisplayObject.alpha 等）乘到源色 alpha 上。
 void fillContours(const std::vector<Contour>& contours, const Matrix& M, const Matrix& Minv,
-                  const Paint& paint, std::uint8_t* buf, int W, int H) {
+                  const Paint& paint, std::uint8_t* buf, int W, int H, float alphaMul = 1.0f) {
     struct Edge { float x0, y0, x1, y1; };
     std::vector<Edge> edges;
     float ymin = 1e9f, ymax = -1e9f;
@@ -174,6 +175,7 @@ void fillContours(const std::vector<Contour>& contours, const Matrix& M, const M
             if (cover <= 0.0f) continue;
             float lx, ly; Minv.apply(x + 0.5f, y + 0.5f, lx, ly);
             Color c = paintColor(paint, lx, ly);
+            c.a = clampU8(static_cast<int>(c.a * alphaMul + 0.5f));   // 对象级透明度
             if (cover < 1.0f) {
                 float a = (c.a / 255.0f) * cover;
                 c.a = clampU8(static_cast<int>(a * 255.0f + 0.5f));
@@ -185,7 +187,7 @@ void fillContours(const std::vector<Contour>& contours, const Matrix& M, const M
 }
 
 void strokeContours(const std::vector<Contour>& contours, const Matrix& M, const Color& color,
-                    float widthTwips, std::uint8_t* buf, int W, int H) {
+                    float widthTwips, std::uint8_t* buf, int W, int H, float alphaMul = 1.0f) {
     float hw = (widthTwips / 2.0f) / 20.0f;  // twips -> 设备半宽(px)
     if (hw < 0.25f) hw = 0.25f;
     Paint p; p.kind = FillKind::Solid; p.solid = color;
@@ -202,14 +204,14 @@ void strokeContours(const std::vector<Contour>& contours, const Matrix& M, const
             std::vector<Contour> quad(1);
             quad[0].xs = {axp + px, bxp + px, bxp - px, axp - px};
             quad[0].ys = {ayp + py, byp + py, byp - py, axp - py};
-            fillContours(quad, Matrix{}, Matrix{}, p, buf, W, H);  // 已是设备坐标
+            fillContours(quad, Matrix{}, Matrix{}, p, buf, W, H, alphaMul);  // 已是设备坐标
         }
     }
 }
 
 void renderShape(const Shape& shape, const Matrix& world, const ColorTransform& cx,
                  const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
-                 std::uint8_t* buf, int W, int H) {
+                 std::uint8_t* buf, int W, int H, float alphaMul = 1.0f) {
     Matrix Minv; world.invert(Minv);
     // 填充
     for (std::size_t i = 0; i < shape.fillStyles.size(); ++i) {
@@ -229,13 +231,13 @@ void renderShape(const Shape& shape, const Matrix& world, const ColorTransform& 
                 p.bmat = fs.gradientMatrix;   // 位图矩阵（形状局部 -> 位图像素）
             }
         }
-        fillContours(shape.fillPaths[i], world, Minv, p, buf, W, H);
+        fillContours(shape.fillPaths[i], world, Minv, p, buf, W, H, alphaMul);
     }
     // 描边
     for (std::size_t i = 0; i < shape.lineStyles.size(); ++i) {
         if (shape.strokePaths[i].empty()) continue;
         const LineStyle& ls = shape.lineStyles[i];
-        strokeContours(shape.strokePaths[i], world, ls.color, ls.width, buf, W, H);
+        strokeContours(shape.strokePaths[i], world, ls.color, ls.width, buf, W, H, alphaMul);
     }
 }
 
@@ -292,12 +294,13 @@ void fillMask(const std::vector<std::vector<Contour>>& paths, const Matrix& M,
 }
 
 // 把单个显示列表项（shape / bitmap / sprite）渲染进 buf。
+// alpha：累积的对象级透明度（运行时 DisplayObject.alpha 等）乘到源色 alpha 上。
 void renderItemInto(const DisplayItem& item, const Matrix& root,
                     const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
-                    std::uint8_t* buf, int W, int H, int frameIndex) {
+                    std::uint8_t* buf, int W, int H, int frameIndex, float alpha = 1.0f) {
     Matrix world = root.post(item.matrix);
     if (item.character->kind == Character::Kind::Shape && item.character->shape) {
-        renderShape(*item.character->shape, world, item.cxform, dict, buf, W, H);
+        renderShape(*item.character->shape, world, item.cxform, dict, buf, W, H, alpha);
     } else if (item.character->kind == Character::Kind::Sprite) {
         // 精灵：按放置矩阵作为新的根，递归渲染其内部时间轴对应帧。
         // 内部帧号 = 当前时间轴帧号 - 该精灵的放置帧（新放置的精灵从内部第 0 帧开始）。
@@ -308,7 +311,7 @@ void renderItemInto(const DisplayItem& item, const Matrix& root,
         if (idx >= static_cast<int>(sf.size())) idx = static_cast<int>(sf.size()) - 1;
         for (const auto& child : sf[idx].items) {
             if (!child.character) continue;
-            renderItemInto(child, world, dict, buf, W, H, idx);
+            renderItemInto(child, world, dict, buf, W, H, idx, alpha);
         }
     } else if (item.character->kind == Character::Kind::Text && item.character->text) {
         // 文本：逐字形按文本矩阵+笔位放置，用字形颜色实心填充字形轮廓
@@ -327,7 +330,7 @@ void renderItemInto(const DisplayItem& item, const Matrix& root,
             Paint p; p.kind = FillKind::Solid; p.solid = tg.color;
             for (std::size_t i = 0; i < gs->fillStyles.size(); ++i) {
                 if (i >= gs->fillPaths.size() || gs->fillPaths[i].empty()) continue;
-                fillContours(gs->fillPaths[i], gm, Minv, p, buf, W, H);
+                fillContours(gs->fillPaths[i], gm, Minv, p, buf, W, H, alpha);
             }
         }
     } else if (item.character->kind == Character::Kind::Bitmap && item.character->bitmap) {
@@ -338,46 +341,49 @@ void renderItemInto(const DisplayItem& item, const Matrix& root,
                 float dx, dy; world.apply(lx, ly, dx, dy);
                 int px = static_cast<int>(std::round(dx)), py = static_cast<int>(std::round(dy));
                 const std::uint8_t* p4 = &bmp.rgba[static_cast<std::size_t>(j) * bmp.width * 4 + i * 4];
-                plot(buf, W, H, px, py, item.cxform.apply(Color(p4[0], p4[1], p4[2], p4[3])));
+                Color col = item.cxform.apply(Color(p4[0], p4[1], p4[2], p4[3]));
+                col.a = clampU8(static_cast<int>(col.a * alpha + 0.5f));   // 对象级透明度
+                plot(buf, W, H, px, py, col);
             }
         }
     }
 }
 
 // AVM2 运行时显示列表（AS3 构建的场景）的渲染。
-// 变换约定：parent 把"角色局部 twips"映射为设备像素；DisplayObject 的 x/y 单位是
-// 父级局部空间的像素（即 20 twips），scale 为缩放系数。
-struct DevT { double sx = 1.0 / 20.0, sy = 1.0 / 20.0, tx = 0, ty = 0; };
-
-void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const DevT& parent,
-                         const Movie& movie, std::uint8_t* buf, int W, int H, int frameIndex) {
+// parent：父级把"角色局部 twips"映射为设备像素的仿射矩阵；
+// DisplayObject 的 x/y 单位 = 父级局部空间的像素（20 twips），scale/rotation 分解自其变换矩阵。
+void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Matrix& parent,
+                         const Movie& movie, std::uint8_t* buf, int W, int H,
+                         int frameIndex, float alpha = 1.0f) {
     if (!d || !d->visible) return;
-    DevT cur;
-    cur.sx = parent.sx * (d->scaleX != 0 ? d->scaleX : 1.0);
-    cur.sy = parent.sy * (d->scaleY != 0 ? d->scaleY : 1.0);
-    cur.tx = parent.tx + parent.sx * (d->x * 20.0);
-    cur.ty = parent.ty + parent.sy * (d->y * 20.0);
+    // 对象局部变换（parent twips -> parent twips）：Translate(x*20,y*20) * Rotate * Scale
+    Matrix Lt;
+    double rad = d->rotation * 3.141592653589793 / 180.0;
+    double ca = std::cos(rad), sa = std::sin(rad);
+    Lt.sx  = static_cast<float>(d->scaleX * ca);
+    Lt.r0  = static_cast<float>(-d->scaleX * sa);
+    Lt.r1  = static_cast<float>(d->scaleY * sa);
+    Lt.sy  = static_cast<float>(d->scaleY * ca);
+    Lt.tx  = static_cast<float>(d->x * 20.0);
+    Lt.ty  = static_cast<float>(d->y * 20.0);
+    Matrix world = parent.post(Lt);          // 角色局部 twips -> 设备像素
+    float a = alpha * static_cast<float>(d->alpha);
 
     if (d->characterId) {
         auto it = movie.characters.find(d->characterId);
         if (it != movie.characters.end() && it->second) {
-            Matrix w;
-            w.sx = static_cast<float>(cur.sx);
-            w.sy = static_cast<float>(cur.sy);
-            w.tx = static_cast<float>(cur.tx);
-            w.ty = static_cast<float>(cur.ty);
             DisplayItem di;
             di.depth = 0;
             di.character = it->second;
-            di.matrix = Matrix{};              // 单位矩阵：world = w
+            di.matrix = Matrix{};            // 单位矩阵：world 已含对象变换
             // MovieClip 用自己的 currentFrame（动画），其余用外层帧号
             int fIdx = (d->kind == fvm::ObjKind::MovieClip && d->currentFrame > 0)
                            ? d->currentFrame : frameIndex;
-            renderItemInto(di, w, movie.characters, buf, W, H, fIdx);
+            renderItemInto(di, world, movie.characters, buf, W, H, fIdx, a);
         }
     }
     for (const auto& c : d->children)
-        renderDisplayObject(c, cur, movie, buf, W, H, frameIndex);
+        renderDisplayObject(c, world, movie, buf, W, H, frameIndex, a);
 }
 
 }  // namespace
@@ -449,11 +455,11 @@ bool renderMovieToPNG(const Movie& movie, int frameIndex, const char* path) {
 
     // 叠加 AVM2 运行时（ActionScript 构建）的显示列表
     if (!movie.runtimeStage.empty()) {
-        DevT stage;
-        stage.sx = root.sx; stage.sy = root.sy;
-        stage.tx = root.tx; stage.ty = root.ty;
+        Matrix rootM;                     // 角色局部 twips -> 设备像素
+        rootM.sx = root.sx; rootM.sy = root.sy;
+        rootM.tx = root.tx; rootM.ty = root.ty;
         for (const auto& d : movie.runtimeStage)
-            renderDisplayObject(d, stage, movie, buf.data(), W, H, frameIndex);
+            renderDisplayObject(d, rootM, movie, buf.data(), W, H, frameIndex);
     }
 
     return stbi_write_png(path, W, H, 4, buf.data(), W * 4) != 0;
