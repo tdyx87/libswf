@@ -141,6 +141,9 @@ public:
     explicit Vm(const abc::AbcFile& abc, Movie& movie);
     void run();
 
+    // 播放循环：推进所有 MovieClip 时间轴后派发 enterFrame 事件（动画驱动）
+    void tick();
+
     std::vector<std::shared_ptr<DisplayObject>> stage;
 
     // ---- 属性访问（含类成员链、getter/setter）----
@@ -158,6 +161,9 @@ private:
     void collectTraits(const std::vector<abc::Traits>& src, std::vector<Member>& out, bool isStatic);
     // 确保类的静态初始化 cinit 已执行
     void ensureClassInit(std::shared_ptr<ClassDef> cd, std::shared_ptr<Object> classObj);
+    // 事件派发：向注册了该类型监听器的对象回调（含事件对象参数）
+    void dispatchToAll(const std::string& type);
+    void advanceTimeline(const std::shared_ptr<DisplayObject>& d);
 
     const abc::AbcFile& abc_;
     Movie& movie_;
@@ -174,8 +180,9 @@ private:
     void instantiateDocumentClasses();
 };
 
-// 运行影片中的全部 ABC 脚本
-bool runMovieScripts(Movie& movie);
+// 运行影片中的全部 ABC 脚本并构建运行时显示列表。
+// 返回的 Vm 实例须保持存活（shared_ptr），以支持逐帧 tick() 驱动动画与事件。
+std::vector<std::shared_ptr<Vm>> runMovieScripts(Movie& movie);
 
 }  // namespace fvm
 }  // namespace swf

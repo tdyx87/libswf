@@ -829,7 +829,15 @@ void Vm::registerFlashApi() {
         };
         c->classDef->instanceMembers.push_back(gf);
         Member tf; tf.kind = Member::Getter; tf.name = "totalFrames";
-        tf.native = [](std::shared_ptr<Object>, const std::vector<Value>&) -> Value { return Value::intg(1); };
+        tf.native = [this](std::shared_ptr<Object> self, const std::vector<Value>&) -> Value {
+            if (self && self->display && self->display->characterId) {
+                auto it = movie_.characters.find(self->display->characterId);
+                if (it != movie_.characters.end() && it->second &&
+                    it->second->kind == Character::Kind::Sprite)
+                    return Value::intg(static_cast<int32_t>(it->second->spriteFrames.size()));
+            }
+            return Value::intg(1);
+        };
         c->classDef->instanceMembers.push_back(tf);
         Member gap; gap.kind = Member::Method; gap.name = "gotoAndPlay";
         gap.native = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
@@ -942,6 +950,59 @@ void Vm::run() {
     }
 
     instantiateDocumentClasses();
+}
+
+// 推进一个显示对象及其子对象的时间轴（动画驱动）。
+void Vm::advanceTimeline(const std::shared_ptr<DisplayObject>& d) {
+    if (!d) return;
+    // MovieClip 且处于播放态：按所属精灵（DefineSprite）的帧数循环推进当前帧
+    if (d->kind == ObjKind::MovieClip && d->playing && d->characterId) {
+        auto it = movie_.characters.find(d->characterId);
+        if (it != movie_.characters.end() && it->second &&
+            it->second->kind == Character::Kind::Sprite) {
+            int total = static_cast<int>(it->second->spriteFrames.size());
+            if (total > 0) {
+                ++d->currentFrame;
+                if (d->currentFrame >= total) d->currentFrame = 0;   // 循环播放
+            }
+        }
+    }
+    for (auto& c : d->children) advanceTimeline(c);
+}
+
+// 向所有注册了该类型监听器的对象派发事件（以注册者自身作为回调 this）。
+void Vm::dispatchToAll(const std::string& type) {
+    auto ev = std::make_shared<Object>();
+    ev->kind = ObjKind::Event;
+    ev->className = "Event";
+    ev->props["type"] = Value::str(type);
+
+    // 快照对象表，避免回调中新增/删除对象导致迭代器失效
+    std::vector<std::shared_ptr<Object>> snap = objects_;
+    for (auto& obj : snap) {
+        if (!obj) continue;
+        auto lit = obj->listeners.find(type);
+        if (lit == obj->listeners.end()) continue;
+        std::vector<Value> ls = lit->second;          // 监听器快照
+        for (auto& lv : ls) {
+            if (lv.kind != VKind::Object || !lv.obj) continue;
+            auto mi = lv.obj->props.find("$method");
+            if (mi == lv.obj->props.end()) continue;
+            uint32_t midx = mi->second.u;
+            if (midx >= abc_.methods.size()) continue;
+            int bi = abc_.methods[midx].bodyIndex;
+            if (bi < 0 || bi >= static_cast<int>(abc_.methodBodies.size())) continue;
+            exec(abc_.methodBodies[bi], {Value::object(ev)}, obj);
+        }
+    }
+}
+
+// 播放一帧：先推进所有时间轴，再派发 Flash 标准帧事件。
+void Vm::tick() {
+    for (auto& d : stage) advanceTimeline(d);
+    dispatchToAll("enterFrame");
+    dispatchToAll("frameConstructed");
+    dispatchToAll("exitFrame");
 }
 
 // ---- 解释器 ----
@@ -1471,14 +1532,16 @@ Value Vm::execScript(const abc::MethodBody& body, std::shared_ptr<Object> thisOb
     return exec(body, {}, thisObj);
 }
 
-bool runMovieScripts(Movie& movie) {
-    if (movie.abcFiles.empty()) return false;
+std::vector<std::shared_ptr<Vm>> runMovieScripts(Movie& movie) {
+    std::vector<std::shared_ptr<Vm>> vms;
+    if (movie.abcFiles.empty()) return vms;
     for (const auto& abc : movie.abcFiles) {
-        Vm vm(abc, movie);
-        vm.run();
-        if (!vm.stage.empty()) movie.runtimeStage = vm.stage;
+        auto vm = std::make_shared<Vm>(abc, movie);
+        vm->run();
+        if (!vm->stage.empty()) movie.runtimeStage = vm->stage;
+        vms.push_back(vm);
     }
-    return true;
+    return vms;
 }
 
 }  // namespace fvm

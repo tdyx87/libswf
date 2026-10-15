@@ -66,10 +66,10 @@ static bool readFile(const std::string& path, std::vector<std::uint8_t>& buf) {
 
 int main(int argc, char** argv) {
     std::string path;
-    bool opcodes = false, render = false, renderAll = false, inspect = false, runAs = false;
+    bool opcodes = false, render = false, renderAll = false, inspect = false, runAs = false, play = false;
     std::string outPath = "out.png";
     std::string outDir = "frames";
-    int frame = 0;
+    int frame = 0, playCount = 0;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--opcodes" || a == "-o") opcodes = true;
@@ -77,6 +77,11 @@ int main(int argc, char** argv) {
         else if (a == "--render-all" && i + 1 < argc) { renderAll = true; outDir = argv[++i]; }
         else if (a == "--inspect") inspect = true;
         else if (a == "--run-as") runAs = true;   // 执行 DoABC(AVM2) 构建运行时显示列表
+        else if (a == "--play" && i + 2 < argc) {  // --play <count> <outdir>：逐帧推进并导出动画
+            play = true; runAs = true;
+            playCount = std::atoi(argv[++i]);
+            outDir = argv[++i];
+        }
         else if (a == "--frame" && i + 1 < argc) { frame = std::atoi(argv[++i]); }
         else if (a == "--help" || a == "-h") { printUsage(); return 0; }
         else path = a;
@@ -102,9 +107,26 @@ int main(int argc, char** argv) {
                 std::printf("no DoABC in file; nothing to execute\n");
             } else {
                 std::printf("running AVM2 scripts (%zu abc)...\n", movie.abcFiles.size());
-                bool ok = swf::fvm::runMovieScripts(movie);
-                std::printf("AVM2 done: %s, runtime stage nodes=%zu, symbolClasses=%zu\n",
-                            ok ? "ok" : "failed", movie.runtimeStage.size(), movie.symbolClasses.size());
+                auto vms = swf::fvm::runMovieScripts(movie);
+                std::printf("AVM2 done: vms=%zu, runtime stage nodes=%zu, symbolClasses=%zu\n",
+                            vms.size(), movie.runtimeStage.size(), movie.symbolClasses.size());
+
+                if (play && !movie.runtimeStage.empty()) {
+                    std::error_code ec;
+                    std::filesystem::create_directories(outDir, ec);
+                    char fnbuf[512];
+                    for (int f = 0; f < playCount; ++f) {
+                        for (auto& vm : vms) vm->tick();   // 推进所有时间轴 + 派发 enterFrame 等
+                        std::snprintf(fnbuf, sizeof(fnbuf), "frame_%03d.png", f);
+                        std::filesystem::path outp = std::filesystem::path(outDir) / fnbuf;
+                        if (!swf::renderMovieToPNG(movie, 0, outp.string().c_str())) {
+                            std::fprintf(stderr, "render frame %d failed\n", f);
+                            return 1;
+                        }
+                    }
+                    std::printf("played %d frames -> %s/\n", playCount, outDir.c_str());
+                    return 0;
+                }
             }
             if (!(render || renderAll)) return 0;
         }
