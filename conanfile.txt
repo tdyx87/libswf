@@ -1,0 +1,21 @@
+[requires]
+zlib/1.3.1
+xz_utils/5.4.5
+# 渲染/字体/图像改用 vendored 方案（见 third_party/），不依赖 conan 的 cairo：
+#   - cairo/1.18.0 在 conan-center 无条件依赖 glib/pcre2/libffi/libgettext->libiconv，
+#     而 libiconv/1.17 配方在 conan 2.x + 新 Python 下 build() 必崩（TypeError: startswith
+#     first arg must be bytes...），且 glib 在 Windows 需巨量源码构建，本环境无法构建。
+#   - 移动端渲染选用 vendored nanovg（OpenGL ES，GPU），比 cairo（纯软件）更适合移动端。
+#   - 字体/图像用 vendored stb_truetype / stb_image（头文件库，跨平台、零构建风险）。
+# 如需 FreeType 的更完整 TrueType 支持，可后续单独 conan add freetype（已验证可解析，构建待确认）。
+
+[generators]
+CMakeDeps
+CMakeToolchain
+
+[layout]
+cmake_layout
+
+[options]
+xz_utils/*:shared=False
+zlib/*:shared=False

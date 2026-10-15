@@ -1,0 +1,20 @@
+# 构建产物
+build/
+*.exe
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.exp
+
+# 本机/环境相关
+CMakeUserPresets.json
+.conanvenv/
+.venv/
+__pycache__/
+*.pyc
+
+# 编辑器
+.vs/
+.idea/
+.DS_Store
