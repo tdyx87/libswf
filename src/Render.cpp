@@ -370,7 +370,10 @@ void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Dev
             di.depth = 0;
             di.character = it->second;
             di.matrix = Matrix{};              // 单位矩阵：world = w
-            renderItemInto(di, w, movie.characters, buf, W, H, frameIndex);
+            // MovieClip 用自己的 currentFrame（动画），其余用外层帧号
+            int fIdx = (d->kind == fvm::ObjKind::MovieClip && d->currentFrame > 0)
+                           ? d->currentFrame : frameIndex;
+            renderItemInto(di, w, movie.characters, buf, W, H, fIdx);
         }
     }
     for (const auto& c : d->children)
