@@ -104,28 +104,61 @@ Color paintColor(const Paint& p, float lx, float ly) {
 }
 
 // 把 (lx,ly) 设备像素反算为形状局部 twips，再上色并合成到 buf
-void plot(std::uint8_t* buf, int W, int H, int px, int py, const Color& c) {
+void plot(std::uint8_t* buf, int W, int H, int px, int py, const Color& c, BlendMode bm = BlendMode::Normal) {
     if (px < 0 || py < 0 || px >= W || py >= H) return;
     float sa = c.a / 255.0f;
-    if (sa <= 0.0f) return;
     std::uint8_t* d = buf + (static_cast<std::size_t>(py) * W + px) * 4;
-    if (sa >= 1.0f) {
-        d[0] = c.r; d[1] = c.g; d[2] = c.b; d[3] = 255;
+    float da = d[3] / 255.0f;
+    // 仅调制/削减 dst alpha 的混合模式
+    if (bm == BlendMode::Erase) {
+        float outA = da * (1.0f - sa);
+        d[3] = clampU8(static_cast<int>(outA * 255.0f));
         return;
     }
-    float da = d[3] / 255.0f;
+    if (bm == BlendMode::Alpha) {
+        float outA = da * sa;
+        d[3] = clampU8(static_cast<int>(outA * 255.0f));
+        return;
+    }
+    if (sa <= 0.0f) return;
+    // 计算混合后的源 RGB（src 与 dst 按模式混合）
+    float sr = c.r, sg = c.g, sb = c.b;
+    float dr = d[0], dg = d[1], db = d[2];
+    float br = sr, bg = sg, bb = sb;
+    switch (bm) {
+        case BlendMode::Add:      br = sr + dr; bg = sg + dg; bb = sb + db; break;
+        case BlendMode::Multiply: br = sr * dr / 255.0f; bg = sg * dg / 255.0f; bb = sb * db / 255.0f; break;
+        case BlendMode::Screen:   br = 255.0f - (255.0f - sr) * (255.0f - dr) / 255.0f;
+                                  bg = 255.0f - (255.0f - sg) * (255.0f - dg) / 255.0f;
+                                  bb = 255.0f - (255.0f - sb) * (255.0f - db) / 255.0f; break;
+        case BlendMode::Lighten:  br = std::max(sr, dr); bg = std::max(sg, dg); bb = std::max(sb, db); break;
+        case BlendMode::Darken:   br = std::min(sr, dr); bg = std::min(sg, dg); bb = std::min(sb, db); break;
+        case BlendMode::Difference: br = std::fabs(sr - dr); bg = std::fabs(sg - dg); bb = std::fabs(sb - db); break;
+        case BlendMode::Subtract: br = dr - sr; bg = dg - sg; bb = db - sb; break;
+        case BlendMode::Invert:   br = 255.0f - dr; bg = 255.0f - dg; bb = 255.0f - db; break;
+        default: break;   // Normal / Layer / Overlay / HardLight：标准 over
+    }
+    br = clampU8(static_cast<int>(br + 0.5f));
+    bg = clampU8(static_cast<int>(bg + 0.5f));
+    bb = clampU8(static_cast<int>(bb + 0.5f));
+    if (sa >= 1.0f) {
+        d[0] = static_cast<std::uint8_t>(br); d[1] = static_cast<std::uint8_t>(bg);
+        d[2] = static_cast<std::uint8_t>(bb); d[3] = 255;
+        return;
+    }
     float outA = sa + da * (1.0f - sa);
     if (outA <= 0.0f) return;
-    d[0] = static_cast<std::uint8_t>((c.r * sa + d[0] * da * (1.0f - sa)) / outA);
-    d[1] = static_cast<std::uint8_t>((c.g * sa + d[1] * da * (1.0f - sa)) / outA);
-    d[2] = static_cast<std::uint8_t>((c.b * sa + d[2] * da * (1.0f - sa)) / outA);
-    d[3] = static_cast<std::uint8_t>(outA * 255.0f);
+    d[0] = static_cast<std::uint8_t>((br * sa + d[0] * da * (1.0f - sa)) / outA);
+    d[1] = static_cast<std::uint8_t>((bg * sa + d[1] * da * (1.0f - sa)) / outA);
+    d[2] = static_cast<std::uint8_t>((bb * sa + d[2] * da * (1.0f - sa)) / outA);
+    d[3] = clampU8(static_cast<int>(outA * 255.0f));
 }
 
 // even-odd 扫描线填充一组轮廓（设备坐标），按 Paint 上色
 // alphaMul：对象级透明度（运行时 DisplayObject.alpha 等）乘到源色 alpha 上。
 void fillContours(const std::vector<Contour>& contours, const Matrix& M, const Matrix& Minv,
-                  const Paint& paint, std::uint8_t* buf, int W, int H, float alphaMul = 1.0f) {
+                  const Paint& paint, std::uint8_t* buf, int W, int H, float alphaMul = 1.0f,
+                  BlendMode bm = BlendMode::Normal) {
     struct Edge { float x0, y0, x1, y1; };
     std::vector<Edge> edges;
     float ymin = 1e9f, ymax = -1e9f;
@@ -181,13 +214,14 @@ void fillContours(const std::vector<Contour>& contours, const Matrix& M, const M
                 c.a = clampU8(static_cast<int>(a * 255.0f + 0.5f));
                 if (c.a == 0) continue;
             }
-            plot(buf, W, H, x, y, c);
+            plot(buf, W, H, x, y, c, bm);
         }
     }
 }
 
 void strokeContours(const std::vector<Contour>& contours, const Matrix& M, const Color& color,
-                    float widthTwips, std::uint8_t* buf, int W, int H, float alphaMul = 1.0f) {
+                    float widthTwips, std::uint8_t* buf, int W, int H, float alphaMul = 1.0f,
+                    BlendMode bm = BlendMode::Normal) {
     float hw = (widthTwips / 2.0f) / 20.0f;  // twips -> 设备半宽(px)
     if (hw < 0.25f) hw = 0.25f;
     Paint p; p.kind = FillKind::Solid; p.solid = color;
@@ -204,14 +238,15 @@ void strokeContours(const std::vector<Contour>& contours, const Matrix& M, const
             std::vector<Contour> quad(1);
             quad[0].xs = {axp + px, bxp + px, bxp - px, axp - px};
             quad[0].ys = {ayp + py, byp + py, byp - py, axp - py};
-            fillContours(quad, Matrix{}, Matrix{}, p, buf, W, H, alphaMul);  // 已是设备坐标
+            fillContours(quad, Matrix{}, Matrix{}, p, buf, W, H, alphaMul, bm);  // 已是设备坐标
         }
     }
 }
 
 void renderShape(const Shape& shape, const Matrix& world, const ColorTransform& cx,
                  const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
-                 std::uint8_t* buf, int W, int H, float alphaMul = 1.0f) {
+                 std::uint8_t* buf, int W, int H, float alphaMul = 1.0f,
+                 BlendMode bm = BlendMode::Normal) {
     Matrix Minv; world.invert(Minv);
     // 填充
     for (std::size_t i = 0; i < shape.fillStyles.size(); ++i) {
@@ -231,13 +266,13 @@ void renderShape(const Shape& shape, const Matrix& world, const ColorTransform& 
                 p.bmat = fs.gradientMatrix;   // 位图矩阵（形状局部 -> 位图像素）
             }
         }
-        fillContours(shape.fillPaths[i], world, Minv, p, buf, W, H, alphaMul);
+        fillContours(shape.fillPaths[i], world, Minv, p, buf, W, H, alphaMul, bm);
     }
     // 描边
     for (std::size_t i = 0; i < shape.lineStyles.size(); ++i) {
         if (shape.strokePaths[i].empty()) continue;
         const LineStyle& ls = shape.lineStyles[i];
-        strokeContours(shape.strokePaths[i], world, ls.color, ls.width, buf, W, H, alphaMul);
+        strokeContours(shape.strokePaths[i], world, ls.color, ls.width, buf, W, H, alphaMul, bm);
     }
 }
 
@@ -293,14 +328,57 @@ void fillMask(const std::vector<std::vector<Contour>>& paths, const Matrix& M,
     }
 }
 
-// 把单个显示列表项（shape / bitmap / sprite）渲染进 buf。
-// alpha：累积的对象级透明度（运行时 DisplayObject.alpha 等）乘到源色 alpha 上。
+// 由起始/终止形状按 ratio(0..1) 插值出中间形状（样式索引对齐；逐点线性插值）。
+static Shape interpolateMorph(const MorphShape& m, float t) {
+    Shape s;
+    t = (t < 0.0f) ? 0.0f : (t > 1.0f ? 1.0f : t);
+    if (!m.start) { if (m.end) return *m.end; return s; }
+    if (!m.end) return *m.start;
+    s.bounds = m.start->bounds;
+    s.fillStyles = m.start->fillStyles;
+    s.lineStyles = m.start->lineStyles;
+    s.fillPaths.resize(m.start->fillPaths.size());
+    for (std::size_t fi = 0; fi < s.fillPaths.size(); ++fi) {
+        const auto& a = m.start->fillPaths[fi];
+        const auto& b = (fi < m.end->fillPaths.size()) ? m.end->fillPaths[fi] : a;
+        s.fillPaths[fi].resize(std::min(a.size(), b.size()));
+        for (std::size_t ci = 0; ci < s.fillPaths[fi].size(); ++ci) {
+            const Contour& ca = a[ci]; const Contour& cb = b[ci];
+            Contour c; std::size_t n = std::min(ca.xs.size(), cb.xs.size());
+            c.xs.resize(n); c.ys.resize(n);
+            for (std::size_t k = 0; k < n; ++k) { c.xs[k] = lerp(ca.xs[k], cb.xs[k], t); c.ys[k] = lerp(ca.ys[k], cb.ys[k], t); }
+            s.fillPaths[fi][ci] = c;
+        }
+    }
+    s.strokePaths.resize(m.start->strokePaths.size());
+    for (std::size_t li = 0; li < s.strokePaths.size(); ++li) {
+        const auto& a = m.start->strokePaths[li];
+        const auto& b = (li < m.end->strokePaths.size()) ? m.end->strokePaths[li] : a;
+        s.strokePaths[li].resize(std::min(a.size(), b.size()));
+        for (std::size_t ci = 0; ci < s.strokePaths[li].size(); ++ci) {
+            const Contour& ca = a[ci]; const Contour& cb = b[ci];
+            Contour c; std::size_t n = std::min(ca.xs.size(), cb.xs.size());
+            c.xs.resize(n); c.ys.resize(n);
+            for (std::size_t k = 0; k < n; ++k) { c.xs[k] = lerp(ca.xs[k], cb.xs[k], t); c.ys[k] = lerp(ca.ys[k], cb.ys[k], t); }
+            s.strokePaths[li][ci] = c;
+        }
+    }
+    return s;
+}
+
+// 把单个显示列表项（shape / bitmap / sprite / morph / text）渲染进 buf。
+// alpha：累积的对象级透明度；bm：混合模式（运行时 DisplayObject.blend / PlaceObject3 blend）。
 void renderItemInto(const DisplayItem& item, const Matrix& root,
                     const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
-                    std::uint8_t* buf, int W, int H, int frameIndex, float alpha = 1.0f) {
+                    std::uint8_t* buf, int W, int H, int frameIndex, float alpha = 1.0f,
+                    BlendMode bm = BlendMode::Normal) {
     Matrix world = root.post(item.matrix);
     if (item.character->kind == Character::Kind::Shape && item.character->shape) {
-        renderShape(*item.character->shape, world, item.cxform, dict, buf, W, H, alpha);
+        renderShape(*item.character->shape, world, item.cxform, dict, buf, W, H, alpha, bm);
+    } else if (item.character->kind == Character::Kind::Morph && item.character->morph) {
+        // 变形形状：按当前 ratio 插值后渲染
+        Shape interp = interpolateMorph(*item.character->morph, item.ratio);
+        renderShape(interp, world, item.cxform, dict, buf, W, H, alpha, bm);
     } else if (item.character->kind == Character::Kind::Sprite) {
         // 精灵：按放置矩阵作为新的根，递归渲染其内部时间轴对应帧。
         // 内部帧号 = 当前时间轴帧号 - 该精灵的放置帧（新放置的精灵从内部第 0 帧开始）。
@@ -311,7 +389,7 @@ void renderItemInto(const DisplayItem& item, const Matrix& root,
         if (idx >= static_cast<int>(sf.size())) idx = static_cast<int>(sf.size()) - 1;
         for (const auto& child : sf[idx].items) {
             if (!child.character) continue;
-            renderItemInto(child, world, dict, buf, W, H, idx, alpha);
+            renderItemInto(child, world, dict, buf, W, H, idx, alpha, bm);
         }
     } else if (item.character->kind == Character::Kind::Text && item.character->text) {
         // 文本：逐字形按文本矩阵+笔位放置，用字形颜色实心填充字形轮廓
@@ -330,7 +408,7 @@ void renderItemInto(const DisplayItem& item, const Matrix& root,
             Paint p; p.kind = FillKind::Solid; p.solid = tg.color;
             for (std::size_t i = 0; i < gs->fillStyles.size(); ++i) {
                 if (i >= gs->fillPaths.size() || gs->fillPaths[i].empty()) continue;
-                fillContours(gs->fillPaths[i], gm, Minv, p, buf, W, H, alpha);
+                fillContours(gs->fillPaths[i], gm, Minv, p, buf, W, H, alpha, bm);
             }
         }
     } else if (item.character->kind == Character::Kind::Bitmap && item.character->bitmap) {
@@ -343,7 +421,7 @@ void renderItemInto(const DisplayItem& item, const Matrix& root,
                 const std::uint8_t* p4 = &bmp.rgba[static_cast<std::size_t>(j) * bmp.width * 4 + i * 4];
                 Color col = item.cxform.apply(Color(p4[0], p4[1], p4[2], p4[3]));
                 col.a = clampU8(static_cast<int>(col.a * alpha + 0.5f));   // 对象级透明度
-                plot(buf, W, H, px, py, col);
+                plot(buf, W, H, px, py, col, bm);
             }
         }
     }
@@ -427,7 +505,7 @@ void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Mat
             // MovieClip 用自己的 currentFrame（动画），其余用外层帧号
             int fIdx = (d->kind == fvm::ObjKind::MovieClip && d->currentFrame > 0)
                            ? d->currentFrame : frameIndex;
-            renderItemInto(di, world, movie.characters, buf, W, H, fIdx, a);
+            renderItemInto(di, world, movie.characters, buf, W, H, fIdx, a, d->blend);
         }
     }
     if (d->hasText && !d->textData.empty())
@@ -478,7 +556,7 @@ bool renderMovieToPNG(const Movie& movie, int frameIndex, const char* path) {
             int j = i + 1;
             while (j < n && items[j].depth <= it.clipDepth) {
                 if (items[j].clipDepth == 0 && items[j].character)
-                    renderItemInto(items[j], root, movie.characters, layer.data(), W, H, frameIndex);
+                    renderItemInto(items[j], root, movie.characters, layer.data(), W, H, frameIndex, 1.0f, items[j].blend);
                 ++j;
             }
             for (int p = 0; p < static_cast<int>(npix); ++p) {
@@ -498,7 +576,7 @@ bool renderMovieToPNG(const Movie& movie, int frameIndex, const char* path) {
             }
             i = j;  // 跳过整个裁剪组
         } else {
-            if (it.character) renderItemInto(it, root, movie.characters, buf.data(), W, H, frameIndex);
+            if (it.character) renderItemInto(it, root, movie.characters, buf.data(), W, H, frameIndex, 1.0f, it.blend);
             ++i;
         }
     }

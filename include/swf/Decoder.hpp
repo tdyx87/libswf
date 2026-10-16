@@ -104,6 +104,9 @@ struct DisplayItem {
     std::uint16_t clipDepth = 0;    // 0 = 非裁剪
     // 裁剪遮罩：被谁裁剪（由 clipDepth 关系决定，渲染时处理）
     int birthFrame = 0;              // 本层时间轴上被放置的帧号（精灵据此对齐内部帧）
+    float ratio = 0;                // MorphShape 变形比例 0..1
+    BlendMode blend = BlendMode::Normal;   // 混合模式
+    bool hasMask = false;           // 本对象作为遮罩（自身不绘制，仅裁剪后续对象）
 };
 
 // 一帧：当前显示列表快照
@@ -133,13 +136,20 @@ struct TextDef {
     int leading = 0;
 };
 
+// 变形形状（DefineMorphShape）：t=0 起始形状 与 t=1 终止形状（样式索引对齐）
+struct MorphShape {
+    std::shared_ptr<Shape> start;
+    std::shared_ptr<Shape> end;
+};
+
 // 角色（字典项）
 struct Character {
-    enum class Kind { Shape, Bitmap, Sprite, Font, Text } kind = Kind::Shape;
+    enum class Kind { Shape, Bitmap, Sprite, Font, Text, Morph } kind = Kind::Shape;
     std::shared_ptr<Shape> shape;
     std::shared_ptr<Bitmap> bitmap;
     std::shared_ptr<FontGlyphs> font;   // Kind::Font
     std::shared_ptr<TextDef> text;      // Kind::Text
+    std::shared_ptr<MorphShape> morph;  // Kind::Morph
     // Sprite（DefineSprite）内部时间轴的各帧显示列表
     std::vector<Frame> spriteFrames;
 };

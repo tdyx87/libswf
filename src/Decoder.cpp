@@ -427,22 +427,11 @@ static int neededBits(std::size_t n) {
     return b;
 }
 
-// DefineMorphShape(46) / DefineMorphShape2(84)：变形形状。
-// 记录结构与 DefineShape 相同，但每条记录多一个 MorphFlag 位；填充/线样式只经
-// StyleChangeRecord(stateNew) 内联定义（无独立样式表头）。
-// 静态渲染取 t=0 的起始形状（end 记录跳过）。
-static std::shared_ptr<Shape> decodeMorphShape(ByteView& bv, int shapeVer) {
-    auto shape = std::make_shared<Shape>();
-    { Rect rb = readRect(bv);  // start bounds
-      shape->bounds.x0 = rb.xMin; shape->bounds.x1 = rb.xMax;
-      shape->bounds.y0 = rb.yMin; shape->bounds.y1 = rb.yMax; }
-    { Rect eb = readRect(bv); }  // end bounds（t=0 不用）
-    if (shapeVer >= 2) { readRect(bv); readRect(bv); bv.readUI32(); }  // edge bounds + offset
-
-    ShapeBuilder sb;
-    sb.fills = &shape->fillStyles; sb.lines = &shape->lineStyles; sb.shape = shape;
+// 解析变形形状的单段（起始段 MorphFlag=0 / 终止段 MorphFlag=1），写入各自 ShapeBuilder。
+static void parseMorphSection(ByteView& bv, int shapeVer, ShapeBuilder& sb,
+                              int& numFillBits, int& numLineBits,
+                              bool startSection, bool allowNew) {
     BitReader br(bv);
-    int numFillBits = 0, numLineBits = 0;
     bool firstRec = true;
     int guard = 0;
     for (;;) {
@@ -454,55 +443,118 @@ static std::shared_ptr<Shape> decodeMorphShape(ByteView& bv, int shapeVer) {
             int stateFill1 = static_cast<int>(br.readUB(1));
             int stateFill0 = static_cast<int>(br.readUB(1));
             int stateMove  = static_cast<int>(br.readUB(1));
-            br.readUB(1);  // MorphLineFlag（起始形状为 0）
-            if (!(stateNew || stateLine || stateFill1 || stateFill0 || stateMove)) { sb.finalizeAll(); break; }
-            if (stateMove) {
-                int mb = static_cast<int>(br.readUB(5));
-                float x = static_cast<float>(br.readSB(mb));
-                float y = static_cast<float>(br.readSB(mb));
-                sb.moveTo(x, y);
-            } else if (!firstRec) {
-                sb.finalizeAll();
+            int morphFlag  = static_cast<int>(br.readUB(1));
+            bool relevant  = startSection ? (morphFlag == 0) : (morphFlag == 1);
+            if (!(stateNew || stateLine || stateFill1 || stateFill0 || stateMove)) {
+                if (relevant) sb.finalizeAll();
+                break;   // EndShapeRecord
             }
-            if (stateFill0 && numFillBits > 0) sb.actFill0 = static_cast<int>(br.readUB(numFillBits));
-            if (stateFill1 && numFillBits > 0) sb.actFill1 = static_cast<int>(br.readUB(numFillBits));
-            if (stateLine  && numLineBits > 0) sb.actLine  = static_cast<int>(br.readUB(numLineBits));
+            if (relevant) {
+                if (stateMove) {
+                    int mb = static_cast<int>(br.readUB(5));
+                    float x = static_cast<float>(br.readSB(mb));
+                    float y = static_cast<float>(br.readSB(mb));
+                    sb.moveTo(x, y);
+                } else if (!firstRec) sb.finalizeAll();
+                if (stateFill0 && numFillBits > 0) sb.actFill0 = static_cast<int>(br.readUB(numFillBits));
+                if (stateFill1 && numFillBits > 0) sb.actFill1 = static_cast<int>(br.readUB(numFillBits));
+                if (stateLine  && numLineBits > 0) sb.actLine  = static_cast<int>(br.readUB(numLineBits));
+            } else {
+                // 另一段的同名记录：消费等长的位以与位流同步
+                if (stateMove) { int mb = static_cast<int>(br.readUB(5)); br.readSB(mb); br.readSB(mb); }
+                if (stateFill0 && numFillBits > 0) br.readUB(numFillBits);
+                if (stateFill1 && numFillBits > 0) br.readUB(numFillBits);
+                if (stateLine  && numLineBits > 0) br.readUB(numLineBits);
+            }
             if (stateNew) {
                 int nfc = bv.readUI8(); if (nfc == 0xFF) nfc = bv.readUI16();
                 if (nfc < 0 || nfc > 1024) break;
-                int old = static_cast<int>(shape->fillStyles.size());
-                shape->fillStyles.resize(old + nfc); shape->fillPaths.resize(old + nfc);
-                for (int i = 0; i < nfc; ++i) shape->fillStyles[old + i] = readFillStyle(bv, true);
-                int nlc = bv.readUI8(); if (nlc == 0xFF) nlc = bv.readUI16();
-                if (nlc < 0 || nlc > 1024) break;
-                int oldl = static_cast<int>(shape->lineStyles.size());
-                shape->lineStyles.resize(oldl + nlc); shape->strokePaths.resize(oldl + nlc);
-                for (int i = 0; i < nlc; ++i) shape->lineStyles[oldl + i] = readLineStyle(bv, shapeVer);
-                numFillBits = neededBits(shape->fillStyles.size());
-                numLineBits = neededBits(shape->lineStyles.size());
+                if (allowNew) {
+                    int old = static_cast<int>(sb.shape->fillStyles.size());
+                    sb.shape->fillStyles.resize(old + nfc); sb.shape->fillPaths.resize(old + nfc);
+                    for (int i = 0; i < nfc; ++i) sb.shape->fillStyles[old + i] = readFillStyle(bv, true);
+                    int nlc = bv.readUI8(); if (nlc == 0xFF) nlc = bv.readUI16();
+                    if (nlc < 0 || nlc > 1024) break;
+                    int oldl = static_cast<int>(sb.shape->lineStyles.size());
+                    sb.shape->lineStyles.resize(oldl + nlc); sb.shape->strokePaths.resize(oldl + nlc);
+                    for (int i = 0; i < nlc; ++i) sb.shape->lineStyles[oldl + i] = readLineStyle(bv, shapeVer);
+                    numFillBits = neededBits(sb.shape->fillStyles.size());
+                    numLineBits = neededBits(sb.shape->lineStyles.size());
+                } else {
+                    // 终止段不应再定义样式，仅消费字节以对齐
+                    for (int i = 0; i < nfc; ++i) readFillStyle(bv, true);
+                    int nlc = bv.readUI8(); if (nlc == 0xFF) nlc = bv.readUI16();
+                    for (int i = 0; i < nlc; ++i) readLineStyle(bv, shapeVer);
+                }
             }
             firstRec = false;
         } else {
             int straight = static_cast<int>(br.readUB(1));
             int nbits    = static_cast<int>(br.readUB(4)) + 2;
-            br.readUB(1);  // MorphShapeFlag（起始形状为 0）
+            int morphFlag = static_cast<int>(br.readUB(1));
+            bool relevant = startSection ? (morphFlag == 0) : (morphFlag == 1);
             if (straight) {
                 int general = static_cast<int>(br.readUB(1));
                 float dx = 0, dy = 0;
                 if (general) { dx = static_cast<float>(br.readSB(nbits)); dy = static_cast<float>(br.readSB(nbits)); }
                 else { int vert = static_cast<int>(br.readUB(1)); if (vert) dy = static_cast<float>(br.readSB(nbits)); else dx = static_cast<float>(br.readSB(nbits)); }
-                sb.lineTo(sb.penX + dx, sb.penY + dy);
+                if (relevant) sb.lineTo(sb.penX + dx, sb.penY + dy);
             } else {
-                float cx = static_cast<float>(br.readSB(nbits));
-                float cy = static_cast<float>(br.readSB(nbits));
-                float ax = static_cast<float>(br.readSB(nbits));
-                float ay = static_cast<float>(br.readSB(nbits));
-                sb.curveTo(sb.penX + cx, sb.penY + cy, sb.penX + ax, sb.penY + ay);
+                float cx = static_cast<float>(br.readSB(nbits)), cy = static_cast<float>(br.readSB(nbits)), ax = static_cast<float>(br.readSB(nbits)), ay = static_cast<float>(br.readSB(nbits));
+                if (relevant) sb.curveTo(sb.penX + cx, sb.penY + cy, sb.penX + ax, sb.penY + ay);
             }
         }
     }
     br.finish();
-    return shape;
+}
+
+// DefineMorphShape(46) / DefineMorphShape2(84)：变形形状。
+// 记录流含起始(段)与终止(Offset 处)两套几何，样式索引对齐。产出 t=0/t=1 两形状供插值。
+static std::shared_ptr<MorphShape> decodeMorphShape(ByteView& bv, int shapeVer) {
+    std::size_t recStart = bv.pos() - 2;   // 记录起点（CharacterID 之前 2 字节），Offset 相对此处
+    auto ms = std::make_shared<MorphShape>();
+    ms->start = std::make_shared<Shape>();
+    ms->end   = std::make_shared<Shape>();
+    {
+        Rect rb = readRect(bv);
+        ms->start->bounds.x0 = rb.xMin; ms->start->bounds.x1 = rb.xMax;
+        ms->start->bounds.y0 = rb.yMin; ms->start->bounds.y1 = rb.yMax;
+        ms->end->bounds = ms->start->bounds;
+    }
+    { Rect eb = readRect(bv);
+      ms->end->bounds.x0 = eb.xMin; ms->end->bounds.x1 = eb.xMax;
+      ms->end->bounds.y0 = eb.yMin; ms->end->bounds.y1 = eb.yMax; }
+    std::uint32_t endOffset = 0;
+    if (shapeVer >= 2) { readRect(bv); readRect(bv); endOffset = bv.readUI32(); }   // edge bounds + flags
+    else { endOffset = bv.readUI32(); }
+
+    ShapeBuilder sbS, sbE;
+    sbS.fills = &ms->start->fillStyles; sbS.lines = &ms->start->lineStyles; sbS.shape = ms->start;
+    sbE.fills = &ms->end->fillStyles;   sbE.lines = &ms->end->lineStyles;   sbE.shape = ms->end;
+
+    int fc = bv.readUI8(); if (fc == 0xFF) fc = bv.readUI16();
+    if (fc < 0 || fc > 4096 || bv.overflow()) return ms;
+    ms->start->fillStyles.resize(fc); ms->start->fillPaths.resize(fc);
+    ms->end->fillStyles.resize(fc);   ms->end->fillPaths.resize(fc);
+    for (int i = 0; i < fc; ++i) {
+        ms->start->fillStyles[i] = readFillStyle(bv, true);
+        ms->end->fillStyles[i]   = readFillStyle(bv, true);   // 紧跟其后的终止样式
+    }
+    int lc = bv.readUI8(); if (lc == 0xFF) lc = bv.readUI16();
+    if (lc < 0 || lc > 4096 || bv.overflow()) return ms;
+    ms->start->lineStyles.resize(lc); ms->start->strokePaths.resize(lc);
+    ms->end->lineStyles.resize(lc);   ms->end->strokePaths.resize(lc);
+    for (int i = 0; i < lc; ++i) {
+        ms->start->lineStyles[i] = readLineStyle(bv, shapeVer);
+        ms->end->lineStyles[i]   = readLineStyle(bv, shapeVer);
+    }
+    int numFillBits = neededBits(ms->start->fillStyles.size());
+    int numLineBits = neededBits(ms->start->lineStyles.size());
+
+    parseMorphSection(bv, shapeVer, sbS, numFillBits, numLineBits, true, true);   // 起始段
+    if (endOffset > 0) bv.seek(recStart + endOffset);
+    parseMorphSection(bv, shapeVer, sbE, numFillBits, numLineBits, false, false); // 终止段
+    return ms;
 }
 
 // 字形轮廓：字形内嵌于字体表，格式同 DefineShape 记录流但无 bounds、无填充/线数量表头，
@@ -844,7 +896,7 @@ bool decodeMovie(const std::uint8_t* data, std::size_t size, Movie& out, std::st
                         if (f & 0x02) { std::uint16_t cid = bv.readUI16(); auto ic = ctx.characters.find(cid); it.character = (ic != ctx.characters.end()) ? ic->second : nullptr; }
                         if (f & 0x04) it.matrix = readMatrix(bv);
                         if (f & 0x08) it.cxform = readCXForm(bv, true);
-                        if (f & 0x10) bv.readUI16();
+                        if (f & 0x10) it.ratio = static_cast<float>(bv.readUI16()) / 65535.0f;
                         if (f & 0x20) { while (bv.pos() < tEnd && bv.readUI8() != 0) {} }
                         if (f & 0x40) it.clipDepth = bv.readUI16();
                         if (f & 0x80) { std::uint16_t sz = bv.readUI16(); bv.skip(sz); }
@@ -854,12 +906,12 @@ bool decodeMovie(const std::uint8_t* data, std::size_t size, Movie& out, std::st
                         DisplayItem it; it.depth = bv.readUI16();
                         if (f2 & 0x04) { while (bv.pos() < tEnd && bv.readUI8() != 0) {} }
                         if (f2 & 0x08) { std::uint8_t nf = bv.readUI8(); for (int k = 0; k < nf && bv.pos() < tEnd; ++k) { bv.readUI8(); std::uint16_t fsz = bv.readUI16(); bv.skip(fsz); } }
-                        if (f2 & 0x10) bv.readUI8();
+                        if (f2 & 0x10) it.blend = static_cast<BlendMode>(bv.readUI8());
                         if (f2 & 0x20) bv.readUI8();
                         if (f & 0x02) { std::uint16_t cid = bv.readUI16(); auto ic = ctx.characters.find(cid); it.character = (ic != ctx.characters.end()) ? ic->second : nullptr; }
                         if (f & 0x04) it.matrix = readMatrix(bv);
                         if (f & 0x08) it.cxform = readCXForm(bv, true);
-                        if (f & 0x10) bv.readUI16();
+                        if (f & 0x10) it.ratio = static_cast<float>(bv.readUI16()) / 65535.0f;
                         if (f & 0x20) { while (bv.pos() < tEnd && bv.readUI8() != 0) {} }
                         if (f & 0x40) it.clipDepth = bv.readUI16();
                         if (f & 0x80) { std::uint16_t sz = bv.readUI16(); bv.skip(sz); }
@@ -954,10 +1006,10 @@ bool decodeMovie(const std::uint8_t* data, std::size_t size, Movie& out, std::st
             case 46: case 84: {  // DefineMorphShape / DefineMorphShape2
                 int ver = (code == 46) ? 1 : 2;
                 std::uint16_t id = bv.readUI16();
-                auto shp = decodeMorphShape(bv, ver);
+                auto ms = decodeMorphShape(bv, ver);
                 auto ch = std::make_shared<Character>();
-                ch->kind = Character::Kind::Shape;   // t=0 起始形状按普通形状渲染
-                ch->shape = shp;
+                ch->kind = Character::Kind::Morph;   // 由渲染器按 ratio 插值
+                ch->morph = ms;
                 ctx.characters[id] = ch;
                 break;
             }
@@ -1046,7 +1098,7 @@ bool decodeMovie(const std::uint8_t* data, std::size_t size, Movie& out, std::st
                 }
                 if (f & 0x04) it.matrix = readMatrix(bv);
                 if (f & 0x08) it.cxform = readCXForm(bv, true);
-                if (f & 0x10) bv.readUI16();                       // ratio
+                if (f & 0x10) it.ratio = static_cast<float>(bv.readUI16()) / 65535.0f;  // ratio
                 if (f & 0x20) { while (bv.readUI8() != 0) {} }     // name
                 if (f & 0x40) it.clipDepth = bv.readUI16();
                 if (f & 0x80) { std::uint16_t sz = bv.readUI16(); bv.skip(sz); }  // clip actions
@@ -1063,7 +1115,7 @@ bool decodeMovie(const std::uint8_t* data, std::size_t size, Movie& out, std::st
                     std::uint8_t nf = bv.readUI8();
                     for (int k = 0; k < nf; ++k) { bv.readUI8(); std::uint16_t fsz = bv.readUI16(); bv.skip(fsz); }
                 }
-                if (f2 & 0x10) bv.readUI8();                       // blend mode
+                if (f2 & 0x10) it.blend = static_cast<BlendMode>(bv.readUI8());  // blend mode
                 if (f2 & 0x20) bv.readUI8();                       // cacheAsBitmap
                 if (f & 0x02) {
                     std::uint16_t cid = bv.readUI16();
@@ -1072,7 +1124,7 @@ bool decodeMovie(const std::uint8_t* data, std::size_t size, Movie& out, std::st
                 }
                 if (f & 0x04) it.matrix = readMatrix(bv);
                 if (f & 0x08) it.cxform = readCXForm(bv, true);
-                if (f & 0x10) bv.readUI16();                       // ratio
+                if (f & 0x10) it.ratio = static_cast<float>(bv.readUI16()) / 65535.0f;  // ratio
                 if (f & 0x20) { while (bv.readUI8() != 0) {} }     // name
                 if (f & 0x40) it.clipDepth = bv.readUI16();
                 if (f & 0x80) { std::uint16_t sz = bv.readUI16(); bv.skip(sz); }  // clip actions

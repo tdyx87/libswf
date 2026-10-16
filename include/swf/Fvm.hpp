@@ -15,6 +15,13 @@ namespace swf {
 
 struct Movie;   // 前向声明（避免与 Decoder.hpp 循环包含）
 
+// Flash 混合模式（PlaceObject3 blendMode 标志）。普通光栅器支持逐像素的常用模式。
+enum class BlendMode {
+    Normal = 0, Layer = 1, Multiply = 2, Screen = 3, Lighten = 4, Darken = 5,
+    Difference = 6, Add = 7, Subtract = 8, Invert = 9, Alpha = 10, Erase = 11,
+    Overlay = 12, HardLight = 13
+};
+
 namespace fvm {
 
 // ---------- 值 ----------
@@ -125,6 +132,7 @@ struct DisplayObject {
     uint32_t textColor = 0xFF000000;   // ARGB（高字节 alpha）
     std::string textFont;
     bool  hasText = false;
+    BlendMode blend = BlendMode::Normal;   // 混合模式
 };
 
 struct Object {

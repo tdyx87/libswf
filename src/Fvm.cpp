@@ -264,6 +264,31 @@ void Vm::setProperty(std::shared_ptr<Object> obj, const std::string& name, const
             }
             obj->props[name] = v; return;
         }
+        if (name == "blendMode" && obj->display) {
+            BlendMode bm = BlendMode::Normal;
+            if (v.kind == VKind::String) {
+                std::string s = v.toString();
+                if (s == "add") bm = BlendMode::Add;
+                else if (s == "multiply")   bm = BlendMode::Multiply;
+                else if (s == "screen")     bm = BlendMode::Screen;
+                else if (s == "lighten")    bm = BlendMode::Lighten;
+                else if (s == "darken")     bm = BlendMode::Darken;
+                else if (s == "difference") bm = BlendMode::Difference;
+                else if (s == "subtract")   bm = BlendMode::Subtract;
+                else if (s == "invert")     bm = BlendMode::Invert;
+                else if (s == "layer")      bm = BlendMode::Layer;
+                else if (s == "alpha")      bm = BlendMode::Alpha;
+                else if (s == "erase")      bm = BlendMode::Erase;
+                else if (s == "overlay")    bm = BlendMode::Overlay;
+                else if (s == "hardlight")  bm = BlendMode::HardLight;
+                else bm = BlendMode::Normal;
+            } else {
+                int n = static_cast<int>(v.toUInt());
+                if (n >= 0 && n <= 13) bm = static_cast<BlendMode>(n);
+            }
+            obj->display->blend = bm;
+            obj->props[name] = v; return;
+        }
     }
     obj->props[name] = v;
 }
