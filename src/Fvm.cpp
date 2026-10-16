@@ -241,6 +241,29 @@ void Vm::setProperty(std::shared_ptr<Object> obj, const std::string& name, const
         if (name == "alpha") { obj->display->alpha = v.toNumber(); obj->props[name] = v; return; }
         if (name == "visible") { obj->display->visible = v.toBool(); obj->props[name] = v; return; }
         if (name == "name") { obj->display->name = v.toString(); obj->props[name] = v; return; }
+        // 运行时 TextField 文本属性
+        if (name == "text" || name == "htmlText") {
+            obj->display->textData = v.toString();
+            obj->display->hasText = true;
+            obj->props[name] = v; return;
+        }
+        if (name == "textColor") {
+            obj->display->textColor = static_cast<uint32_t>(v.toUInt());
+            obj->props[name] = v; return;
+        }
+        if (name == "defaultTextFormat" || name == "setTextFormat") {
+            // 从 TextFormat 对象读取 size / color / font
+            if (v.kind == VKind::Object && v.obj) {
+                auto fmt = v.obj;
+                auto ps = fmt->props.find("size");
+                if (ps != fmt->props.end()) obj->display->textSize = ps->second.toInt();
+                auto pc = fmt->props.find("color");
+                if (pc != fmt->props.end()) obj->display->textColor = static_cast<uint32_t>(pc->second.toUInt());
+                auto pf = fmt->props.find("font");
+                if (pf != fmt->props.end()) obj->display->textFont = pf->second.toString();
+            }
+            obj->props[name] = v; return;
+        }
     }
     obj->props[name] = v;
 }
@@ -1198,6 +1221,7 @@ Value Vm::exec(const abc::MethodBody& body, const std::vector<Value>& args,
             case 0x85: break;                // coerce_s
             case 0x78: break;                // checkfilter
             case 0x02: case 0x09: break;                       // nop / label
+            case 0x08: break;                                  // kill（局部变量作用域结束，无操作）
             case 0x20: push(Value::nullv()); break;
             case 0x21: push(Value::undefined()); break;
             case 0x24: push(Value::intg(static_cast<int8_t>(in.u8()))); break;
@@ -1232,7 +1256,7 @@ Value Vm::exec(const abc::MethodBody& body, const std::vector<Value>& args,
                 break;
             }
             case 0x1d: if (!scope.empty()) scope.pop_back(); break;
-            case 0x64: break;
+            case 0x64: { push(Value::object(globals_)); break; }   // getglobalscope
             case 0x65: { uint32_t i2 = in.u8();
                 if (i2 < scope.size()) push(Value::object(scope[i2])); else push(Value::undefined());
                 break; }
@@ -1286,6 +1310,18 @@ Value Vm::exec(const abc::MethodBody& body, const std::vector<Value>& args,
                 if (a2.toString() == b2.toString()) { size_t t = static_cast<size_t>(static_cast<int64_t>(in.pos()) + o2); if (t <= codeSize) in.seek(t); } break; }
             case 0x14: { int32_t o2 = in.s24(); Value b2 = pop(), a2 = pop();
                 if (a2.toString() != b2.toString()) { size_t t = static_cast<size_t>(static_cast<int64_t>(in.pos()) + o2); if (t <= codeSize) in.seek(t); } break; }
+            case 0x15: { int32_t o2 = in.s24(); Value b2 = pop(), a2 = pop();
+                if (a2.toNumber() < b2.toNumber()) { size_t t = static_cast<size_t>(static_cast<int64_t>(in.pos()) + o2); if (t <= codeSize) in.seek(t); } break; }
+            case 0x16: { int32_t o2 = in.s24(); Value b2 = pop(), a2 = pop();
+                if (a2.toNumber() <= b2.toNumber()) { size_t t = static_cast<size_t>(static_cast<int64_t>(in.pos()) + o2); if (t <= codeSize) in.seek(t); } break; }
+            case 0x17: { int32_t o2 = in.s24(); Value b2 = pop(), a2 = pop();
+                if (a2.toNumber() > b2.toNumber()) { size_t t = static_cast<size_t>(static_cast<int64_t>(in.pos()) + o2); if (t <= codeSize) in.seek(t); } break; }
+            case 0x18: { int32_t o2 = in.s24(); Value b2 = pop(), a2 = pop();
+                if (a2.toNumber() >= b2.toNumber()) { size_t t = static_cast<size_t>(static_cast<int64_t>(in.pos()) + o2); if (t <= codeSize) in.seek(t); } break; }
+            case 0x19: { int32_t o2 = in.s24(); Value b2 = pop(), a2 = pop();
+                if (a2.kind == b2.kind && a2.toString() == b2.toString()) { size_t t = static_cast<size_t>(static_cast<int64_t>(in.pos()) + o2); if (t <= codeSize) in.seek(t); } break; }
+            case 0x1a: { int32_t o2 = in.s24(); Value b2 = pop(), a2 = pop();
+                if (!(a2.kind == b2.kind && a2.toString() == b2.toString())) { size_t t = static_cast<size_t>(static_cast<int64_t>(in.pos()) + o2); if (t <= codeSize) in.seek(t); } break; }
             case 0x47: return Value::undefined();
             case 0x48: return pop();
 
@@ -1462,6 +1498,16 @@ Value Vm::exec(const abc::MethodBody& body, const std::vector<Value>& args,
                         if (!dup) stage.push_back(objv.obj->display);
                     }
                 }
+                break;
+            }
+            case 0x5f: {   // findpropstrict
+                uint32_t mn = in.u30();
+                std::string name = multinameName(mn);
+                Value found = Value::nullv();
+                for (auto it = scope.rbegin(); it != scope.rend(); ++it)
+                    if ((*it)->props.count(name)) { found = Value::object(*it); break; }
+                if (found.isNull()) found = Value::object(globals_);
+                push(found);
                 break;
             }
             case 0x5d: {   // findproperty

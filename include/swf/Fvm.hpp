@@ -118,6 +118,13 @@ struct DisplayObject {
     bool playing = true;
     std::shared_ptr<DisplayObject> parent;
     std::vector<std::shared_ptr<DisplayObject>> children;
+
+    // 运行时 TextField 文本（AS3 设置 tf.text / tf.textColor / defaultTextFormat 后由渲染器栅格化）
+    std::string textData;
+    int   textSize = 12;            // 字号（px）
+    uint32_t textColor = 0xFF000000;   // ARGB（高字节 alpha）
+    std::string textFont;
+    bool  hasText = false;
 };
 
 struct Object {

@@ -115,6 +115,7 @@ struct Frame {
 struct FontGlyphs {
     std::vector<std::shared_ptr<Shape>> shapes;
     std::vector<int> advances;   // 每字形前进宽度（twips）
+    std::map<int, int> codeToGlyph;   // 字符码 -> 字形索引（运行时文本渲染用）
 };
 
 // 文本中的一个字形放置（DefineText/Text2 解码结果）

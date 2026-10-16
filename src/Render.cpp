@@ -349,6 +349,54 @@ void renderItemInto(const DisplayItem& item, const Matrix& root,
     }
 }
 
+// 栅格化运行时 TextField（AS3 设置的 .text）。复用已解码的字体字形轮廓，
+// 按字符码映射到字形，并以字号缩放（字形设计单位 em=1024）。
+static void renderDynamicText(const fvm::DisplayObject& d, const Matrix& world,
+                              const Movie& movie, std::uint8_t* buf, int W, int H, float alpha) {
+    const FontGlyphs* fg = nullptr;
+    for (const auto& kv : movie.characters) {
+        if (kv.second && kv.second->kind == Character::Kind::Font && kv.second->font) {
+            fg = kv.second->font.get();
+            break;
+        }
+    }
+    if (!fg) return;
+    float s = (static_cast<float>(d.textSize) * 20.0f) / 1024.0f;   // 字形设计单位(em=1024) -> twips
+    Color col(static_cast<std::uint8_t>((d.textColor >> 16) & 0xFF),
+              static_cast<std::uint8_t>((d.textColor >> 8) & 0xFF),
+              static_cast<std::uint8_t>(d.textColor & 0xFF),
+              static_cast<std::uint8_t>((d.textColor >> 24) & 0xFF));
+    Paint p; p.kind = FillKind::Solid; p.solid = col;
+    float penX = 0, penY = 0;
+    float lineH = static_cast<float>(d.textSize) * 20.0f * 1.2f;   // 行高（twips）
+    auto glyphAdvance = [&](const Shape& shape) -> float {
+        float w = 0;
+        for (const auto& ct : shape.fillPaths)
+            for (const auto& c : ct)
+                for (float x : c.xs) w = std::max(w, x);
+        return w;
+    };
+    for (char ch : d.textData) {
+        if (ch == '\n') { penY += lineH; penX = 0; continue; }
+        auto it = fg->codeToGlyph.find(static_cast<unsigned char>(ch));
+        int gi = (it != fg->codeToGlyph.end()) ? it->second : -1;
+        if (gi < 0 || gi >= static_cast<int>(fg->shapes.size()) || !fg->shapes[gi]) {
+            penX += s * 512.0f; continue;   // 未知字符占位
+        }
+        const auto& shape = *fg->shapes[gi];
+        Matrix ms; ms.sx = s; ms.sy = s;                 // scale（em -> twips）
+        Matrix mt; mt.tx = penX; mt.ty = penY;          // 笔位（twips）
+        Matrix gm = world.post(ms).post(mt);
+        Matrix Minv; gm.invert(Minv);
+        for (std::size_t i = 0; i < shape.fillStyles.size(); ++i) {
+            if (i >= shape.fillPaths.size() || shape.fillPaths[i].empty()) continue;
+            fillContours(shape.fillPaths[i], gm, Minv, p, buf, W, H, alpha);
+        }
+        float wEm = glyphAdvance(shape);
+        penX += (wEm > 0 ? wEm : 512.0f) * s + s * 40.0f;   // 前进 + 字间距
+    }
+}
+
 // AVM2 运行时显示列表（AS3 构建的场景）的渲染。
 // parent：父级把"角色局部 twips"映射为设备像素的仿射矩阵；
 // DisplayObject 的 x/y 单位 = 父级局部空间的像素（20 twips），scale/rotation 分解自其变换矩阵。
@@ -382,6 +430,8 @@ void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Mat
             renderItemInto(di, world, movie.characters, buf, W, H, fIdx, a);
         }
     }
+    if (d->hasText && !d->textData.empty())
+        renderDynamicText(*d, world, movie, buf, W, H, a);
     for (const auto& c : d->children)
         renderDisplayObject(c, world, movie, buf, W, H, frameIndex, a);
 }

@@ -574,14 +574,14 @@ static void parseGlyphShape(ByteView& bv, std::shared_ptr<Shape>& shape, int sha
 // DefineFont2(48) / DefineFont3(75)。注意：FontID 已由调用方读出，本函数从 flags 开始。
 static std::shared_ptr<FontGlyphs> decodeFont(ByteView& bv) {
     auto fg = std::make_shared<FontGlyphs>();
-    bv.readUI8();               // flags
+    uint8_t flags = bv.readUI8();   // FontFlags（bit7 = WideCodes）
     int nameLen = bv.readUI8();
     bv.skip(static_cast<std::size_t>(nameLen));
     int numGlyphs = bv.readUI16();
     if (numGlyphs <= 0 || numGlyphs > 65535 || bv.overflow()) return fg;
     std::vector<std::uint32_t> offsets(static_cast<std::size_t>(numGlyphs));
     for (int i = 0; i < numGlyphs; ++i) offsets[i] = bv.readUI32();
-    bv.readUI32();              // CodeTableOffset
+    uint32_t codeTableOffset = bv.readUI32();   // CodeTableOffset（相对记录起始）
     // 字形表基址：OffsetTable[0] 相对于其后紧邻的字形表起始处
     std::size_t tableBase = bv.pos();
     fg->shapes.resize(static_cast<std::size_t>(numGlyphs));
@@ -594,6 +594,16 @@ static std::shared_ptr<FontGlyphs> decodeFont(ByteView& bv) {
         auto shp = std::make_shared<Shape>();
         parseGlyphShape(gv, shp, 3);
         fg->shapes[static_cast<std::size_t>(i)] = shp;
+    }
+    // 代码表：每字形对应一个字符码（1 或 2 字节，取决于 WideCodes 标志位）
+    bool wideCodes = (flags & 0x80) != 0;
+    if (codeTableOffset > 0 && codeTableOffset + numGlyphs * (wideCodes ? 2 : 1) <= bv.size()) {
+        bv.seek(static_cast<std::size_t>(codeTableOffset));
+        for (int i = 0; i < numGlyphs; ++i) {
+            int code = wideCodes ? static_cast<int>(bv.readUI16())
+                                 : static_cast<int>(bv.readUI8());
+            fg->codeToGlyph[code] = i;
+        }
     }
     return fg;
 }
