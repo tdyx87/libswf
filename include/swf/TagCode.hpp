@@ -72,6 +72,7 @@ enum class TagCode : std::uint16_t {
     Internal85 = 85,
     DefineSceneAndFrameLabelData = 86,
     DefineBinaryData = 87,
+    DefineFontName = 88,
     StartSound2 = 89,
     DefineBitsJPEG4 = 90,
     DefineFont4 = 91,
@@ -144,6 +145,7 @@ inline const char* tagName(std::uint16_t code) {
         case 85:  return "Internal(85)";
         case 86:  return "DefineSceneAndFrameLabelData";
         case 87:  return "DefineBinaryData";
+        case 88:  return "DefineFontName";
         case 89:  return "StartSound2";
         case 90:  return "DefineBitsJPEG4";
         case 91:  return "DefineFont4";

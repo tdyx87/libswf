@@ -1,11 +1,15 @@
 # 构建产物
 build/
+build-dbg/
 *.exe
 *.pdb
 *.ilk
 *.obj
 *.lib
 *.exp
+
+# 预编译三方二进制（体积大，不入库）
+third_party/ffmpeg-*
 
 # 本机/环境相关
 CMakeUserPresets.json

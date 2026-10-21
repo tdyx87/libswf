@@ -115,6 +115,43 @@ void Parser::dispatch(const std::uint8_t* data, std::size_t avail, TagInfo& info
             info.note = "frame label at " + std::to_string(off);
             break;
         }
+        case 60: {  // DefineVideoStream：UI16 id + UI16 numFrames + UI16 W + UI16 H + UI8 VideoFlags
+            std::uint16_t id = bv.readUI16();
+            std::uint16_t nf = bv.readUI16();
+            std::uint16_t w = bv.readUI16();
+            std::uint16_t h = bv.readUI16();
+            std::uint8_t vf = bv.readUI8();
+            static const char* kCodec[] = {"undefined", "reserved", "H.263", "ScreenVideo",
+                                           "VP6", "VP6+alpha", "ScreenVideo2", "AVC"};
+            std::uint8_t cid = vf & 0x0F;
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "id=%u %dx%d frames=%u codec=%s%s%s",
+                          id, w, h, nf, cid < 8 ? kCodec[cid] : "?",
+                          (vf & 0x10) ? " smoothing" : "", (vf & 0x20) ? " deblocking" : "");
+            info.note = buf;
+            break;
+        }
+        case 61: {  // VideoFrame：UI16 StreamID + UI16 FrameNum + 压缩数据
+            std::uint16_t sid = bv.readUI16();
+            std::uint16_t fnum = bv.readUI16();
+            info.note = "stream=" + std::to_string(sid) + " frame=" + std::to_string(fnum) +
+                        " (" + std::to_string(len >= 4 ? len - 4 : 0) + " bytes)";
+            break;
+        }
+        case 14: {  // DefineSound：UI16 SoundID + UI8 flags（格式/采样率/位深/声道）
+            std::uint16_t id = bv.readUI16();
+            std::uint8_t flags = bv.readUI8();
+            static const char* kFmt[] = {"Uncompressed", "ADPCM", "MP3", "Nellymoser",
+                                         "PCMLError", "Speex", "", "MP3-8", "", "Nellymoser-16"};
+            // SWF 采样率表不是 5512<<n（11024≠11025），必须用精确值
+            static const int kRate[4] = {5512, 11025, 22050, 44100};
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "id=%u %s %dHz %dbit %dch",
+                          id, kFmt[(flags >> 4) & 0x0F], kRate[(flags >> 2) & 3],
+                          ((flags >> 1) & 1) ? 16 : 8, (flags & 1) ? 2 : 1);
+            info.note = buf;
+            break;
+        }
         default:
             info.note = std::to_string(len) + " bytes";
             break;

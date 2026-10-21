@@ -62,6 +62,12 @@ public:
 
     // sub_477E50：位流结束 —— 把 refill 预读但未被消费的整字节退回给字节流
     void finish() {
+        // 语义：把 refill 预读但未消费的**整字节**退回，落点即"向上对齐到下一字节"。
+        // 等价推导：缓冲覆盖 [P-4, P)，已消费 c = 32 - bitCount_ 位，
+        //   对齐位 = (P-4) + ceil(c/8) = P - floor(bitCount_/8)
+        // 两种写法完全等价，这里保留更简洁的前者对应形式。
+        // 注意：不能用 floor(c/8)——那会少退一整字节，SWF 头（frameRate/frameCount）
+        // 会因此整体错位（实测会读出 frameCount=11794 这种垃圾值）。
         std::size_t back = static_cast<std::size_t>(bitCount_) / 8;
         std::size_t p = src_.pos();
         src_.seek(back <= p ? p - back : 0);
@@ -69,7 +75,27 @@ public:
         bitCount_ = 0;
     }
 
+    // 把字节流位置**前进**到当前位位置之后的整字节边界，并清空位缓冲。
+    // 用于位字段与字节结构混排的场合（例如 SHAPE 记录里的 FILLSTYLEARRAY）：
+    // finish() 是"把预读的整字节退回"，语义相反，不能用于此处。
+    void alignToByte() {
+        if (bitCount_ <= 0) return;         // 无缓冲：字节位置本来就是对的
+        // refill() 一次装入 4 字节，故 src_.pos() == P 时缓冲覆盖 [P-4, P)，
+        // 已消费 c = 32 - bitCount_ 位，下一个位所在字节 = (P-4) + ceil(c/8)。
+        int consumed = 32 - bitCount_;
+        std::size_t p = src_.pos();
+        std::size_t start = (p >= 4) ? p - 4 : 0;
+        src_.seek(start + static_cast<std::size_t>((consumed + 7) / 8));
+        bitBuf_ = 0;
+        bitCount_ = 0;
+    }
+
     bool overflow() const { return src_.overflow(); }
+
+    // 逻辑位位置（相对字节流起点）：src_.pos()*8 减去尚未消费的缓冲位。
+    std::size_t bitPos() const {
+        return src_.pos() * 8 - static_cast<std::size_t>(bitCount_);
+    }
 
 private:
     ByteView& src_;
