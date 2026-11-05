@@ -163,27 +163,10 @@ def read_fill(r, alpha, ver):
 def read_line(r, alpha, ver):
     w = r.ub(16)
     if ver < 4:
-        if ver >= 3:
-            # DefineShape3 的线样式也是位打包的
-            r.ub(2)
-            join = r.ub(2)
-            has_fill = r.ub(1)
-            r.ub(1)
-            r.ub(1)
-            r.ub(1)
-            r.ub(5)
-            r.ub(1)
-            r.ub(2)
-            if join == 2:
-                r.ub(8)
-            r.align()
-            if has_fill:
-                read_fill(r, alpha, ver)
-            else:
-                read_rgba(r, alpha)
-        else:
-            read_rgba(r, alpha)
-        return w
+        # DefineShape1/2/3 的线样式都是简单形式：Width UI16 + Color(RGB/RGBA)
+        # （LINESTYLE2 位打包形式是 DefineShape4 才引入的）
+        col = read_rgba(r, alpha)
+        return (w, col)
     r.ub(2)
     join = r.ub(2)
     has_fill = r.ub(1)
@@ -253,6 +236,7 @@ def dump_shape(data, ver):
     print("bounds=%s edge=%s fills=%d lines=%d fillBits=%d lineBits=%d winding=%d"
           % (bounds, edge_bounds, len(fills), len(lines), num_fill_bits, num_line_bits, winding))
     print("fill styles:", fills[:6])
+    print("line styles (width):", lines[:8])
 
     # 边记录
     paths = {}
@@ -262,6 +246,8 @@ def dump_shape(data, ver):
     recs = 0
     style_changes = 0
     edges = 0
+    ex0 = ey0 = 1 << 30
+    ex1 = ey1 = -(1 << 30)   # 实际几何范围（含曲线控制点）
     while True:
         recs += 1
         if recs > 200000:
@@ -335,6 +321,13 @@ def dump_shape(data, ver):
                 cy = py + r.sb(nb)
                 px = cx + r.sb(nb)
                 py = cy + r.sb(nb)
+                ex0 = min(ex0, cx); ex1 = max(ex1, cx)
+                ey0 = min(ey0, cy); ey1 = max(ey1, cy)
+            ex0 = min(ex0, px); ex1 = max(ex1, px)
+            ey0 = min(ey0, py); ey1 = max(ey1, py)
+            if os.environ.get('EDGE_DUMP') == '1':
+                print("  edge rec%d pos=(%d,%d) straight=%d act0=%d act1=%d line=%d"
+                      % (recs, px, py, straight, act0, act1, actline))
             edges += 1
             if act0:
                 paths.setdefault(act0, 0)
@@ -346,6 +339,11 @@ def dump_shape(data, ver):
     print("records=%d edges=%d styleNewRecords=%d finalFills=%d endPos=%d/%d%s"
           % (recs, edges, style_changes, len(fills), r.bitpos >> 3, total_len,
              "  <== CLEAN" if abs((r.bitpos >> 3) - total_len) <= 1 else "  <== DESYNC"))
+    print("actual geometry extent(twips): x[%d..%d] y[%d..%d]"
+          % (ex0, ex1, ey0, ey1))
+    print("declared bounds: %s" % (bounds,))
+    if ex0 < bounds[0] or ex1 > bounds[1] or ey0 < bounds[2] or ey1 > bounds[3]:
+        print("  <== GEOMETRY EXCEEDS DECLARED BOUNDS")
     used = sorted(set(abs(k) for k in paths))
     print("referenced fill styles: %d  -> %s" % (len(used), used[:20]))
     print("total fill styles: %d" % len(fills))

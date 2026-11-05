@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <string>
 #include <cstdlib>
+#include <future>
 #include <map>
 #include <utility>
 #include <vector>
@@ -51,8 +52,10 @@ static void printUsage() {
     std::printf("  swfparser <file.swf> --wav <id> <out.wav>      decode a DefineSound (MP3/Speex/Nellymoser) to WAV\n");
     std::printf("  swfparser <file.swf> --render-video <id> <outdir>  export decoded video frames as PNGs\n");
     std::printf("  swfparser <file.swf> --play-avm1 <count> <outdir>  AVM1-driven playback -> PNG frames\n");
+    std::printf("  swfparser <file.swf> --play <count> <outdir> [--click F:X:Y] [--hover F:X:Y]  AVM2 playback -> PNG frames\n");
     std::printf("  swfparser <file.swf> --play-game <count> <outdir> [--click F:X:Y]...  headless full playback via swf::Player\n");
     std::printf("  swfparser <file.swf> --play-game <count> <outdir> [--hover F:X:Y]...  move mouse (no press) at step F\n");
+    std::printf("  [--size WxH]  re-rasterize each frame at WxH (vector/text stay sharp when upscaled)\n");
 }
 
 static void printOpcodes() {
@@ -173,15 +176,28 @@ static bool readFile(const std::string& path, std::vector<std::uint8_t>& buf) {
     return got == buf.size();
 }
 
+// PNG 编码（zlib 压缩）耗时通常是软件光栅的数倍。导出逐帧序列时把编码交给后台
+// 线程，与下一帧的渲染重叠执行；编码只读传入的 RGBA 缓冲，与渲染无数据竞争。
+static std::future<bool> writePngAsync(std::string path, std::vector<std::uint8_t> rgba,
+                                       int W, int H) {
+    return std::async(std::launch::async,
+                      [path = std::move(path), rgba = std::move(rgba), W, H] {
+                          return stbi_write_png(path.c_str(), W, H, 4, rgba.data(), W * 4) != 0;
+                      });
+}
+
 int main(int argc, char** argv) {
     std::string path;
     bool opcodes = false, render = false, renderAll = false, inspect = false, runAs = false, play = false;
     bool listAvm1 = false, extractAudio = false, playAvm1 = false;
     bool wav = false, playSound = false, wavStream = false, renderVideo = false;
-    bool playGame = false;
+    bool playGame = false, noRender = false;
     struct ClickSpec { int frame; double x, y; };
     std::vector<ClickSpec> clicks;   // --click <frame>:<x>:<y>（可重复，模拟按下并在 +2 帧释放）
     std::vector<ClickSpec> hovers;   // --hover <frame>:<x>:<y>（可重复，把鼠标移到该位置但不按下）
+    // --drag <down>:<up>:<x1>:<y1>:<x2>:<y2>：按下后逐帧从 (x1,y1) 移到 (x2,y2)，第 up 帧释放
+    struct DragSpec { int down, up; double x1, y1, x2, y2; };
+    std::vector<DragSpec> drags;
     std::vector<std::pair<int, int>> keys;   // --key <frame>:<vk>（可重复，在第 frame 步发送一次 keyDown）
     std::string outPath = "out.png";
     std::string outDir = "frames";
@@ -189,6 +205,7 @@ int main(int argc, char** argv) {
     std::string videoDir = "video";
     std::uint16_t audioId = 0;
     int frame = 0, playCount = 0;
+    int targetW = 0, targetH = 0;   // --size WxH：按设备分辨率重新光栅化
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--opcodes" || a == "-o") opcodes = true;
@@ -223,6 +240,7 @@ int main(int argc, char** argv) {
         else if (a == "--play-game" && i + 2 < argc) {  // --play-game <count> <outdir>：真实 swf::Player 全流程播放
             playGame = true; playCount = std::atoi(argv[++i]); outDir = argv[++i];
         }
+        else if (a == "--no-render") noRender = true;   // 只推进时间轴与交互，不导出 PNG
         else if (a == "--click" && i + 1 < argc) {  // --click <frame>:<x>:<y>
             std::string spec = argv[++i];
             double x = 0, y = 0; int fr = 0;
@@ -238,7 +256,20 @@ int main(int argc, char** argv) {
             double x = 0, y = 0; int fr = 0;
             if (std::sscanf(spec.c_str(), "%d:%lf:%lf", &fr, &x, &y) == 3) hovers.push_back({fr, x, y});
         }
+        else if (a == "--drag" && i + 1 < argc) {  // --drag <down>:<up>:<x1>:<y1>:<x2>:<y2>
+            std::string spec = argv[++i];
+            DragSpec ds{};
+            if (std::sscanf(spec.c_str(), "%d:%d:%lf:%lf:%lf:%lf",
+                            &ds.down, &ds.up, &ds.x1, &ds.y1, &ds.x2, &ds.y2) == 6)
+                drags.push_back(ds);
+        }
         else if (a == "--frame" && i + 1 < argc) { frame = std::atoi(argv[++i]); }
+        else if (a == "--size" && i + 1 < argc) {  // --size <W>x<H>：高分辨率重新光栅化
+            int w = 0, h = 0;
+            if (std::sscanf(argv[++i], "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+                targetW = w; targetH = h;
+            }
+        }
         else if (a == "--help" || a == "-h") { printUsage(); return 0; }
         else path = a;
     }
@@ -266,10 +297,21 @@ int main(int argc, char** argv) {
             up[c.frame + 2] = {c.x, c.y};   // 按住 2 帧后释放
         }
         char fnbuf[512];
+        std::future<bool> pendingPng;   // 上一帧的后台 PNG 编码
         for (int step = 0; step < playCount; ++step) {
             // 悬停：从指定步开始每帧都重设鼠标位置（显示列表每帧重建，按钮态需持续刷新）。
             for (const auto& hv : hovers)
                 if (step >= hv.frame) player.setMouse(hv.x, hv.y);
+            // --drag：按下后逐帧移动指针（拖动靠移动驱动），到期释放。
+            for (const auto& dg : drags) {
+                if (step < dg.down || step > dg.up) continue;
+                double t = (dg.up > dg.down) ? double(step - dg.down) / double(dg.up - dg.down) : 1.0;
+                double dx = dg.x1 + (dg.x2 - dg.x1) * t;
+                double dy = dg.y1 + (dg.y2 - dg.y1) * t;
+                if (step == dg.down) { player.setMouse(dx, dy); player.mouseDown(); }
+                else if (step == dg.up) { player.setMouse(dx, dy); player.mouseUp(); }
+                else player.setMouse(dx, dy);
+            }
             auto d = down.find(step);
             if (d != down.end()) { player.setMouse(d->second.first, d->second.second); player.mouseDown(); }
             auto u = up.find(step);
@@ -278,12 +320,14 @@ int main(int argc, char** argv) {
                 if (kv.first == step) player.keyDown(kv.second);
             player.tick();
             std::vector<std::uint8_t> rgba; int W = 0, H = 0;
-            if (player.render(rgba, W, H)) {
+            if (player.render(rgba, W, H, targetW, targetH)) {
                 std::snprintf(fnbuf, sizeof(fnbuf), "%s/p_%04d.png", outDir.c_str(), step);
-                stbi_write_png(fnbuf, W, H, 4, rgba.data(), W * 4);
+                if (pendingPng.valid()) pendingPng.get();   // 等上一帧编码完成再复用缓冲
+                pendingPng = writePngAsync(fnbuf, std::move(rgba), W, H);
             }
             std::printf("step=%d frame=%d\n", step, player.currentFrame());
         }
+        if (pendingPng.valid()) pendingPng.get();   // 收尾：等最后一帧编码落盘
         std::printf("played %d steps -> %s/\n", playCount, outDir.c_str());
         return 0;
     }
@@ -350,9 +394,12 @@ int main(int argc, char** argv) {
                 ++n;
             }
             if (n == 0) {
-                std::printf("video id %u: codecId=%u (%ux%u) 未能解码（%s）—— 需启用 FFmpeg 后端\n",
+                // 纯 ASCII：此前该行在 MSVC /utf-8 下触发 C4819，
+                // 导致格式串解析异常并报 C4474（参数数量不匹配）。
+                std::printf("video id %u: codecId=%u (%u x %u) not decoded (%s) - FFmpeg backend required\n",
                             audioId, vs->codecId, vs->width, vs->height,
-                            vs->codecId == 3 ? "无已解码帧" : "H.263/VP6/AVC 未配置 FFmpeg 或未包含已解码帧");
+                            vs->codecId == 3 ? "no decoded frames"
+                                : "H.263/VP6/AVC needs FFmpeg or has no decoded frames");
             } else {
                 std::printf("exported %d video frames (codecId=%u %ux%u) -> %s/\n",
                             n, vs->codecId, vs->width, vs->height, videoDir.c_str());
@@ -408,13 +455,46 @@ int main(int argc, char** argv) {
                 auto vms = swf::fvm::runMovieScripts(movie);
                 std::printf("AVM2 done: vms=%zu, runtime stage nodes=%zu, symbolClasses=%zu\n",
                             vms.size(), movie.runtimeStage.size(), movie.symbolClasses.size());
+                if (std::getenv("SWF_AS_SYMBOLS"))   // 临时诊断：打印 SymbolClass 映射
+                    for (const auto& kv : movie.symbolClasses)
+                        std::printf("[symbol] %s -> char %u\n", kv.first.c_str(), kv.second);
 
                 if (play && !movie.runtimeStage.empty()) {
                     std::error_code ec;
                     std::filesystem::create_directories(outDir, ec);
+                    // 输入调度：--click F:X:Y 在 F 帧按下、F+2 帧释放；--hover F:X:Y 从 F 帧起保持指针位置
+                    std::map<int, std::pair<double, double>> down, up;
+                    for (const auto& c : clicks) {
+                        down[c.frame] = {c.x, c.y};
+                        up[c.frame + 2] = {c.x, c.y};
+                    }
                     char fnbuf[512];
                     for (int f = 0; f < playCount; ++f) {
+                        for (const auto& hv : hovers)
+                            if (f >= hv.frame)
+                                for (auto& vm : vms) vm->setMousePosition(hv.x, hv.y);
+                        // --drag：按下后逐帧移动指针（拖动靠移动驱动），到期释放
+                        for (const auto& dg : drags) {
+                            if (f < dg.down || f > dg.up) continue;
+                            double t = (dg.up > dg.down)
+                                           ? double(f - dg.down) / double(dg.up - dg.down)
+                                           : 1.0;
+                            double dx = dg.x1 + (dg.x2 - dg.x1) * t;
+                            double dy = dg.y1 + (dg.y2 - dg.y1) * t;
+                            for (auto& vm : vms) {
+                                if (f == dg.down) vm->mouseDown(dx, dy);
+                                else if (f == dg.up) vm->mouseUp(dx, dy);
+                                else vm->setMousePosition(dx, dy);
+                            }
+                        }
+                        auto d = down.find(f);
+                        if (d != down.end())
+                            for (auto& vm : vms) vm->mouseDown(d->second.first, d->second.second);
+                        auto u = up.find(f);
+                        if (u != up.end())
+                            for (auto& vm : vms) vm->mouseUp(u->second.first, u->second.second);
                         for (auto& vm : vms) vm->tick();   // 推进所有时间轴 + 派发 enterFrame 等
+                        if (noRender) continue;
                         std::snprintf(fnbuf, sizeof(fnbuf), "frame_%03d.png", f);
                         std::filesystem::path outp = std::filesystem::path(outDir) / fnbuf;
                         if (!swf::renderMovieToPNG(movie, 0, outp.string().c_str())) {
@@ -532,15 +612,21 @@ int main(int argc, char** argv) {
             std::filesystem::create_directories(outDir, ec);
             std::size_t count = 0;
             char fnbuf[512];
+            std::future<bool> pendingPng;
             for (std::size_t f = 0; f < movie.frames.size(); ++f) {
                 std::snprintf(fnbuf, sizeof(fnbuf), "frame_%03zu.png", f);
                 std::filesystem::path outp = std::filesystem::path(outDir) / fnbuf;
-                if (!swf::renderMovieToPNG(movie, static_cast<int>(f), outp.string().c_str())) {
+                std::vector<std::uint8_t> next;
+                int w = 0, h = 0;
+                if (!swf::renderMovieToBuffer(movie, static_cast<int>(f), next, w, h)) {
                     std::fprintf(stderr, "render frame %zu failed\n", f);
                     return 1;
                 }
+                if (pendingPng.valid()) pendingPng.get();   // 上一帧编码完成后再提交
+                pendingPng = writePngAsync(outp.string(), std::move(next), w, h);
                 ++count;
             }
+            if (pendingPng.valid()) pendingPng.get();
             std::printf("rendered %zu frames -> %s/\n", count, outDir.c_str());
             return 0;
         }
@@ -561,8 +647,10 @@ int main(int argc, char** argv) {
     int rc = parser.parseFile(path, r);
 
     std::printf("file        : %s\n", path.c_str());
-    if (!r.error.empty() && !r.ok) {
-        std::printf("error       : %s (rc=%d)\n", r.error.c_str(), rc);
+    // rc<0 时 error 可能为空（截断的标签流），只看 error 会漏报失败。
+    if (rc < 0 || !r.error.empty()) {
+        std::printf("error       : %s (rc=%d)\n",
+                    r.error.empty() ? "parse failed" : r.error.c_str(), rc);
         return 1;
     }
 
