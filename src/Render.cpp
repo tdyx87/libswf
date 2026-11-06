@@ -740,6 +740,10 @@ static void drawThickSegment(float axp, float ayp, float bxp, float byp, float h
                 ib = std::min(xb, static_cast<int>(std::floor(hiI - 0.5f)) - 1);
             }
         }
+        // 纵深防御：直写不经过 plot() 的边界检查，必须把区间夹回本行合法范围。
+        // 否则 ia/ib 一旦因异常浮点值算出界，x >= W 会回绕写到下一行开头。
+        ia = std::max(ia, xa);
+        ib = std::min(ib, xb);
         if (ib >= ia) {
             for (int x = xa; x < ia; ++x) plotDist(x, y, py);
             if (base.a == 255 && alphaMul >= 1.0f && bm == BlendMode::Normal) {
