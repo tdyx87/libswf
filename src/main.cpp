@@ -688,6 +688,38 @@ int main(int argc, char** argv) {
                 }
             }
             std::printf("frames: %zu\n", movie.frames.size());
+            if (std::getenv("SWF_SPRITE_DUMP")) {
+                const char* dv = std::getenv("SWF_SPRITE_DUMP");
+                if (std::strcmp(dv, "allnames") == 0) {
+                    for (const auto& kv : movie.characters) {
+                        if (!kv.second || kv.second->kind != swf::Character::Kind::Sprite) continue;
+                        for (std::size_t f = 0; f < kv.second->spriteFrames.size(); ++f)
+                            for (const auto& di : kv.second->spriteFrames[f].items)
+                                if (!di.name.empty())
+                                    std::printf("named cid=%u frame=%zu d%u c%u tx=%.0f ty=%.0f name='%s'\n",
+                                                kv.first, f, di.depth, di.characterId,
+                                                di.matrix.tx / 20.0, di.matrix.ty / 20.0, di.name.c_str());
+                    }
+                    return 0;
+                }
+                unsigned want = static_cast<unsigned>(std::atoi(std::getenv("SWF_SPRITE_DUMP")));
+                auto it = movie.characters.find(want);
+                if (it != movie.characters.end() && it->second->kind == swf::Character::Kind::Sprite) {
+                    int fi = 0;
+                    for (const auto& fr : it->second->spriteFrames) {
+                        std::printf("sprite %u frame %d items=%zu:", want, fi++, fr.items.size());
+                        for (const auto& di : fr.items)
+                            std::printf(" d%u:c%u'%s'%s(sx=%.3f r0=%.4f r1=%.4f sy=%.3f tx=%.1f ty=%.1f ratio=%.3f)",
+                                        di.depth, di.characterId,
+                                        di.name.c_str(), di.clipDepth ? "(clip)" : "",
+                                        di.matrix.sx, di.matrix.r0, di.matrix.r1, di.matrix.sy,
+                                        di.matrix.tx / 20.0, di.matrix.ty / 20.0, di.ratio);
+                        std::printf("\n");
+                    }
+                } else {
+                    std::printf("sprite %u not found or not a sprite\n", want);
+                }
+            }
             if (!movie.abcFiles.empty()) {
                 for (std::size_t fi = 0; fi < movie.abcFiles.size(); ++fi) {
                     const auto& a = movie.abcFiles[fi];

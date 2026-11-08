@@ -17,6 +17,9 @@ namespace swf {
 // 门户页"。历史上这里为特定样本复制整部影片、冻结主 Vm 并伪造 1.5s + 12.5s
 // 启动时序，导致通用 AVM2 影片前数百帧画面静止、脚本不推进，与官方播放器差异很大。
 // 默认按真实语义播放；SWF_STARTUP_SIM=1 可复现旧时序用于 A/B 对照。
+// FIX-2026-020：对带「preloader + intro 品牌门户」结构的影片（如 swf2.swf）默认
+// 自动启用启动模拟——官方播放器开局有加载进度页与门户页，跳过它们与官方不符；
+// 检测不到该结构的影片仍按真实语义直接播放。SWF_STARTUP_SIM=0 可强制关闭。
 static bool startupSimEnabled() {
     const char* e = std::getenv("SWF_STARTUP_SIM");
     return e && e[0] == '1';
@@ -318,34 +321,32 @@ bool Player::load(const std::vector<std::uint8_t>& data, std::string& err) {
     portalElapsed_ = 0;
     portalStarted_ = false;
     preloaderRoot_.reset();
-    if (startupSimEnabled() && !movie_.abcFiles.empty() && movie_.frames.size() > 1) {
+    const char* simEnv = std::getenv("SWF_STARTUP_SIM");
+    const bool simForceOn = simEnv && simEnv[0] == '1';
+    const bool simForceOff = simEnv && simEnv[0] == '0';
+    if (!simForceOff && !movie_.abcFiles.empty() && movie_.frames.size() > 1) {
         loadingMovie_ = movie_;
         auto firstVms = fvm::runMovieScripts(loadingMovie_, 0);
+        // FIX-2026-020：SWF_ROOT_TIMELINE 转正后根时间轴逐帧自动推进，影片副本在
+        // 预热期就被推到第 2 帧（main），firstFrameStage_ 捕获到的是游戏内容而非
+        // preloader——启动模拟整体失效，开局进度条消失（用户主诉）。冻结副本的根
+        // 时间轴与其直接子剪辑（preloading 门户页容器），预热只推进内部子剪辑
+        // （头像/logo/星光入场动画）。
+        for (const auto& r : loadingMovie_.runtimeStage) {
+            if (!r) continue;
+            r->playing = false;
+            for (const auto& c : r->children)
+                if (c) c->playing = false;
+        }
+        if (std::getenv("SWF_SIM_DBG"))
+            std::fprintf(stderr, "[sim] probe abc=%zu frames=%zu stage=%zu vms=%zu\n",
+                         movie_.abcFiles.size(), movie_.frames.size(),
+                         loadingMovie_.runtimeStage.size(), firstVms.size());
         // 官方播放器窗口出现时 preloader 入场动画已跑了一会儿：先推进若干帧，
         // 让头像与 logo 处于加载中而非初始位置。
         for (int i = 0; i < 16; ++i)
             for (auto& vm : firstVms) vm->tick();
         if (!loadingMovie_.runtimeStage.empty()) {
-            firstFrameStage_ = loadingMovie_.runtimeStage;
-            loadingVms_ = firstVms;
-            loadingTotal_ = static_cast<int>(movie_.frameRate * 1.5f + 0.5f);
-            if (loadingTotal_ < 1) loadingTotal_ = 1;
-            std::function<std::shared_ptr<fvm::DisplayObject>(
-                const std::shared_ptr<fvm::DisplayObject>&, const std::string&)> findByName =
-                [&](const std::shared_ptr<fvm::DisplayObject>& d, const std::string& part)
-                    -> std::shared_ptr<fvm::DisplayObject> {
-                    if (!d) return nullptr;
-                    if (d->name.find(part) != std::string::npos) return d;
-                    for (const auto& c : d->children)
-                        if (auto hit = findByName(c, part)) return hit;
-                    return nullptr;
-                };
-            // 进度条按 SWF 语义由 gotoAndStop(pct) 驱动：Bar 每帧放置同一
-            // MorphShape 并给出 ratio，Morph 终止段几何解码后中间帧可正确渲染。
-            updateLoadingProgress();
-            // 门户页位于 preloader 主容器的第 2 帧：该帧移除全部加载控件并放置
-            // intro 剪辑。识别出这个容器后，加载完成即跳到该帧，品牌页（渐变
-            // 背景、logo、星光、分类气泡、按钮）由其内部时间轴自行播放。
             std::function<std::shared_ptr<fvm::DisplayObject>(
                 const std::shared_ptr<fvm::DisplayObject>&)> findPortalRoot =
                 [&](const std::shared_ptr<fvm::DisplayObject>& d)
@@ -362,11 +363,27 @@ bool Player::load(const std::vector<std::uint8_t>& data, std::string& err) {
                         if (auto hit = findPortalRoot(c)) return hit;
                     return nullptr;
                 };
-            for (const auto& r : firstFrameStage_)
-                if (auto hit = findPortalRoot(r)) { preloaderRoot_ = hit; break; }
-            if (preloaderRoot_ && !loadingVms_.empty()) {
-                portalTotal_ = static_cast<int>(movie_.frameRate * 12.5f + 0.5f);
-                if (portalTotal_ < 1) portalTotal_ = 1;
+            std::shared_ptr<fvm::DisplayObject> portal;
+            for (const auto& r : loadingMovie_.runtimeStage)
+                if (auto hit = findPortalRoot(r)) { portal = hit; break; }
+            // 自动检测：影片确实带「preloader + 品牌门户」结构（preloading 容器的
+            // 第 2 帧含 intro 剪辑）才启用模拟；SWF_STARTUP_SIM=1 强制启用作 A/B。
+            if (portal || simForceOn) {
+                firstFrameStage_ = loadingMovie_.runtimeStage;
+                loadingVms_ = firstVms;
+                loadingTotal_ = static_cast<int>(movie_.frameRate * 1.5f + 0.5f);
+                if (loadingTotal_ < 1) loadingTotal_ = 1;
+                if (portal) preloaderRoot_ = portal;
+                if (preloaderRoot_ && !loadingVms_.empty()) {
+                    portalTotal_ = static_cast<int>(movie_.frameRate * 12.5f + 0.5f);
+                    if (portalTotal_ < 1) portalTotal_ = 1;
+                }
+                // 进度条按 SWF 语义由 gotoAndStop(pct) 驱动：Bar 每帧放置同一
+                // MorphShape 并给出 ratio，Morph 终止段几何解码后中间帧可正确渲染。
+                updateLoadingProgress();
+                if (std::getenv("SWF_SIM_DBG"))
+                    std::fprintf(stderr, "[sim] engaged loading=%d portal=%d\n",
+                                 loadingTotal_, portalTotal_);
             }
         }
     }
@@ -774,22 +791,32 @@ DisplayItem* Player::resolveItemChain(const std::vector<std::pair<int, int>>& ch
     return found;
 }
 
+std::vector<std::shared_ptr<fvm::Vm>>& Player::activeVms() {
+    // 加载/门户阶段：可见且可交互的 UI 是启动副本 loadingVms_（其 firstFrameStage_
+    // 正是渲染所用的 runtimeStage）。副本存在时把 AVM2 鼠标事件派发给它，否则回退
+    // 到真实游戏 Vm，避免门户 Play 等按钮在冻结的 vms_ 第 0 帧上点不中（FIX-2026-022）。
+    if (!loadingVms_.empty() &&
+        (loadingElapsed_ < loadingTotal_ || portalElapsed_ < portalTotal_))
+        return loadingVms_;
+    return vms_;
+}
+
 void Player::setMouse(double x, double y) {
     mouseX_ = x; mouseY_ = y;
     pollMouseEvents(mouseDown_);
     // AVM2：运行时显示树的命中与事件派发由 Vm 维护，同一舞台坐标需同步转交。
-    for (auto& vm : vms_) vm->setMousePosition(x, y);
+    for (auto& vm : activeVms()) vm->setMousePosition(x, y);
 }
 void Player::mouseDown() {
     mouseDown_ = true;
     pollMouseEvents(true);
-    for (auto& vm : vms_) vm->mouseDown(mouseX_, mouseY_);
+    for (auto& vm : activeVms()) vm->mouseDown(mouseX_, mouseY_);
 }
 void Player::mouseUp() {
     if (mouseDown_) pollMouseEvents(false);
     mouseDown_ = false;
     if (ext_) ext_->endDrag();  // Flash 语义：松开鼠标即结束 startDrag
-    for (auto& vm : vms_) vm->mouseUp(mouseX_, mouseY_);
+    for (auto& vm : activeVms()) vm->mouseUp(mouseX_, mouseY_);
 }
 // 光标形状与 Flash 对齐：悬停目标是按钮时用系统手形光标（IDC_HAND）。
 bool Player::handCursor() const {

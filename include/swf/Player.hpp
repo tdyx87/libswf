@@ -113,6 +113,11 @@ private:
     std::shared_ptr<fvm::DisplayObject> preloaderRoot_;
     void updateLoadingProgress();
 
+    // 当前阶段应接收鼠标事件的 Vm 集合：加载/门户阶段渲染的是启动副本
+    // （loadingVms_ 的 firstFrameStage_），AVM2 点击必须派发给该副本，否则会落到
+    // 仍冻结在第 0 帧的真实游戏 Vm（vms_），导致门户 Play 等按钮点不中（FIX-2026-022）。
+    std::vector<std::shared_ptr<fvm::Vm>>& activeVms();
+
     void snapshotItems(int frameIndex);
     // 递归为显示列表中的每个精灵实例重建其内部帧运行态子树（children）：以静态帧快照
     // 为模板，按 (depth, characterId) 从旧子树继承运行态（rtFrame/按钮态/是否初始化）。

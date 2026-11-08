@@ -468,7 +468,8 @@ inline void registerFvmOps() {
     fvmOps().add(0x10, [](ExecCtx& c) { int32_t o=c.in.s24(); c.jump(o); });                                          // jump
     fvmOps().add(0x11, [](ExecCtx& c) { int32_t o=c.in.s24(); if(c.pop().toBool()) c.jump(o); });                      // iftrue
     fvmOps().add(0x12, [](ExecCtx& c) { int32_t o=c.in.s24(); if(!c.pop().toBool()) c.jump(o); });                     // iffalse
-    fvmOps().add(0x13, [](ExecCtx& c) { int32_t o=c.in.s24(); Value b=c.pop(),a=c.pop(); if(looseEquals(a,b)) c.jump(o); });       // ifeq
+    fvmOps().add(0x13, [](ExecCtx& c) { int32_t o=c.in.s24(); Value b=c.pop(),a=c.pop();
+        if(looseEquals(a,b)) c.jump(o); });       // ifeq
     fvmOps().add(0x14, [](ExecCtx& c) { int32_t o=c.in.s24(); Value b=c.pop(),a=c.pop();
         if (std::getenv("SWF_AS_DEBUG") &&
             (a.toString().find("startFrame") != std::string::npos ||
@@ -2906,6 +2907,23 @@ void Vm::registerNativeClasses() {
             return Value::intg(pos == std::string::npos ? -1 : static_cast<int32_t>(pos));
         };
         c->classDef->instanceMembers.push_back(io);
+        // FIX-2026-020：String.replace 缺失——换装关的 onListClick1 用
+        // int(e.target.name.replace('a','')) 取物品序号，replace 不存在时表达式
+        // 得 undefined → gotoAndStop(0) 把 LV 部件重置回底帧，点击任何装饰都
+        // 表现为「没反应」。AS3 语义：pattern 为字符串时只替换第一处。
+        Member rp; rp.kind = Member::Method; rp.name = "replace";
+        rp.native = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
+            auto p = self->props.find("$str");
+            std::string s = (p != self->props.end()) ? p->second.s : std::string();
+            if (a.size() < 2) return Value::str(s);
+            std::string pat = a[0].toString();
+            if (pat.empty()) return Value::str(s);
+            std::string rep = a[1].toString();
+            auto pos = s.find(pat);
+            if (pos == std::string::npos) return Value::str(s);
+            return Value::str(s.substr(0, pos) + rep + s.substr(pos + pat.size()));
+        };
+        c->classDef->instanceMembers.push_back(rp);
         Member up; up.kind = Member::Method; up.name = "toUpperCase";
         up.native = [](std::shared_ptr<Object> self, const std::vector<Value>&) -> Value {
             auto p = self->props.find("$str");
@@ -5809,9 +5827,13 @@ void Vm::advanceTimeline(const std::shared_ptr<DisplayObject>& d) {
             if (total > 0) {
                 // 新实例先停留在首帧：让 addFrameScript(0, ...) 有机会执行
                 // （否则创建当帧就被推进到第 2 帧，首帧脚本永远不触发）。
-                // SWF_NO_HOLDFRAME：实验开关，跳过保持逻辑（无条件推进），
-                // 用于验证"无帧脚本子精灵永停首帧"是否导致飘落动画缺失。
+                // FIX-2026-017：仅对注册了第 0 帧脚本的对象保持首帧。此前所有
+                // 新建精灵一律停首帧一拍，而 lastScriptFrame 只有执行过帧脚本
+                // 才 >=0，导致**无任何帧脚本的纯补间动画精灵**（转场 loading 屏的
+                // 泡泡/白云/水瓶 cid770/767/552 等）lastScriptFrame 永远为 -1，
+                // 被永久锁死在第 0 帧，动画整体冻结。
                 if (d->currentFrame == 0 && d->lastScriptFrame < 0 &&
+                    d->characterId && d->frameScripts.count(0) &&
                     !std::getenv("SWF_NO_HOLDFRAME")) {
                     // 保持第 0 帧，脚本由本帧稍后的 runFrameScripts 执行
                 } else {

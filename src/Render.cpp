@@ -1567,18 +1567,35 @@ static void renderEditText(const EditText& et, const Matrix& world,
 }
 
 // 取出 clipDepth 层用作裁剪区域的形状集合（第二个分量是相对遮罩对象的局部矩阵）。
-// 遮罩本体可以是形状，也可以是"单帧精灵包着的形状"——Loading 进度条的遮罩
-//（cid721）就是逐帧平移的精灵，只认 Shape 会让整条遮罩失效、进度条恒为满条。
-static void collectMaskShapes(const Character* ch, const Matrix& m,
-                              std::vector<std::pair<const Shape*, Matrix>>& out) {
+// 遮罩本体可以是形状、变形形状（FIX-2026-018：按 ratio 插值——loading 转盘的
+// 扇形扫过动画 cid1250/1252... 就是 MorphShape 遮罩，只认 Shape 会把遮罩当
+// 空集，被遮罩层整层直显、动画冻结），也可以是"单帧精灵包着的形状"——
+// Loading 进度条的遮罩（cid721）就是逐帧平移的精灵，只认 Shape 会让整条遮罩
+// 失效、进度条恒为满条。插值产生的中间形状由调用方通过 owned 持有，
+// 存活期必须覆盖后续 fillMask 调用。
+static void collectMaskShapes(const Character* ch, const Matrix& m, float ratio,
+                              std::vector<std::pair<const Shape*, Matrix>>& out,
+                              std::vector<std::shared_ptr<Shape>>& owned) {
     if (!ch) return;
+    auto addMorph = [&](const Character* mc, const Matrix& mm) {
+        if (!mc->morph || !mc->morph->start) return;
+        auto s = std::make_shared<Shape>(interpolateMorph(*mc->morph, ratio));
+        if (s->fillPaths.empty() && s->fillEdges.empty()) return;
+        out.push_back({s.get(), mm});
+        owned.push_back(std::move(s));
+    };
     if (ch->kind == Character::Kind::Shape && ch->shape)
         out.push_back({ch->shape.get(), m});
+    else if (ch->kind == Character::Kind::Morph)
+        addMorph(ch, m);
     else if (ch->kind == Character::Kind::Sprite && !ch->spriteFrames.empty())
-        for (const auto& sub : ch->spriteFrames.front().items)
-            if (sub.character && sub.character->kind == Character::Kind::Shape &&
-                sub.character->shape)
+        for (const auto& sub : ch->spriteFrames.front().items) {
+            if (!sub.character) continue;
+            if (sub.character->kind == Character::Kind::Shape && sub.character->shape)
                 out.push_back({sub.character->shape.get(), m.post(sub.matrix)});
+            else if (sub.character->kind == Character::Kind::Morph)
+                addMorph(sub.character.get(), m.post(sub.matrix));
+        }
 }
 
 // 渲染一组显示列表项并处理 clipDepth 裁剪组（主时间轴与精灵内部时间轴通用）。
@@ -1990,7 +2007,8 @@ void renderItemsWithClip(const std::vector<DisplayItem>& items, const Matrix& ro
             // 同时它定义了后续 depth+1..clipDepth 层的裁剪区域。
             if (it.character) renderItemInto(it, root, dict, buf, W, H, frameIndex, alpha, it.blend, inheritedCx);
             std::vector<std::pair<const Shape*, Matrix>> maskShapes;
-            collectMaskShapes(it.character.get(), Matrix{}, maskShapes);
+            std::vector<std::shared_ptr<Shape>> ownedMasks;
+            collectMaskShapes(it.character.get(), Matrix{}, it.ratio, maskShapes, ownedMasks);
             int j = i + 1;
             while (j < n && items[j].depth <= it.clipDepth) ++j;
             if (!maskShapes.empty()) {
@@ -2173,10 +2191,12 @@ static void renderRuntimeChildren(const std::vector<std::shared_ptr<fvm::Display
                    children[static_cast<std::size_t>(j)]->depth >= 0 &&
                    children[static_cast<std::size_t>(j)]->depth <= c->clipDepth) ++j;
             std::vector<std::pair<const Shape*, Matrix>> maskShapes;
+            std::vector<std::shared_ptr<Shape>> ownedMasks;
             if (c->characterId) {
                 auto mi = movie.characters.find(c->characterId);
                 if (mi != movie.characters.end())
-                    collectMaskShapes(mi->second.get(), Matrix{}, maskShapes);
+                    collectMaskShapes(mi->second.get(), Matrix{}, c->ratio,
+                                      maskShapes, ownedMasks);
             }
             if (maskShapes.empty() || j == i + 1) {
                 // 遮罩不可用：保持旧行为（遮罩层本身不绘制，组内对象直接画）

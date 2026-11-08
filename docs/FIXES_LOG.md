@@ -787,10 +787,179 @@ swfparser.exe swf2.swf --play-game 620 ..\..\build\compare\our_frames ^
 
 ---
 
-最近一次全量验证：**2026-11-08**（FIX-2026-015）——全量构建成功；ctest **21/21 通过**；
-`read_lints` 0；默认 620 帧全链 `build\compare\framesMaskFull\`（`p_0030`/`p_0500`
-与修复前逐像素一致）；擦洗进度条 `build\compare\framesMaskFix\`（p_0585 空槽 →
-p_0620 半条）；完整关卡链 `build\compare\stepMaskFix_err.txt` 推进至第三关。
+## NOTE-2026-016：「loading的movieclip显示不对」复查结论——无新代码缺陷（2026-11-08）
+
+用户在 FIX-2026-015 提交后仍报告 loading MovieClip 显示不对。逐项复查后确认
+**两处 loading 显示在当前构建中均正常**，此前"仍有问题"的判断来自陈旧产物与误报脚本：
+
+1. **擦洗进度条（cid724 loading）正常**：`framesMaskFix` 逐列像素测量 + 放大裁剪
+   （y 46-79 波段）证实填充从空槽（p_0585）→ 半条（p_0620）→ 满条（p_0650），
+   红黄条纹样式正确。运行时遮罩几何自洽：父矩阵含 ~2.12 横向缩放（341px 遮罩窗
+   = cid720 的 160px 局部宽），遮罩右缘扫描 [419→719] 与填充区 [418,717] 设备像素
+   完全对齐（f100 lm.tx=+460 twips → 右缘 719）。
+   **此前「left[277,419] progress0 恒满」是误报**：`analyze_loading.py`（已删除）的
+   颜色谓词 `(r>180,g>180,b<120)` 把**未被遮罩的黄色空槽/端帽**（恒显元素）计入了
+   "填充"，与遮罩行为无关。
+2. **开屏 preloader 百分比正常**：`framesDefault\`（10:38，早于当日 19:19 构建的
+   陈旧产物）中 "0 %" 卡死是旧版本现象。当前构建实测（`framesVerify\`）：
+   文本 31% 与填充 ~31% 同步，`porcentaje = loadCount*100/delayCount(48)` 每 tick
+   ≈ +2.08，`Bar.gotoAndStop(porcentaje)` 与 `Loader_txt.text`（progreso 处理器
+   pc=117/133 两次赋值，cid82 EditText）同源同值；渲染侧经
+   `renderDisplayObjectImpl` 的 `textData → textOverride` 分支覆盖 InitialText。
+3. **清理**：删除 Render.cpp 中临时诊断 `[maskdbg]`/`[maskbb]`/`[txt82]`；
+   删除 build\compare 临时脚本（analyze_loading.py / shapeparse.py / findshape.py）
+   与 preDiag*/maskdbg*/inspect*/裁剪 PNG 等。
+   **验证**：全量构建成功；ctest **21/21 通过**；标准 620 帧四次点击全链重放
+   `build\compare\framesVerify\` 通过（preloader 百分比爬升 → 门户 → 标题 →
+   选角色 → 第三关）。
+
+---
+
+## FIX-2026-017：无帧脚本精灵被"保持第 0 帧"逻辑永久锁死——关卡转场动画整体冻结（2026-11-08）
+
+**用户报告**：「第二关与第三关之间 loading movieclip 还是没有修复」「换装的也有很多问题」。
+
+**现象**：关卡转场屏（洗澡动画、关卡开场元素入场、标题屏婴儿逐个弹出等）全部静止；
+上一会话（NOTE-2026-016）结论"无新代码缺陷"是**误判**——真正的问题是全局性的：
+所有**没有注册任何帧脚本的纯补间动画精灵**一律冻结在第 0 帧。
+
+**根因**（`Fvm.cpp` `advanceTimeline`）：
+
+```cpp
+// 修复前：
+if (d->currentFrame == 0 && d->lastScriptFrame < 0 && !SWF_NO_HOLDFRAME)
+    保持第 0 帧;            // 等本帧稍后的 runFrameScripts 执行首帧脚本
+```
+
+"保持第 0 帧"的本意是给 `addFrameScript(0,…)` 的首帧脚本一拍执行机会；释放条件是
+`lastScriptFrame >= 0`，而它**只有真正执行过帧脚本才会被置位**。于是：
+
+- 有首帧脚本的精灵（如第三关副本_310 的 stepMC，frame1 执行 `stop()` 等待交互）：
+  第一拍被 runFrameScripts 置位 `lastScriptFrame=0`，第二拍起正常推进（且 stop() 后
+  按官方语义停在原地）——行为正确；
+- **无任何帧脚本的纯补间精灵**（转场屏的 30 个泡泡 cid770、14 朵云 cid767、20 个
+  水瓶 cid552、标题屏入场元素……）：`lastScriptFrame` 永远为 -1 → **永远保持第 0 帧**，
+  整个 loading MovieClip 冻结。这正是代码注释里 `SWF_NO_HOLDFRAME` 实验想验证
+  但从未收尾的问题。
+
+**修复**：保持首帧的条件收紧为「注册了第 0 帧脚本的对象」：
+
+```cpp
+if (d->currentFrame == 0 && d->lastScriptFrame < 0 &&
+    d->characterId && d->frameScripts.count(0) && !SWF_NO_HOLDFRAME)
+```
+
+无帧脚本精灵从创建当 tick 起正常推进（与 Flash「时间轴自动播放」语义一致）；
+带首帧脚本的对象保持原有"先执行首帧脚本再推进"的时序。
+
+**排查过程要点**（供后续参考）：
+1. 重构第二关完整交互链需用 `--inspect` + 新增诊断 `SWF_SPRITE_DUMP`（保留）：
+   `SWF_SPRITE_DUMP=allnames` 打印全部精灵命名放置的 depth/char/tx/ty，
+   `SWF_SPRITE_DUMP=<cid>` 打印单精灵各帧放置。由此推得第一关各按钮/热点
+   舞台坐标（舞台 y = 帧 y-336）与第二关 hita..hitd、thita..thitd 坐标。
+2. `getChildByName('progressBar')` MISS（`gameProgressBar -> null`）经全 SWF
+   命名放置扫描证实：**SWF 里根本不存在名为 progressBar 的实例**（4266 个命名
+   放置中 0 个），返回 null 是正确行为，游戏代码自行容错，不是缺陷。
+3. stepMC（第三关副本_310，cid932，148 帧，'end' 标签在 147）frame1 脚本
+   （mi=897，`SWF_AS_MI=897` 转储确认）确实调用 `stop()` 并注册 hita..hitd
+   click/gensui startDrag——这是官方等待交互的语义，不是 bug。
+4. `frameHandler`（mi=56）只做 `mc.addFrameScript(getFrameIndexByLabel(mc,label), cb)`，
+   不负责 play()；动画启动依赖时间轴自动播放（即本修复）。
+
+**修复后验证**（`build\compare\framesVerify17\`，1080 帧交互链重放渲染）：
+- 标题屏入场动画恢复（婴儿逐个弹出，tick 20→25 像素差 156750，修复前 1812）；
+- 第一关水面注入动画恢复（p_0465→0470 差 4771）；
+- 第二关开场元素入场恢复（纸巾盒→草莓→SKIP 依次出现，p_1006→1011 差 18610）；
+- 第二关结束点 NEXT → 转场 → 第三关正常推进；
+- 交互链未回归：第一关拖拽序列、第二关 lv6/hover 序列、NEXT 按钮链全部照常；
+- 全量构建成功；ctest **21/21 通过**。
+
+**遗留**：
+- 第二关（点子关）黑点点击命中未打通：可见黑点（cid510/513 等，depth 142/8）盖在
+  hita..hitd（d122-139）之上并吞掉点击（`[mouse] click target=stepMC listeners=0`），
+  需要进一步确认黑点的点击监听注册机制（疑为动态注册在生成实例上）；
+  打通后才能重放「第二关→第三关（换装）」转场与验证换装屏；
+- `lockCenter=true` 语义待核实；第一关 `PROGRESS_STEP` 拖放链未构造（遗留延续）；
+- `--play-game` 会吞掉其后紧跟的两个参数，`--no-render` 必须写在 outDir 之后。
+
+---
+
+## FIX-2026-019：MorphShape 遮罩不支持——loading 转盘扇形动画冻结（2026-11-08）
+
+**用户报告**：「loading 里的转盘应该是有动画的 但是现在没有显示动画」。
+
+**现象**：SKIP→loading 屏的黄圆转盘完全静止（应为扇形扫过动画）；"loading..." 文字
+与 PLAY 按钮出现/缩放正常。逐 tick 像素差证实：转盘区域在遮罩切换 tick（833/876）
+之外全为 0 变化。
+
+**根因**（`Render.cpp` `collectMaskShapes`）：遮罩收集器只认 `Shape` 与「单帧精灵
+包着的 Shape」两种本体，**不认 `Kind::Morph`**——loading_mc（cid1269）d4 层的扇形
+遮罩（c1250→c1252→c1253→c1254→c1258→c1259，每个窗口 20 帧内 ratio 0→1 平滑插值）
+是 MorphShape，被静默丢弃 → maskShapes 为空 → 被遮罩的黄饼层（d6 c1251）**整层
+直显**，呈现为一个静态满黄圆盘。时间轴侧 ratio 每帧都在更新（`applyTimelineFrame`
+的 `child->ratio = di.ratio`），SWF 数据也正常（`SWF_SPRITE_DUMP=1269` 可见逐帧
+ratio），卡点纯粹在渲染器遮罩收集。
+
+**修复**：`collectMaskShapes` 增加 Morph 分支——用 `interpolateMorph(morph, ratio)`
+插值出中间形状加入遮罩（插值结果由新增的 `owned` 向量持有，存活期覆盖 fillMask）；
+精灵遮罩内部的 Morph 子项同样支持。两个调用点分别传入静态项 `it.ratio` 与运行时
+`c->ratio`。同时 `SWF_SPRITE_DUMP` 的逐项输出补充了矩阵与 ratio（诊断增强，保留）。
+
+**验证**（`build\compare\nr41\`）：转盘区域 91/185 tick 有连续动画——每帧 ~1500-2100px
+的扇形扫过插值变化 + 遮罩切换大跳变（803/819/861）+ 圆盘缩小消失与 PLAY 弹入
+（892-913）；PLAY 在 960 正常出现；换装关可达。全量构建成功；ctest **21/21 通过**。
+
+**排查教训**：用 `ImageChops.difference().histogram()` 做帧差时，直方图是 256×3=768 bin，
+按"单通道阈值 30"取样必须用 `sum(h[31:256])+sum(h[287:512])+sum(h[543:768])`；
+此前误用 `h[798:]`（越界恒空）得到全 0 的假阴性，差点把"转盘无动画"误判为已有动画。
+
+---
+
+## NOTE-2026-018：「SKIP→loading→PLAY→换装」全链验证通过——用户主诉确认由 FIX-2026-017 修复（2026-11-08）
+
+用户提供关键路径：「点击前两关的 skip 就可以跳到 loading，然后继续点击 play 就可以到换装关」。
+按此路径逐环节验证，**全部打通**，并确认 FIX-2026-017 正是「第二关与第三关之间 loading
+MovieClip 没修复」的根因修复：
+
+1. **SKIP 按钮命中区**（engine 忠实于 SWF 定义，非缺陷）：skipBtn/nextBtn（c753/c756）
+   是 DefineButton2，hit 区 = hit 记录形状并集。c751（主 hit 形状）局部包围盒
+   [43,32]-[123,57]px，**比可视按钮（c36 大椭圆 + 亮星装饰）小**——SWF 作者本来就把
+   热区做小了。网格实测命中点：第一关 SKIP = **(1120,550)**，第二关（点子关）SKIP =
+   **(80,515)**，RESET = (1150,548)。点击热区外的可视区域会命中下层 stepMC（与 Flash
+   一致）。诊断工具：`SWF_BTN_DBG=1` 打印 ButtonRecord 矩阵与 hit 形状包围盒（已移除）。
+2. **loading 屏结构**（main frame 6）：SKIP 第二关 → `main gotoStop 6`。frame 6 的
+   stepMC = **换装_448（cid1236，换装关本体）**，其上叠 **midloadingMC_511 蒙层**
+   （cid1273，d1842，"loading..." 文本 + 黄色转盘，转盘动画经 FIX-2026-017 正常旋转）。
+   蒙层内 loading_mc（c1269）**自动播放**，第 **130** 帧起出现命名实例
+   `nextbtn`（c1268，黄底 PLAY 圆钮，舞台 (640,434)）。midloadingMC frame1（mi=561）
+   注册 Stage mouseDown → 闭包 onDown（mi=560）：**仅当 `e.target.name=='nextbtn'`**
+   才继续（隐藏蒙层、露出换装关）；点击其它位置/过早点击 PLAY 出现前均无效——
+   与官方语义一致。**修复前 loading_mc 被锁死在第 0 帧（无帧脚本精灵）→ PLAY 永远
+   不出现 → loading 屏永久卡住**，这正是用户看到的现象；FIX-2026-017 后 loading_mc
+   正常推进，PLAY 在 ~170 tick 后出现。
+3. **换装关交互全部响应**：frame1（mi=789）注册的页签 btn0-3（c1232-1235，星形，
+   舞台 ≈(320,280) 附近有 btn1 热区）、List（c1231）各分类的 a1-a6 物品位
+   （如 a5@(240,250)、a1@(240,400)）、btnReset（(1150,548)，2 个监听）均可命中并触发
+   gotoAndStop/换装。实测：点击物品 a5 → 婴儿戴上蓝帽子+青蛙挂件；点击页签 btn1 →
+   左侧面板切换为发饰分类；RESET 点击正常派发。
+4. **回放链**（产物 `build\compare\framesVerify18\`，1080 帧）：4 次选角/关卡点击 +
+   2 拖拽 + lv6 hover 序列（480-630）→ `--click 660:1120:550`（第一关 SKIP）→
+   `--click 770:80:515`（第二关 SKIP → loading 屏）→ `--click 950:640:434`（PLAY）→
+   `--click 1005:240:250`（物品 a5）→ `--click 1015:320:280`（页签 btn1）→
+   `--click 1025:240:400`（物品 a1）。p_0940 = loading+PLAY，p_1079 = 换装关已戴帽。
+5. **清理**：移除 Decoder.cpp 临时诊断 `SWF_BTN_DBG`。全量构建成功；ctest **21/21 通过**。
+
+**遗留**：换装关的深交互（拖拽衣物到婴儿、SHOW 按钮、四分类完整物品、换装关自身的
+结题转场）尚未系统回放；点子关（第二关）的正常通关路径仍需打通黑点点击（现用 SKIP
+绕过）。若用户在换装关发现具体视觉/交互问题，可按上述元素坐标逐项排查。
+
+---
+
+最近一次全量验证：**2026-11-08**（FIX-2026-017）——全量构建成功；ctest **21/21 通过**；
+1080 帧交互链 `build\compare\framesVerify17\`：标题入场/第一关水面/第二关开场动画
+全部恢复，关卡推进至第三关；620 帧基线 `build\compare\framesVerify\`、
+擦洗进度条 `build\compare\framesMaskFix\`、上一轮全链
+`build\compare\framesMaskFull\` / `stepMaskFix_err.txt` 仍有效。
 上一次（FIX-2026-014）：全量构建成功；ctest **21/21 通过**；
 `read_lints` 0；默认 620 帧四次点击全链 `build\compare\framesFinal\`
 （`p_0030`/`p_0500` 与 `framesDragFix\` 逐像素一致）；完整关卡链 1060 帧带渲染
@@ -810,3 +979,83 @@ p_0620 半条）；完整关卡链 `build\compare\stepMaskFix_err.txt` 推进至
 历史基线：FIX-2026-006 的 `--play-game 345 --click 310:593:574`
 （进度条 → 门户 Play → 游戏标题屏，产物 `build\compare\framesDefault\`）。
 历史基线：2026-11-07 全量构建 19 目标 + 21/21 + 620 步回放 9 组官方对比图。
+
+## FIX-2026-022：启动进度页/门户 Play 按钮点不中——mouseDown 误派发给冻结的真实游戏 Vm（2026-11-09）
+
+**用户报告**：「开始进度页 的按钮又无法点击了」（FIX-2026-020 重写启动模拟后引入的回归；
+用户明确要求"修复 bug 时禁止把之前能用的功能给修改了"。）
+
+- **状态**：已修复、已验证。默认无环境变量 `--play-game 1480` 完整回放：门户 Play `btn_play`、
+  标题 `btnPlay`、关卡 `skipBtn`、换装页签 `btn3`、物品 `a6`/`a4` 全部 `listeners=1` 命中；
+  12 个测试可执行文件 **全部 OK（0 failures）**；`read_lints` 0。`String.replace`（FIX-2026-020）
+  与关卡交互不受影响。
+
+- **根因**：FIX-2026-020 把启动模拟改为「独立影片副本 `loadingMovie_` + `loadingVms_` 维持
+  preloader/门户播放，期间不推进真实游戏 Vm（`vms_`）」。门户阶段渲染用的显示树是
+  `loadingVms_` 的 `firstFrameStage_`（`render()` 第 699 行把 `movie_.runtimeStage` 临时换成
+  `firstFrameStage_`）；但 `Player::mouseDown/mouseUp/setMouse` 仍把 AVM2 鼠标事件**无条件**
+  派发给 `vms_`（真实游戏，门户阶段被冻结在第 0 帧）。于是命中解析落在冻结的 `vms_` 第 0 帧
+  显示树上——门户 `btn_play` 所在容器（`preloaderRoot_`）从未被 `setClipFrame(...,1)` 推进到
+  门户帧，副本里可见的按钮在 `vms_` 树里不存在 → `[mouse] click ... listeners=0`，按钮点不中。
+
+- **修复**（`Player.cpp`）——按当前阶段把 AVM2 鼠标事件派发给「正在渲染」的那组 Vm：
+  ```cpp
+  std::vector<std::shared_ptr<fvm::Vm>>& Player::activeVms() {
+      if (!loadingVms_.empty() &&
+          (loadingElapsed_ < loadingTotal_ || portalElapsed_ < portalTotal_))
+          return loadingVms_;
+      return vms_;
+  }
+  // mouseDown / mouseUp / setMouse 内 for (auto& vm : vms_) 改为 for (auto& vm : activeVms())
+  ```
+  AVM1 按钮命中（`pollMouseEvents` 对 `curItems_` 的解析）本就正确，无需改动。改动只影响
+  AVM2 事件派发目标，且门户结束后 `activeVms()` 回到 `vms_`，与 FIX-2026-020 的换装交互逻辑
+  完全隔离，未触碰任何已可用功能。
+
+- **验证**：`--play-game 360 --click 310:593:574` 修复前 `target= depth=123 chain=5
+  listeners=0`；修复后 `target=btn_play depth=231 chain=5 listeners=1`。完整回放全链点击
+  命中列表见上。
+
+## FIX-2026-020：换装关部分装饰点击无反应——`String.replace` 未实现（2026-11-09）
+
+**用户报告**：「换装所有的衣服装饰都点击一下，就是装饰有的就是没反应的」+「开始的进度怎么没有了」。
+（进度条问题见 FIX-2026-020 之前的 Player.cpp 启动模拟修复；本条只针对装饰点击。）
+
+- **状态**：已修复、已验证。默认无环境变量 `--play-game 1450` 完整回放通过；12 个 avm2/
+  avm1/边界/图形/字体/音频测试可执行文件 **全部 OK（0 failures）**；`read_lints` 0。
+
+- **根因**：换装关页签列表点击处理器 `onListClick1`(mi=788) 取物品序号的写法为
+  `int(e.target.name.replace('a',''))`（例如按钮实例名 `a6` → 去掉 `a` → `6`）。
+  引擎的 `String` 类**从未注册 `replace` 成员**，于是 `getProperty(String,'replace')` 取到
+  `undefined`，对其 `callprop` 返回 `undefined`；`int(undefined)`=NaN，`convert_i`→`0`。
+  结果处理器用 `this.m_show['LV3'].gotoAndStop(0)` 把该 LV 部件**重置回底帧**，与"点击没反应 /
+  装饰消失"完全吻合。所有分类的物品都走同一写法，所以"有的有反应有的没反应"其实取决于该分类
+  默认帧是否恰好等于 0，并非交互逻辑本身有选择性分支。
+
+- **修复**（`Fvm.cpp`，String 实例成员）：
+  ```cpp
+  Member rp; rp.kind = Member::Method; rp.name = "replace";
+  rp.native = [](shared_ptr<Object> self, const vector<Value>& a) -> Value {
+      auto p = self->props.find("$str");
+      string s = (p != self->props.end()) ? p->second.s : string();
+      if (a.size() < 2) return Value::str(s);
+      string pat = a[0].toString();
+      if (pat.empty()) return Value::str(s);
+      string rep = a[1].toString();
+      auto pos = s.find(pat);
+      if (pos == string::npos) return Value::str(s);
+      return Value::str(s.substr(0, pos) + rep + s.substr(pos + pat.size()));
+  };
+  c->classDef->instanceMembers.push_back(rp);
+  ```
+  AS3 语义：`pattern` 为字符串时**只替换第一处**（与官方一致）；`pattern` 为空直接返回原串。
+
+- **验证**：在 gotoStop 原生加临时 `SWF_GOTO_ARG` 诊断，对比修复前后同一分类4 点击
+  （`(120,250)` 命中实例 `a6`）的实参：
+  - 修复前：`[gotoArg] name=LV3 raw='0' kind=3 -> 0`（重置底帧，装饰无变化）。
+  - 修复后：`[gotoArg] name=LV3 raw='6' kind=3 -> 5`（正确跳到该物品对应帧 idx5）。
+  说明 `e.target.name.replace('a','')` 现在正确得 `6`，处理器按物品序号切换 LV 部件帧。
+  （诊断代码已清理，未保留在最终提交中。）
+
+- **排错工具沉淀**：`SWF_AS_OPS=<mi>` 强制只追踪指定 method body；`SWF_AS_DEBUG` 下
+  `gotoStop` 原生打印 `name/cid/total/->idx` 便于核对部件帧切换。
