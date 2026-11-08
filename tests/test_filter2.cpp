@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,17 @@ static void addFixed(std::vector<std::uint8_t>& out, double v) {
     std::int32_t raw = static_cast<std::int32_t>(v * 65536.0);
     out.push_back(raw & 0xFF); out.push_back((raw >> 8) & 0xFF);
     out.push_back((raw >> 16) & 0xFF); out.push_back((raw >> 24) & 0xFF);
+}
+// FIXED8（SI16/256）：滤镜的 Strength 字段
+static void addFixed8(std::vector<std::uint8_t>& out, double v) {
+    std::int16_t raw = static_cast<std::int16_t>(v * 256.0);
+    out.push_back(raw & 0xFF); out.push_back((raw >> 8) & 0xFF);
+}
+// FLOAT32：Convolution 的 divisor/bias/矩阵与 ColorMatrix 的 20 个值
+static void addFloat(std::vector<std::uint8_t>& out, float v) {
+    std::uint32_t bits; std::memcpy(&bits, &v, sizeof(bits));
+    out.push_back(bits & 0xFF); out.push_back((bits >> 8) & 0xFF);
+    out.push_back((bits >> 16) & 0xFF); out.push_back((bits >> 24) & 0xFF);
 }
 static void writeTag(std::vector<std::uint8_t>& out, int code, const std::vector<std::uint8_t>& data) {
     std::size_t len = data.size();
@@ -117,12 +129,13 @@ int main() {
 
     // ---- ColorMatrix：R<->B 交换 ----
     {
+        // 结构顺序：Depth → CharacterId → ... → FilterList
         std::vector<std::uint8_t> po3;
-        po3.push_back(0x02); po3.push_back(0x01); po3.push_back(0x01); po3.push_back(0x00);
-        po3.push_back(0x01); po3.push_back(0x06);   // 1 filter, ColorMatrix
-        double m[20] = {0,0,1,0,0, 0,1,0,0,0, 1,0,0,0,0, 0,0,0,1,0};
-        for (double v : m) addFixed(po3, v);
+        po3.push_back(0x02); po3.push_back(0x01); po3.push_back(0x01); po3.push_back(0x00);  // flags, depth
         po3.push_back(0x01); po3.push_back(0x00);    // CharacterId=1
+        po3.push_back(0x01); po3.push_back(0x06);   // 1 filter, ColorMatrix
+        float m[20] = {0,0,1,0,0, 0,1,0,0,0, 1,0,0,0,0, 0,0,0,1,0};
+        for (float v : m) addFloat(po3, v);
         Raster R = raster(buildSwf(shape, po3), "colormatrix");
         check(R.ok && R.W == 800 && R.H == 600, "colormatrix: renders 800x600");
         check(R.r(50,25) < 80 && R.b(50,25) > 150, "colormatrix: red(255,0,0) -> blue(0,0,255)");
@@ -130,14 +143,14 @@ int main() {
     // ---- Convolution：全零核 + bias=0.5 -> 整层灰 ----
     {
         std::vector<std::uint8_t> po3;
-        po3.push_back(0x02); po3.push_back(0x01); po3.push_back(0x01); po3.push_back(0x00);
+        po3.push_back(0x02); po3.push_back(0x01); po3.push_back(0x01); po3.push_back(0x00);  // flags, depth
+        po3.push_back(0x01); po3.push_back(0x00);    // CharacterId=1
         po3.push_back(0x01); po3.push_back(0x05);   // Convolution
         po3.push_back(3); po3.push_back(3);          // 3x3
-        addFixed(po3, 1.0); addFixed(po3, 0.5);      // divisor, bias
-        for (int i = 0; i < 9; ++i) addFixed(po3, 0.0);
+        addFloat(po3, 1.0f); addFloat(po3, 0.5f);    // divisor, bias
+        for (int i = 0; i < 9; ++i) addFloat(po3, 0.0f);
         po3.push_back(0); po3.push_back(0); po3.push_back(0); po3.push_back(0);  // default color
-        po3.push_back(0x20);                         // clamp=1, preserveAlpha=0
-        po3.push_back(0x01); po3.push_back(0x00);    // CharacterId=1
+        po3.push_back(0x02);                         // clamp=1, preserveAlpha=0
         Raster R = raster(buildSwf(shape, po3), "convolution");
         bool gray = R.ok && R.r(50,25) > 160 && R.g(50,25) > 160 && R.b(50,25) > 160
                     && std::abs(R.r(400,300)-R.g(400,300)) < 12 && std::abs(R.g(400,300)-R.b(400,300)) < 12;
@@ -147,13 +160,14 @@ int main() {
     // ---- Bevel：方块外下沿出现暗色投影 ----
     {
         std::vector<std::uint8_t> po3;
-        po3.push_back(0x02); po3.push_back(0x01); po3.push_back(0x01); po3.push_back(0x00);
+        po3.push_back(0x02); po3.push_back(0x01); po3.push_back(0x01); po3.push_back(0x00);  // flags, depth
+        po3.push_back(0x01); po3.push_back(0x00);    // CharacterId=1
         po3.push_back(0x01); po3.push_back(0x03);   // Bevel
         po3.push_back(0); po3.push_back(0); po3.push_back(0); po3.push_back(255);   // shadow black
         po3.push_back(255); po3.push_back(255); po3.push_back(255); po3.push_back(255); // highlight white
-        addFixed(po3, 0.0); addFixed(po3, 0.0); addFixed(po3, 45.0); addFixed(po3, 200.0); addFixed(po3, 1.0);
+        addFixed(po3, 0.0); addFixed(po3, 0.0); addFixed(po3, 45.0); addFixed(po3, 200.0);
+        addFixed8(po3, 1.0);                         // strength (FIXED8)
         po3.push_back(0x01);                         // passes=1
-        po3.push_back(0x01); po3.push_back(0x00);    // CharacterId=1
         Raster R = raster(buildSwf(shape, po3), "bevel");
         check(R.ok, "bevel: renders");
         check(R.r(50,25) > 150 && R.g(50,25) < 100, "bevel: object body still red");
@@ -162,17 +176,17 @@ int main() {
     // ---- GradientGlow：包围盒外出现彩色光晕 ----
     {
         std::vector<std::uint8_t> po3;
-        po3.push_back(0x02); po3.push_back(0x01); po3.push_back(0x01); po3.push_back(0x00);
+        po3.push_back(0x02); po3.push_back(0x01); po3.push_back(0x01); po3.push_back(0x00);  // flags, depth
+        po3.push_back(0x01); po3.push_back(0x00);    // CharacterId=1
         po3.push_back(0x01); po3.push_back(0x04);   // GradientGlow
         po3.push_back(2);                            // numColors
         po3.push_back(255); po3.push_back(0); po3.push_back(0); po3.push_back(255);     // red
         po3.push_back(255); po3.push_back(255); po3.push_back(0); po3.push_back(255);   // yellow
         po3.push_back(0); po3.push_back(255);        // ratios
         addFixed(po3, 160.0); addFixed(po3, 160.0);  // blurX/Y = 8px
-        addFixed(po3, 0.0); addFixed(po3, 0.0); addFixed(po3, 1.0);  // angle, distance, strength
+        addFixed(po3, 0.0); addFixed(po3, 0.0);
+        addFixed8(po3, 1.0);                         // angle, distance, strength (FIXED8)
         po3.push_back(0x01);                         // passes=1
-        po3.push_back(2);                            // type=Full
-        po3.push_back(0x01); po3.push_back(0x00);    // CharacterId=1
         Raster R = raster(buildSwf(shape, po3), "gradientglow");
         check(R.ok, "gradientglow: renders");
         check(R.outsideNonWhite() > 0, "gradientglow: colored halo outside shape bbox");
@@ -180,17 +194,17 @@ int main() {
     // ---- GradientBevel：包围盒外出现光晕 ----
     {
         std::vector<std::uint8_t> po3;
-        po3.push_back(0x02); po3.push_back(0x01); po3.push_back(0x01); po3.push_back(0x00);
+        po3.push_back(0x02); po3.push_back(0x01); po3.push_back(0x01); po3.push_back(0x00);  // flags, depth
+        po3.push_back(0x01); po3.push_back(0x00);    // CharacterId=1
         po3.push_back(0x01); po3.push_back(0x07);   // GradientBevel
         po3.push_back(2);
         po3.push_back(0); po3.push_back(0); po3.push_back(0); po3.push_back(255);       // shadow black
         po3.push_back(255); po3.push_back(255); po3.push_back(255); po3.push_back(255); // highlight white
         po3.push_back(0); po3.push_back(255);
         addFixed(po3, 160.0); addFixed(po3, 160.0);
-        addFixed(po3, 45.0); addFixed(po3, 200.0); addFixed(po3, 1.0);
+        addFixed(po3, 45.0); addFixed(po3, 200.0);
+        addFixed8(po3, 1.0);                         // strength (FIXED8)
         po3.push_back(0x01);
-        po3.push_back(2);
-        po3.push_back(0x01); po3.push_back(0x00);
         Raster R = raster(buildSwf(shape, po3), "gradientbevel");
         check(R.ok, "gradientbevel: renders");
         check(R.outsideNonWhite() > 0, "gradientbevel: halo outside shape bbox");

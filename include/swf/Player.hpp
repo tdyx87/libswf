@@ -12,6 +12,7 @@
 #include "swf/Decoder.hpp"
 #include "swf/FFmpeg.hpp"
 #include "swf/Fvm.hpp"
+#include "swf/MovieClipCommands.hpp"
 #include "swf/Render.hpp"
 
 namespace swf {
@@ -33,9 +34,19 @@ public:
     float frameRate() const { return movie_.frameRate; }
     int stageW() const { return stageW_; }
     int stageH() const { return stageH_; }
+    // 诊断（窗口播放器日志用）：AVM2 虚拟机数量与运行时舞台根节点数量。
+    size_t vmCount() const { return vms_.size(); }
+    size_t runtimeRoots() const {
+        size_t n = 0;
+        for (const auto& vm : vms_) n += vm->stage.size();
+        return n;
+    }
 
     void tick();
-    bool render(std::vector<std::uint8_t>& rgba, int& W, int& H);
+    // targetW/targetH > 0：按该设备分辨率重新光栅化（窗口放大时保持矢量/文字清晰）；
+    // 传 0 或不传则输出舞台原生尺寸（CLI 导出 PNG / 像素断言）。
+    bool render(std::vector<std::uint8_t>& rgba, int& W, int& H,
+                int targetW = 0, int targetH = 0);
 
     void setMouse(double x, double y); void mouseDown(); void mouseUp(); void keyDown(int vk); void keyUp(int vk);
 
@@ -54,6 +65,9 @@ public:
     // 供 SpriteClip（精灵自身时间轴适配器）在 gotoAndPlay/gotoAndStop 使播放头真正改变时调用：
     // 执行目标内部帧的脚本（Flash 语义：进入目标帧即运行该帧动作）。parent 为该精灵实例的上级剪辑。
     void runClipFrameScript(DisplayItem& it, int idx, avm1::IClip* parent);
+    // AVM1 MovieClip 扩展方法（根时间轴版本）：attachMovie/duplicateMovieClip/
+    // createEmptyMovieClip/startDrag/stopDrag/getBounds/setMask 作用于顶层显示列表。
+    avm1::Value callExt(const std::string& method, const std::vector<avm1::Value>& args) override;
 
 private:
     swf::Movie movie_;
@@ -82,6 +96,22 @@ private:
     // 在下一个 tick 生效（与 Flash 一致：跳转从下一帧开始，且会执行目标帧脚本）。
     struct PendingGoto { bool active = false; int frame = 1; bool play = true; };
     PendingGoto pendingGoto_;
+    // AVM2 影片的模拟加载阶段。官方 Flash Player 流式加载时 preloader 会持续显示约
+    // 1.5 秒并让进度条递增；本地一次解码完没有加载过程，播放器第一次 tick 就把主
+    // 时间轴推到第 2 帧，加载画面只会一闪而过。这里用独立的影片副本 + Vm 维持一段
+    // preloader 播放，期间不推进游戏 Vm（其具名实例 main 只在第 2 帧，改动初始帧
+    // 会让 AS3 初始化失败、游戏卡在内部 loading）。
+    Movie loadingMovie_;
+    std::vector<std::shared_ptr<fvm::DisplayObject>> firstFrameStage_;
+    std::vector<std::shared_ptr<fvm::Vm>> loadingVms_;
+    int loadingTotal_ = 0;
+    int loadingElapsed_ = 0;
+    // 加载完成后的品牌门户阶段：preloader 主容器的第 2 帧（intro_mc）。
+    int portalTotal_ = 0;
+    int portalElapsed_ = 0;
+    bool portalStarted_ = false;
+    std::shared_ptr<fvm::DisplayObject> preloaderRoot_;
+    void updateLoadingProgress();
 
     void snapshotItems(int frameIndex);
     // 递归为显示列表中的每个精灵实例重建其内部帧运行态子树（children）：以静态帧快照
@@ -129,6 +159,12 @@ private:
     // container 输出其直接容器项（顶层项时为 nullptr）。解析失败返回 nullptr。
     DisplayItem* resolveItemChain(const std::vector<std::pair<int, int>>& chain,
                                   DisplayItem** container) const;
+    // ---- Facade：AVM1 扩展方法统一委托给 MovieClipCommands（Command 表）----
+    // 旧的 makeSymbolItem/insertDynamicItem/findContainerOf/boundsObject/applyDrag
+    // 与 DragState 都是只有声明、无实现也无调用点的死代码，已由命令对象取代。
+    std::unique_ptr<MovieClipCommands> ext_;
+    // 构造命令上下文：只暴露命令需要的最小能力（含由 Facade 注入的回调）。
+    ExtCommandContext makeExtContext();
 };
 
 using PlayerPtr = std::unique_ptr<Player>;

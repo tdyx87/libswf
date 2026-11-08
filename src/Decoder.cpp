@@ -4,6 +4,7 @@
 #include "swf/Decoder.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,7 @@
 #include "swf/ByteView.hpp"
 #include "swf/Decompress.hpp"
 #include "swf/FFmpeg.hpp"   // 跨平台视频解码（H.263/VP6/AVC）
+#include "swf/TagReader.hpp"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -117,8 +119,8 @@ static Matrix readMatrix(ByteView& bv) {
         // 但变换公式为  x' = ScaleX*x + RotateSkew1*y 、 y' = RotateSkew0*x + ScaleY*y，
         // 即矩阵布局 [[ScaleX, RotateSkew1],[RotateSkew0, ScaleY]] 与存储顺序**相反**。
         // 这里按布局存放（r0 = RotateSkew1、r1 = RotateSkew0），使 apply()/post() 自洽。
-        float skew0 = br.readSB(nr);   // 文件第一个 = RotateSkew0
-        float skew1 = br.readSB(nr);   // 文件第二个 = RotateSkew1
+        float skew0 = static_cast<float>(br.readSB(nr));   // 文件第一个 = RotateSkew0
+        float skew1 = static_cast<float>(br.readSB(nr));   // 文件第二个 = RotateSkew1
         m.r0 = skew1 / 65536.0f; m.r1 = skew0 / 65536.0f; total += 2 * nr;
     }
     nt = static_cast<int>(br.readUB(5)); total += 5;
@@ -417,10 +419,11 @@ struct ShapeBuilder {
         penX = x; penY = y;
     }
     void curveTo(float cx, float cy, float ax, float ay) {
-        // 二次贝塞尔拍平：段数由控制点到弦的偏离（矢高 sag，twips）决定，
-        // N ≈ sqrt(2·sag)，等价于把折线相对曲线的最大偏差压到约 0.5 twip。
-        // 这是按与 Flash Player 的逐像素误差标定的：固定 16 段（历史实现）
-        // 明显偏大，矢高越大的曲线偏差越大；本式在大/小曲线上都更接近原版。
+        // 二次贝塞尔拍平：段数由控制点到弦的偏离（矢高 sag，twips）决定。
+        // 几何推导：二次曲线总弦的矢高 h，整段 N 等分后每小段矢高约 h/N²
+        //（控制点结构按 1/N² 缩放）；弦高差（折线最大偏差）≈ 矢高/2 = h/(2N²)。
+        // 令 h/(2N²) ≤ 0.5 twip（SWF 坐标 1/20 像素）得 N ≈ sqrt(h)，即 sqrt(2·sag)。
+        // 纯几何依据，与具体播放器行为无关。
         float ddx = 2.0f * cx - penX - ax;
         float ddy = 2.0f * cy - penY - ay;
         float sag = 0.25f * std::sqrt(ddx * ddx + ddy * ddy);  // 曲线中点相对弦的偏离
@@ -444,6 +447,9 @@ static FillStyle readFillStyle(ByteView& bv, bool alpha);
 static void readGradient(ByteView& bv, FillStyle& fs, bool alpha, bool focal) {
     fs.gradientMatrix = readMatrix(bv);
     std::uint8_t hdr = bv.readUI8();
+    // GRADIENT 头：bits7-6=SpreadMode, bits5-4=InterpolationMode, bits3-0=NumGradients
+    fs.spreadMode = static_cast<std::uint8_t>((hdr >> 6) & 0x03);
+    fs.interpMode = static_cast<std::uint8_t>((hdr >> 4) & 0x03);
     int n = hdr & 0x0F;
     for (int i = 0; i < n; ++i) {
         GradientStop s;
@@ -451,12 +457,12 @@ static void readGradient(ByteView& bv, FillStyle& fs, bool alpha, bool focal) {
         readColor(bv, alpha, s.color);
         fs.gradient.push_back(s);
     }
-    // 焦点渐变（0x13）在渐变记录之后还有 FocalPoint：两个 RatioFraction = SB[15]/32768
+    // 焦点渐变（0x13）在渐变记录之后还有一个 FocalPoint（FIXED8，2 字节，范围 -1..1，
+    // 沿渐变矩阵 x 轴）。此处必须按 2 字节读，否则每次焦点渐变都会多吃 2 字节，
+    // 后续填充/线样式表与形状记录全部错位（曾把 id=670 的 4056 字节形状解析出 1482 条线）。
     if (focal) {
-        BitReader br(bv);
-        fs.focalX = static_cast<float>(br.readSB(15)) / 32768.0f;
-        fs.focalY = static_cast<float>(br.readSB(15)) / 32768.0f;
-        br.finish();
+        fs.focalX = static_cast<std::int16_t>(bv.readUI16()) / 256.0f;
+        fs.focalY = 0.0f;
     }
 }
 static void readBitmapFill(ByteView& bv, FillStyle& fs) {
@@ -471,8 +477,9 @@ static FillStyle readFillStyle(ByteView& bv, bool alpha) {
         case 0x10: fs.kind = FillKind::LinearGradient; readGradient(bv, fs, alpha, false); break;
         case 0x12: fs.kind = FillKind::RadialGradient;  readGradient(bv, fs, alpha, false); break;
         case 0x13: fs.kind = FillKind::FocalGradient;   readGradient(bv, fs, alpha, true); break;
-        case 0x40: case 0x43: fs.kind = FillKind::Bitmap; fs.tiled = true;  readBitmapFill(bv, fs); break;
-        case 0x41: case 0x44: fs.kind = FillKind::Bitmap; fs.tiled = false; readBitmapFill(bv, fs); break;
+        // 0x40 平滑重复 / 0x41 平滑裁剪 / 0x42 非平滑重复 / 0x43 非平滑裁剪
+        case 0x40: case 0x42: fs.kind = FillKind::Bitmap; fs.tiled = true;  readBitmapFill(bv, fs); break;
+        case 0x41: case 0x43: fs.kind = FillKind::Bitmap; fs.tiled = false; readBitmapFill(bv, fs); break;
         default: fs.kind = FillKind::Solid; break;  // 未知样式，跳过后续未知长度（v1 近似）
     }
     return fs;
@@ -503,9 +510,9 @@ static LineStyle readLineStyle(ByteView& bv, int shapeVer) {
     br.readUB(1);  // NoClose
     br.readUB(2);  // EndCapStyle
     if (join == 2) br.readUB(16);  // MiterLimitFactor：FIXED8 -> UI16（2 字节）
-    int hasBlur = static_cast<int>(br.readUB(1));
-    // 模糊字段是位字段，必须用 br 读取；混用 bv 直读会破坏缓冲位置
-    if (hasBlur) { br.readUB(16); br.readUB(16); br.readUB(8); }
+    // LINESTYLE2 的位字段到此结束（共 16 位）；之后直接是 Color / FILLSTYLE。
+    // 若在此多读一位“模糊标志”，后续颜色与整个形状记录流都会错开一字节，
+    // 记录流会读成垃圾（曾把 id=414 的 119 字节形状解析出 948 个填充样式）。
     br.finish();  // 统一对齐到字节边界，再按字节读颜色/填充
     if (hasFill) {
         readFillStyle(bv, true);  // 消费字节（线填充）
@@ -515,12 +522,84 @@ static LineStyle readLineStyle(ByteView& bv, int shapeVer) {
     return ls;
 }
 
+// ---------- MORPH 样式（DefineMorphShape 专用，与 FILLSTYLE/LINESTYLE 不同） ----------
+// 规范（对照 Ruffle read_morph_fill_style / read_morph_line_style）：每条记录同时含
+// 起始与终止两套值，**共享**类型字节/CharacterId/GradientFlags，渐变 stop 为交错排列。
+// 用两条普通 readFillStyle 读取会整体错位（床单圆点黑点根因，cid=1287）。
+static void readMorphFillStyle(ByteView& bv, FillStyle& s, FillStyle& e) {
+    std::uint8_t t = bv.readUI8();
+    switch (t) {
+        case 0x00:
+            s.kind = e.kind = FillKind::Solid;
+            readColor(bv, true, s.color);
+            readColor(bv, true, e.color);
+            break;
+        case 0x10: case 0x12: case 0x13: {
+            s.kind = (t == 0x10) ? FillKind::LinearGradient : FillKind::RadialGradient;
+            e.kind = s.kind;
+            s.gradientMatrix = readMatrix(bv);
+            e.gradientMatrix = readMatrix(bv);
+            std::uint8_t hdr = bv.readUI8();          // 共享 Spread/Interp/NumControlPoints
+            s.spreadMode = e.spreadMode = static_cast<std::uint8_t>((hdr >> 6) & 0x03);
+            s.interpMode = e.interpMode = static_cast<std::uint8_t>((hdr >> 4) & 0x03);
+            int n = hdr & 0x0F;
+            for (int i = 0; i < n; ++i) {             // 交错：start ratio+color, end ratio+color
+                GradientStop gs, ge;
+                gs.ratio = bv.readUI8(); readColor(bv, true, gs.color);
+                ge.ratio = bv.readUI8(); readColor(bv, true, ge.color);
+                s.gradient.push_back(gs); e.gradient.push_back(ge);
+            }
+            if (t == 0x13) {                          // 焦点渐变：Start/EndFocalPoint 各 FIXED8
+                s.kind = e.kind = FillKind::FocalGradient;
+                s.focalX = static_cast<std::int16_t>(bv.readUI16()) / 256.0f;
+                e.focalX = static_cast<std::int16_t>(bv.readUI16()) / 256.0f;
+            }
+            break;
+        }
+        case 0x40: case 0x41: case 0x42: case 0x43:
+            s.kind = e.kind = FillKind::Bitmap;
+            s.tiled = e.tiled = (t == 0x40 || t == 0x42);
+            s.bitmapId = e.bitmapId = bv.readUI16();  // 共享 CharacterId
+            s.gradientMatrix = readMatrix(bv);        // StartMatrix
+            e.gradientMatrix = readMatrix(bv);        // EndMatrix
+            break;
+        default:
+            s.kind = e.kind = FillKind::Solid;
+            break;
+    }
+}
+
+static void readMorphLineStyle(ByteView& bv, LineStyle& s, LineStyle& e, int shapeVer) {
+    s.width = static_cast<float>(bv.readUI16());     // StartWidth
+    e.width = static_cast<float>(bv.readUI16());     // EndWidth
+    if (shapeVer < 2) {
+        readColor(bv, true, s.color);
+        readColor(bv, true, e.color);
+        return;
+    }
+    // DefineMorphShape2：共享 LINESTYLE2 位字段（16 位）
+    BitReader br(bv);
+    br.readUB(2);                                     // StartCapStyle
+    int join = static_cast<int>(br.readUB(2));
+    int hasFill = static_cast<int>(br.readUB(1));
+    br.readUB(1); br.readUB(1); br.readUB(1);         // NoVScale/NoHScale/PixelHinting
+    br.readUB(5);                                     // reserved
+    br.readUB(1);                                     // NoClose
+    br.readUB(2);                                     // EndCapStyle
+    if (join == 2) br.readUB(16);                     // 共享 MiterLimitFactor
+    br.finish();
+    if (hasFill) {
+        FillStyle fs, fe;                             // 线填充也是 morph 对
+        readMorphFillStyle(bv, fs, fe);
+    } else {
+        readColor(bv, true, s.color);
+        readColor(bv, true, e.color);
+    }
+}
+
 static std::shared_ptr<Shape> decodeShape(ByteView& bv, int shapeVer, std::uint16_t shapeId = 0) {
     auto shape = std::make_shared<Shape>();
     bool alpha = (shapeVer >= 3);
-    std::size_t entryPos = bv.pos();
-    const char* trEnv = std::getenv("SWF_TRACE_SHAPE");
-    bool trace = trEnv && static_cast<std::uint16_t>(std::atoi(trEnv)) == shapeId;
 
     { Rect rb = readRect(bv);
       shape->bounds.x0 = rb.xMin; shape->bounds.x1 = rb.xMax;
@@ -544,14 +623,6 @@ static std::shared_ptr<Shape> decodeShape(ByteView& bv, int shapeVer, std::uint1
         hbr.finish();                       // 对齐到字节边界
     }
     shape->usesWinding = usesWinding;
-
-    if (std::getenv("SWF_DUMP_SHAPES")) {
-        const std::uint8_t* bp = bv.base();
-        std::printf("SHAPE entry=%zu postHead=%zu ver=%d hdr=%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                    entryPos, bv.pos(), shapeVer,
-                    bp[bv.pos()], bp[bv.pos()+1], bp[bv.pos()+2], bp[bv.pos()+3],
-                    bp[bv.pos()+4], bp[bv.pos()+5], bp[bv.pos()+6], bp[bv.pos()+7]);
-    }
 
     // 填充样式（防御：数量异常/溢出时提前结束，避免真实文件触发内存爆炸）
     int fc = bv.readUI8(); if (fc == 0xFF) fc = bv.readUI16();
@@ -578,9 +649,7 @@ static std::shared_ptr<Shape> decodeShape(ByteView& bv, int shapeVer, std::uint1
     BitReader br(bv);
     int numFillBits = static_cast<int>(br.readUB(4));
     int numLineBits = static_cast<int>(br.readUB(4));
-    if (std::getenv("SWF_DUMP_SHAPES")) {
-        std::printf("SHAPE headDone=%zu fillBits=%d lineBits=%d\n", bv.pos(), numFillBits, numLineBits);
-    }
+
 
 
 
@@ -588,7 +657,6 @@ static std::shared_ptr<Shape> decodeShape(ByteView& bv, int shapeVer, std::uint1
     int guard = 0;
     while (!done) {
         if (++guard > 100000) break;
-        if (trace && guard <= 400) std::printf("  R i=%d bit=%zu\n", guard, br.bitPos());
         if (bv.overflow()) break;   // 字节流耗尽：停止解析该形状
         int typeFlag = static_cast<int>(br.readUB(1));
         if (typeFlag == 0) {
@@ -605,7 +673,6 @@ static std::shared_ptr<Shape> decodeShape(ByteView& bv, int shapeVer, std::uint1
                 int mb = static_cast<int>(br.readUB(5));
                 float x = static_cast<float>(br.readSB(mb));
                 float y = static_cast<float>(br.readSB(mb));
-                if (trace && guard <= 400) std::printf("     move mb=%d dx=%d dy=%d\n", mb, (int)x, (int)y);
                 sb.moveTo(x, y);
             }
             // 样式索引是 1 基索引（0 = 停用）。StateNewStyles 追加新样式后，
@@ -621,8 +688,6 @@ static std::shared_ptr<Shape> decodeShape(ByteView& bv, int shapeVer, std::uint1
             int nf1 = stateFill1 ? (raw1 ? sb.fillBase + raw1 : 0) : sb.actFill1;
             int nl = stateLine ? (rawL ? sb.lineBase + rawL : 0) : sb.actLine;
             sb.styleChange(nf0, nf1, nl, stateFill0 != 0, stateFill1 != 0, stateLine != 0);
-            if (trace && guard <= 400) std::printf("     style new=%d line=%d f1=%d f0=%d mv=%d idx f0=%d f1=%d l=%d fb=%d lb=%d\n",
-                stateNew, stateLine, stateFill1, stateFill0, stateMove, nf0, nf1, nl, numFillBits, numLineBits);
             if (stateNew) {
                 // 与 Ruffle 的 Reader::read_shape_record 保持一致（SWF 规范的位/字节混排）：
                 //   1) 位字段读完后先 byte_align：丢弃当前字节剩余位，前进到下一字节；
@@ -655,9 +720,6 @@ static std::shared_ptr<Shape> decodeShape(ByteView& bv, int shapeVer, std::uint1
                 for (int i = 0; i < nlc; ++i) shape->lineStyles[oldl + i] = readLineStyle(bv, shapeVer);
                 if (bv.overflow()) { sb.finalizeAll(); break; }
                 int nb = bv.readUI8();               // NumFillBits | NumLineBits
-
-                if (trace && guard <= 400) std::printf("     stateNew nfc=%d nlc=%d totalF=%zu totalL=%zu nb=%02x -> fb=%d lb=%d\n",
-                    nfc, nlc, shape->fillStyles.size(), shape->lineStyles.size(), nb, nb >> 4, nb & 0x0F);
                 numFillBits = nb >> 4;
                 numLineBits = nb & 0x0F;
             }
@@ -679,10 +741,6 @@ static std::shared_ptr<Shape> decodeShape(ByteView& bv, int shapeVer, std::uint1
                 float cy = static_cast<float>(br.readSB(nbits));
                 float ax = static_cast<float>(br.readSB(nbits));
                 float ay = static_cast<float>(br.readSB(nbits));
-                if (trace && guard <= 400)
-                    std::printf("     curve nbits=%d cd=(%d,%d) ad=(%d,%d) pen=(%d,%d) ctrl=(%d,%d) anchor=(%d,%d)\n",
-                        nbits, (int)cx, (int)cy, (int)ax, (int)ay, (int)sb.penX, (int)sb.penY,
-                        (int)(sb.penX + cx), (int)(sb.penY + cy), (int)(sb.penX + ax), (int)(sb.penY + ay));
                 // SWF 曲线边：AnchorDelta 相对**控制点**（而非笔点），
                 // anchor = pen + ctrlDelta + anchorDelta
                 sb.curveTo(sb.penX + cx, sb.penY + cy,
@@ -691,61 +749,6 @@ static std::shared_ptr<Shape> decodeShape(ByteView& bv, int shapeVer, std::uint1
         }
     }
     br.finish();
-    if (std::getenv("SWF_DUMP_SHAPES")) {
-        std::printf("SHAPE end=%zu id=%u ver=%d fc=%zu lc=%zu bounds=(%d,%d,%d,%d) fillBits=%d lineBits=%d\n",
-                    bv.pos(), shapeId, shapeVer, shape->fillStyles.size(), shape->lineStyles.size(),
-                    (int)shape->bounds.x0, (int)shape->bounds.x1, (int)shape->bounds.y0, (int)shape->bounds.y1,
-                    numFillBits, numLineBits);
-        for (std::size_t i = 0; i < shape->fillStyles.size(); ++i) {
-            const FillStyle& fs = shape->fillStyles[i];
-            if (!shape->fillPaths[i].empty())
-            std::printf("   fs id=%u [%zu] kind=%d rgba=(%d,%d,%d,%d) stops=%zu bmp=%u m=(%.3f,%.3f,%.3f,%.3f t=%.1f,%.1f) bbox=",
-                shapeId, i, (int)fs.kind, fs.color.r, fs.color.g, fs.color.b, fs.color.a,
-                fs.gradient.size(), fs.bitmapId, fs.gradientMatrix.sx, fs.gradientMatrix.sy,
-                fs.gradientMatrix.r0, fs.gradientMatrix.r1, fs.gradientMatrix.tx, fs.gradientMatrix.ty);
-            for (const auto& ct : shape->fillPaths[i]) {
-                float x0=1e9f,y0=1e9f,x1=-1e9f,y1=-1e9f;
-                for (std::size_t k = 0; k < ct.xs.size(); ++k) {
-                    x0=std::min(x0,ct.xs[k]); x1=std::max(x1,ct.xs[k]);
-                    y0=std::min(y0,ct.ys[k]); y1=std::max(y1,ct.ys[k]);
-                }
-                if (!shape->fillPaths[i].empty())
-                std::printf("(%.0f,%.0f)-(%.0f,%.0f)n%zu ", x0,y0,x1,y1,ct.xs.size());
-            }
-            if (!shape->fillPaths[i].empty()) std::printf("\n");
-        }
-        for (std::size_t i = 0; i < shape->lineStyles.size(); ++i) {
-            std::printf("   ls id=%u [%zu] w=%.1f rgba=(%d,%d,%d,%d)\n", shapeId, i,
-                shape->lineStyles[i].width, shape->lineStyles[i].color.r, shape->lineStyles[i].color.g,
-                shape->lineStyles[i].color.b, shape->lineStyles[i].color.a);
-        }
-    }
-    // 临时调试：把某形状的每个填充样式的有向边转储为文本，便于外部可视化核对几何。
-    {
-        const char* edEnv = std::getenv("SWF_DUMP_EDGES");
-        if (edEnv && static_cast<std::uint16_t>(std::atoi(edEnv)) == shapeId) {
-            char fn[64];
-            std::snprintf(fn, sizeof(fn), "edges_%u.txt", static_cast<unsigned>(shapeId));
-            FILE* f = std::fopen(fn, "w");
-            if (f) {
-                std::fprintf(f, "bounds %d %d %d %d\n", (int)shape->bounds.x0, (int)shape->bounds.x1,
-                             (int)shape->bounds.y0, (int)shape->bounds.y1);
-                for (std::size_t i = 0; i < shape->fillStyles.size(); ++i) {
-                    const FillStyle& fs = shape->fillStyles[i];
-                    std::fprintf(f, "style %zu kind %d rgba %d %d %d %d stops %zu focal %.3f %.3f m %.4f %.4f %.4f %.4f %.1f %.1f\n",
-                                 i, (int)fs.kind, fs.color.r, fs.color.g, fs.color.b, fs.color.a,
-                                 fs.gradient.size(), fs.focalX, fs.focalY,
-                                 fs.gradientMatrix.sx, fs.gradientMatrix.sy, fs.gradientMatrix.r0,
-                                 fs.gradientMatrix.r1, fs.gradientMatrix.tx, fs.gradientMatrix.ty);
-                    for (const auto& gs : fs.gradient)
-                        std::fprintf(f, "g %d %d %d %d %d\n", gs.ratio, gs.color.r, gs.color.g, gs.color.b, gs.color.a);
-                    for (const auto& e : shape->fillEdges[i])
-                        std::fprintf(f, "e %.2f %.2f %.2f %.2f %d\n", e.x0, e.y0, e.x1, e.y1, e.sign);
-                }
-                std::fclose(f);
-            }
-        }
-    }
     return shape;
 }
 
@@ -756,12 +759,13 @@ static int neededBits(std::size_t n) {
     return b;
 }
 
-// 解析变形形状的单段（起始段 MorphFlag=0 / 终止段 MorphFlag=1），写入各自 ShapeBuilder。
+// 解析变形形状的单段（起始段在前；终止段紧跟哑 UI8 之后，顺序两段）。
+// 权威依据（Ruffle read_shape_record）：morph 记录标志**不含 MorphFlag 位**——
+//   StyleChange = tf(1)+sn(1)+sl(1)+f1(1)+f0(1)+mv(1)；Edge = tf(1)+st(1)+nb(4)。
+//   5 标志全 0 = EndShapeRecord；StateNewStyles = 普通样式数组 + 1 打包 UI8 位宽（非成对）。
 static void parseMorphSection(ByteView& bv, int shapeVer, ShapeBuilder& sb,
-                              int& numFillBits, int& numLineBits,
-                              bool startSection, bool allowNew) {
+                              int& numFillBits, int& numLineBits) {
     BitReader br(bv);
-    bool firstRec = true;
     int guard = 0;
     for (;;) {
         if (++guard > 100000 || bv.overflow()) break;
@@ -772,71 +776,60 @@ static void parseMorphSection(ByteView& bv, int shapeVer, ShapeBuilder& sb,
             int stateFill1 = static_cast<int>(br.readUB(1));
             int stateFill0 = static_cast<int>(br.readUB(1));
             int stateMove  = static_cast<int>(br.readUB(1));
-            int morphFlag  = static_cast<int>(br.readUB(1));
-            bool relevant  = startSection ? (morphFlag == 0) : (morphFlag == 1);
             if (!(stateNew || stateLine || stateFill1 || stateFill0 || stateMove)) {
-                if (relevant) sb.finalizeAll();
+                sb.finalizeAll();
                 break;   // EndShapeRecord
             }
-            if (relevant) {
-                if (stateMove) {
-                    int mb = static_cast<int>(br.readUB(5));
-                    float x = static_cast<float>(br.readSB(mb));
-                    float y = static_cast<float>(br.readSB(mb));
-                    sb.moveTo(x, y);
-                }
-                // 样式变更不结束子路径：按游标增量更新
-                bool has0 = stateFill0 && numFillBits > 0;
-                bool has1 = stateFill1 && numFillBits > 0;
-                bool hasL = stateLine && numLineBits > 0;
-                int nf0 = has0 ? static_cast<int>(br.readUB(numFillBits)) : sb.actFill0;
-                int nf1 = has1 ? static_cast<int>(br.readUB(numFillBits)) : sb.actFill1;
-                int nl = hasL ? static_cast<int>(br.readUB(numLineBits)) : sb.actLine;
-                sb.styleChange(nf0, nf1, nl, has0, has1, hasL);
-            } else {
-                // 另一段的同名记录：消费等长的位以与位流同步
-                if (stateMove) { int mb = static_cast<int>(br.readUB(5)); br.readSB(mb); br.readSB(mb); }
-                if (stateFill0 && numFillBits > 0) br.readUB(numFillBits);
-                if (stateFill1 && numFillBits > 0) br.readUB(numFillBits);
-                if (stateLine  && numLineBits > 0) br.readUB(numLineBits);
+            if (stateMove) {
+                int mb = static_cast<int>(br.readUB(5));
+                float x = static_cast<float>(br.readSB(mb));
+                float y = static_cast<float>(br.readSB(mb));
+                sb.moveTo(x, y);
             }
+            // 索引语义与 decodeShape 一致：1 基 + 批内基址（fillBase/lineBase）
+            int raw0 = stateFill0 ? static_cast<int>(br.readUB(numFillBits)) : 0;
+            int raw1 = stateFill1 ? static_cast<int>(br.readUB(numFillBits)) : 0;
+            int rawL = stateLine ? static_cast<int>(br.readUB(numLineBits)) : 0;
+            int nf0 = stateFill0 ? (raw0 ? sb.fillBase + raw0 : 0) : sb.actFill0;
+            int nf1 = stateFill1 ? (raw1 ? sb.fillBase + raw1 : 0) : sb.actFill1;
+            int nl = stateLine ? (rawL ? sb.lineBase + rawL : 0) : sb.actLine;
+            sb.styleChange(nf0, nf1, nl, stateFill0 != 0, stateFill1 != 0, stateLine != 0);
             if (stateNew) {
-                int nfc = bv.readUI8(); if (nfc == 0xFF) nfc = bv.readUI16();
+                // 与 decodeShape 一致：索引位读完后先 byte_align（BitReader 已预读 4 字节，
+                // 必须先对齐把 bv 落回真实位位置），再用字节模式读样式数组 + nb 字节。
+                br.alignToByte();
+                int nfc = bv.readUI8(); if (nfc == 0xFF && shapeVer >= 2) nfc = bv.readUI16();
                 if (nfc < 0 || nfc > 1024) break;
-                if (allowNew) {
+                {
                     int old = static_cast<int>(sb.shape->fillStyles.size());
+                    sb.fillBase = old;
                     sb.shape->fillStyles.resize(old + nfc); sb.shape->fillPaths.resize(old + nfc);
                     sb.shape->fillEdges.resize(old + nfc);
-                    for (int i = 0; i < nfc; ++i) sb.shape->fillStyles[old + i] = readFillStyle(bv, true);
-                    int nlc = bv.readUI8(); if (nlc == 0xFF) nlc = bv.readUI16();
+                    for (int i = 0; i < nfc; ++i) sb.shape->fillStyles[old + i] = readFillStyle(bv, false);
+                    int nlc = bv.readUI8(); if (nlc == 0xFF && shapeVer >= 2) nlc = bv.readUI16();
                     if (nlc < 0 || nlc > 1024) break;
                     int oldl = static_cast<int>(sb.shape->lineStyles.size());
+                    sb.lineBase = oldl;
                     sb.shape->lineStyles.resize(oldl + nlc); sb.shape->strokePaths.resize(oldl + nlc);
                     for (int i = 0; i < nlc; ++i) sb.shape->lineStyles[oldl + i] = readLineStyle(bv, shapeVer);
-                    numFillBits = neededBits(sb.shape->fillStyles.size());
-                    numLineBits = neededBits(sb.shape->lineStyles.size());
-                } else {
-                    // 终止段不应再定义样式，仅消费字节以对齐
-                    for (int i = 0; i < nfc; ++i) readFillStyle(bv, true);
-                    int nlc = bv.readUI8(); if (nlc == 0xFF) nlc = bv.readUI16();
-                    for (int i = 0; i < nlc; ++i) readLineStyle(bv, shapeVer);
+                    int nb2 = bv.readUI8();
+                    numFillBits = nb2 >> 4;
+                    numLineBits = nb2 & 0x0F;
                 }
             }
-            firstRec = false;
         } else {
             int straight = static_cast<int>(br.readUB(1));
             int nbits    = static_cast<int>(br.readUB(4)) + 2;
-            int morphFlag = static_cast<int>(br.readUB(1));
-            bool relevant = startSection ? (morphFlag == 0) : (morphFlag == 1);
             if (straight) {
                 int general = static_cast<int>(br.readUB(1));
                 float dx = 0, dy = 0;
                 if (general) { dx = static_cast<float>(br.readSB(nbits)); dy = static_cast<float>(br.readSB(nbits)); }
                 else { int vert = static_cast<int>(br.readUB(1)); if (vert) dy = static_cast<float>(br.readSB(nbits)); else dx = static_cast<float>(br.readSB(nbits)); }
-                if (relevant) sb.lineTo(sb.penX + dx, sb.penY + dy);
+                sb.lineTo(sb.penX + dx, sb.penY + dy);
             } else {
                 float cx = static_cast<float>(br.readSB(nbits)), cy = static_cast<float>(br.readSB(nbits)), ax = static_cast<float>(br.readSB(nbits)), ay = static_cast<float>(br.readSB(nbits));
-                if (relevant) sb.curveTo(sb.penX + cx, sb.penY + cy, sb.penX + ax, sb.penY + ay);
+                // 与 decodeShape 一致：AnchorDelta 相对控制点（规范 SHAPERECORD）
+                sb.curveTo(sb.penX + cx, sb.penY + cy, sb.penX + cx + ax, sb.penY + cy + ay);
             }
         }
     }
@@ -845,7 +838,7 @@ static void parseMorphSection(ByteView& bv, int shapeVer, ShapeBuilder& sb,
 
 // DefineMorphShape(46) / DefineMorphShape2(84)：变形形状。
 // 记录流含起始(段)与终止(Offset 处)两套几何，样式索引对齐。产出 t=0/t=1 两形状供插值。
-static std::shared_ptr<MorphShape> decodeMorphShape(ByteView& bv, int shapeVer) {
+static std::shared_ptr<MorphShape> decodeMorphShape(ByteView& bv, int shapeVer, std::uint16_t shapeId = 0) {
     std::size_t recStart = bv.pos() - 2;   // 记录起点（CharacterID 之前 2 字节），Offset 相对此处
     auto ms = std::make_shared<MorphShape>();
     ms->start = std::make_shared<Shape>();
@@ -872,24 +865,36 @@ static std::shared_ptr<MorphShape> decodeMorphShape(ByteView& bv, int shapeVer) 
     ms->start->fillStyles.resize(fc); ms->start->fillPaths.resize(fc);
     ms->end->fillStyles.resize(fc);   ms->end->fillPaths.resize(fc);
     ms->start->fillEdges.resize(fc);  ms->end->fillEdges.resize(fc);
-    for (int i = 0; i < fc; ++i) {
-        ms->start->fillStyles[i] = readFillStyle(bv, true);
-        ms->end->fillStyles[i]   = readFillStyle(bv, true);   // 紧跟其后的终止样式
-    }
+    for (int i = 0; i < fc; ++i)
+        readMorphFillStyle(bv, ms->start->fillStyles[i], ms->end->fillStyles[i]);
     int lc = bv.readUI8(); if (lc == 0xFF) lc = bv.readUI16();
     if (lc < 0 || lc > 4096 || bv.overflow()) return ms;
     ms->start->lineStyles.resize(lc); ms->start->strokePaths.resize(lc);
     ms->end->lineStyles.resize(lc);   ms->end->strokePaths.resize(lc);
-    for (int i = 0; i < lc; ++i) {
-        ms->start->lineStyles[i] = readLineStyle(bv, shapeVer);
-        ms->end->lineStyles[i]   = readLineStyle(bv, shapeVer);
-    }
-    int numFillBits = neededBits(ms->start->fillStyles.size());
-    int numLineBits = neededBits(ms->start->lineStyles.size());
+    for (int i = 0; i < lc; ++i)
+        readMorphLineStyle(bv, ms->start->lineStyles[i], ms->end->lineStyles[i], shapeVer);
+    // SHAPEMORPHSHAPEWITHSTYLE：线样式表之后还有 1 个字节 = NumFillBits(高4位)|NumLineBits(低4位)，
+    // 必须从流里读出来（与 decodeShape 一致），不能按 neededBits 估算。此前漏读这 1 字节，
+    // 使 MORPHSHAPERECORD 位流自起点整体错位 1 字节，StateNewStyles 追加的位图填充
+    // 全部解码成垃圾 bitmapId（床单圆点黑点根因，cid=1287）。
+    int nb = bv.readUI8();
+    int numFillBits = nb >> 4;
+    int numLineBits = nb & 0x0F;
 
-    parseMorphSection(bv, shapeVer, sbS, numFillBits, numLineBits, true, true);   // 起始段
-    if (endOffset > 0) bv.seek(recStart + endOffset);
-    parseMorphSection(bv, shapeVer, sbE, numFillBits, numLineBits, false, false); // 终止段
+    parseMorphSection(bv, shapeVer, sbS, numFillBits, numLineBits);   // 起始段
+    // 终止段**不 seek 到 Offset**（对照 Ruffle read_define_morph_shape）：起始段的
+    // EndShapeRecord 之后紧跟 1 个打包字节（本片写 0，即终止段的 NumFillBits|NumLineBits），
+    // 终止段记录从当前位流位置继续。MORPH 两段共用同一张样式表，样式索引位宽沿用起始段。
+    // 关键修复：终止段是独立的 ShapeBuilder，若其第一段不含 StateFill0（本片的第一个
+    // 记录就是 MoveTo），sbE.actFill0 会保持初值 0，所有边落到"无填充"，m.end 几何全空
+    // -> Morph 中间帧无法插值、进度条只能固定在末帧再手工缩放。这里把起始段建立的当前
+    // 填充/线样式继承给终止段，等价于 Flash 的"两段样式状态连续"语义。
+    bv.readUI8();
+    sbE.actFill0 = sbS.actFill0;
+    sbE.actFill1 = sbS.actFill1;
+    sbE.actLine = sbS.actLine;
+    parseMorphSection(bv, shapeVer, sbE, numFillBits, numLineBits);
+    (void)endOffset; (void)recStart; (void)shapeId;
     return ms;
 }
 
@@ -982,8 +987,13 @@ static void parseGlyphShape(ByteView& bv, std::shared_ptr<Shape>& shape, int sha
 }
 
 // DefineFont2(48) / DefineFont3(75)。注意：FontID 已由调用方读出，本函数从 flags 开始。
-static std::shared_ptr<FontGlyphs> decodeFont(ByteView& bv, int swfVersion) {
+static std::shared_ptr<FontGlyphs> decodeFont(ByteView& bv, int swfVersion, bool font3) {
     auto fg = std::make_shared<FontGlyphs>();
+    // DefineFont3 把字形坐标（以及 HasLayout 度量表）放大到 DefineFont2 的 20 倍，
+    // 即 EM square = 1024 * 20，与 twips 对齐；DefineFont2 仍是规范默认的 1024。
+    // 两者都用 fontHeight/unitsPerEm 把字形坐标换算成 twips，单位弄错会让 DefineText
+    // 与 EditText 的嵌入字形整体放大 20 倍（swf2.swf 首帧的 "LOADING"/"0%" 即如此）。
+    fg->unitsPerEm = font3 ? kFontEmSquare * 20 : kFontEmSquare;
     std::uint8_t flags = bv.readUI8();
     bool hasLayout   = (flags & 0x80) != 0;   // FontFlagsHasLayout
     bool wideOffsets = (flags & 0x08) != 0;   // FontFlagsWideOffsets（32 位偏移）
@@ -1027,7 +1037,6 @@ static std::shared_ptr<FontGlyphs> decodeFont(ByteView& bv, int swfVersion) {
         fg->shapes[static_cast<std::size_t>(i)] = shp;
     }
     std::size_t codeTablePos = tableBase + codeOffset;
-    (void)hasLayout;   // 布局字段（Ascent/Descent/Advance 等）暂不需要，跳过
     // 代码表：每字形对应一个字符码（1 或 2 字节，取决于 WideCodes）。
     // 用全新的 ByteView 读取：字形解析可能已置位 overflow_（该标志是粘性的，seek 不会清除）。
     std::size_t need = static_cast<std::size_t>(numGlyphs) * (wideCodes ? 2 : 1);
@@ -1038,6 +1047,33 @@ static std::shared_ptr<FontGlyphs> decodeFont(ByteView& bv, int swfVersion) {
             int code = wideCodes ? static_cast<int>(cv.readUI16())
                                  : static_cast<int>(cv.readUI8());
             fg->codeToGlyph[code] = i;
+        }
+        // FontFlagsHasLayout 的布局表紧跟 CodeTable（SWF 规范 DefineFont2/3）：
+        //   SI16 Ascent, SI16 Descent, SI16 Leading,
+        //   SI16 FontAdvanceTable[NumGlyphs], RECT FontBoundsTable[NumGlyphs],
+        //   UI16 KerningCount, KERNINGRECORD[Count]（码宽由 WideCodes 决定, SI16 调整量）
+        // 这些值与字形轮廓同处 EM square 坐标系，渲染时统一乘 fontHeight/unitsPerEm。
+        if (hasLayout && codeTablePos + need + 6 <= bv.size()) {
+            ByteView lv(bv.base(), bv.size());
+            lv.seek(codeTablePos + need);
+            fg->hasLayout = true;
+            fg->ascent  = static_cast<std::int16_t>(lv.readUI16());
+            fg->descent = static_cast<std::int16_t>(lv.readUI16());
+            fg->leading = static_cast<std::int16_t>(lv.readUI16());
+            for (int i = 0; i < numGlyphs && !lv.overflow(); ++i)
+                fg->advances[static_cast<std::size_t>(i)] = static_cast<std::int16_t>(lv.readUI16());
+            // FontBoundsTable：每个 RECT 按字节对齐，用 readRect 精确推进（值排版不需要）
+            for (int i = 0; i < numGlyphs && !lv.overflow(); ++i) (void)readRect(lv);
+            if (!lv.overflow()) {
+                int kcount = static_cast<int>(lv.readUI16());
+                for (int i = 0; i < kcount && !lv.overflow(); ++i) {
+                    int c1 = wideCodes ? static_cast<int>(lv.readUI16()) : static_cast<int>(lv.readUI8());
+                    int c2 = wideCodes ? static_cast<int>(lv.readUI16()) : static_cast<int>(lv.readUI8());
+                    int adj = static_cast<std::int16_t>(lv.readUI16());
+                    fg->kerning[(static_cast<std::uint32_t>(c1) << 16) |
+                                static_cast<std::uint16_t>(c2)] = adj;
+                }
+            }
         }
     }
     return fg;
@@ -1143,16 +1179,17 @@ static std::shared_ptr<EditText> decodeEditText(ByteView& bv) {
         return s;
     };
     if (hasFont) et->fontId = bv.readUI16();
-    if (hasFontClass) { (void)readStr(); }   // 设备字体类名，忽略
+    if (hasFontClass) et->fontClass = readStr();   // 设备字体类名（字体替换时用）
     if (hasFont || hasFontClass) et->fontHeight = bv.readUI16();
     if (hasTextColor) { auto c = bv.readRGBA(true); et->color = Color(c.r, c.g, c.b, c.a); }
     if (hasMaxLength) et->maxLength = bv.readUI16();
     if (hasLayout) {
-        (void)bv.readUI8();    // Align(UB[2]) + 保留位
-        (void)bv.readUI16();   // LeftMargin
-        (void)bv.readUI16();   // RightMargin
-        (void)bv.readUI16();   // Indent
-        (void)bv.readUI16();   // Leading(SI16)
+        et->hasLayout  = true;
+        et->align      = bv.readUI8();                                          // UI8: Left/Right/Center/Justify
+        et->leftMargin = bv.readUI16();
+        et->rightMargin = bv.readUI16();
+        et->indent     = static_cast<std::int16_t>(bv.readUI16());             // SI16
+        et->leading    = static_cast<std::int16_t>(bv.readUI16());             // SI16（twips）
     }
     // VariableName 在 InitialText 之前（脚本写同名变量时文本随之更新）。
     et->variableName = readStr();
@@ -1160,17 +1197,26 @@ static std::shared_ptr<EditText> decodeEditText(ByteView& bv) {
     return et;
 }
 
-// 解析 FILTERLIST：DropShadow/Blur/Glow 存入 out（供渲染）；其余滤镜按精确结构跳过。
+// 解析 FILTERLIST（SWF 规范 FILTER / FILTERLIST）。
+// 注意字段类型：BlurX/BlurY/Angle/Distance 为 FIXED(16.16)，Strength 为 FIXED8(SI16/256)，
+// Convolution 的 Divisor/Bias/Matrix 与 ColorMatrix 的 20 个值都是 32 位 FLOAT。
 static void parseFilterList(ByteView& bv, std::vector<Filter>& out) {
     std::uint8_t n = bv.readUI8();
-    auto fx = [&]() { return bv.readSI32() / 65536.0f; };  // FIXED 16.16 -> float
+    auto fx = [&]() { return bv.readSI32() / 65536.0f; };                 // FIXED 16.16
+    auto fx8 = [&]() { return static_cast<std::int16_t>(bv.readUI16()) / 256.0f; };  // FIXED8
+    auto rf = [&]() {                                                     // FLOAT32
+        std::uint32_t bits = bv.readUI32();
+        float v; std::memcpy(&v, &bits, sizeof(v));
+        return v;
+    };
     for (int i = 0; i < n && !bv.overflow(); ++i) {
         std::uint8_t id = bv.readUI8();
         Filter f;
         switch (id) {
             case 0: {  // DropShadow
                 auto c = bv.readRGBA(true); f.kind = FilterKind::DropShadow; f.color = Color(c.r, c.g, c.b, c.a);
-                f.blurX = fx(); f.blurY = fx(); f.angle = fx(); f.distance = fx(); f.strength = fx();
+                f.blurX = fx(); f.blurY = fx(); f.angle = fx(); f.distance = fx(); f.strength = fx8();
+                // 位：InnerShadow(7) Knockout(6) CompositeSource(5) Passes(4..0)
                 std::uint8_t fl = bv.readUI8(); f.inner = (fl & 0x80) != 0; f.knockout = (fl & 0x40) != 0; f.passes = (fl & 0x1F);
                 out.push_back(f); } break;
             case 1: {  // Blur
@@ -1179,16 +1225,18 @@ static void parseFilterList(ByteView& bv, std::vector<Filter>& out) {
                 out.push_back(f); } break;
             case 2: {  // Glow
                 auto c = bv.readRGBA(true); f.kind = FilterKind::Glow; f.color = Color(c.r, c.g, c.b, c.a);
-                f.blurX = fx(); f.blurY = fx(); f.strength = fx();
+                f.blurX = fx(); f.blurY = fx(); f.strength = fx8();
                 std::uint8_t fl = bv.readUI8(); f.inner = (fl & 0x80) != 0; f.knockout = (fl & 0x40) != 0; f.passes = (fl & 0x1F);
                 out.push_back(f); } break;
             case 3: {  // Bevel
                 Filter f; f.kind = FilterKind::Bevel;
                 auto sh = bv.readRGBA(true); f.color = Color(sh.r, sh.g, sh.b, sh.a);     // 阴影像素
                 auto hi = bv.readRGBA(true); f.highlight = Color(hi.r, hi.g, hi.b, hi.a); // 高光像素
-                f.blurX = fx(); f.blurY = fx(); f.angle = fx(); f.distance = fx(); f.strength = fx();
+                f.blurX = fx(); f.blurY = fx(); f.angle = fx(); f.distance = fx(); f.strength = fx8();
+                // 位：InnerShadow(7) Knockout(6) CompositeSource(5) OnTop(4) Passes(3..0)
                 std::uint8_t fl = bv.readUI8();
-                f.inner = (fl & 0x80) != 0; f.knockout = (fl & 0x40) != 0; f.passes = (fl & 0x1F);
+                f.inner = (fl & 0x80) != 0; f.knockout = (fl & 0x40) != 0; f.onTop = (fl & 0x10) != 0;
+                f.passes = (fl & 0x0F);
                 out.push_back(f); } break;
             case 4: case 7: {  // GradientGlow / GradientBevel
                 Filter f; f.kind = (id == 4) ? FilterKind::GradientGlow : FilterKind::GradientBevel;
@@ -1197,28 +1245,29 @@ static void parseFilterList(ByteView& bv, std::vector<Filter>& out) {
                     auto c = bv.readRGBA(true); f.gradientColors.emplace_back(c.r, c.g, c.b, c.a);
                 }
                 for (int k = 0; k < nc && !bv.overflow(); ++k) f.gradientRatios.push_back(bv.readUI8());
-                f.blurX = fx(); f.blurY = fx(); f.angle = fx(); f.distance = fx(); f.strength = fx();
+                f.blurX = fx(); f.blurY = fx(); f.angle = fx(); f.distance = fx(); f.strength = fx8();
+                // 位：InnerShadow(7) Knockout(6) CompositeSource(5) OnTop(4) Passes(3..0)
                 std::uint8_t fl = bv.readUI8();
-                f.inner = (fl & 0x80) != 0; f.knockout = (fl & 0x40) != 0; f.passes = (fl & 0x1F);
-                if (!bv.overflow()) f.gradientType = bv.readUI8();   // 0=Inner 1=Outer 2=Full
+                f.inner = (fl & 0x80) != 0; f.knockout = (fl & 0x40) != 0; f.onTop = (fl & 0x10) != 0;
+                f.passes = (fl & 0x0F);
                 out.push_back(f); } break;
             case 5: {  // Convolution
                 Filter f; f.kind = FilterKind::Convolution;
                 std::uint8_t mx = bv.readUI8(), my = bv.readUI8();
                 f.convW = mx; f.convH = my;
-                f.convDivisor = fx(); f.convBias = fx();
+                f.convDivisor = rf(); f.convBias = rf();
                 int cnt = (int)mx * (int)my; f.convMatrix.resize(cnt);
-                for (int k = 0; k < cnt && !bv.overflow(); ++k) f.convMatrix[k] = fx();
+                for (int k = 0; k < cnt && !bv.overflow(); ++k) f.convMatrix[k] = rf();
                 auto def = bv.readRGBA(true); f.convColor = Color(def.r, def.g, def.b, def.a);
                 if (!bv.overflow()) {
                     std::uint8_t fl = bv.readUI8();
-                    f.convClamp = (fl & 0x20) != 0;          // clamp 位
-                    f.convPreserveAlpha = (fl & 0x80) != 0;  // 保留 alpha 位
+                    f.convClamp = (fl & 0x02) != 0;          // Clamp（Reserved UB[6] + Clamp + PreserveAlpha）
+                    f.convPreserveAlpha = (fl & 0x01) != 0;
                 }
                 out.push_back(f); } break;
-            case 6: {  // ColorMatrix（4x5 = 20 个 FLOAT16）
+            case 6: {  // ColorMatrix（4x5 = 20 个 FLOAT32）
                 Filter f; f.kind = FilterKind::ColorMatrix;
-                for (int k = 0; k < 20; ++k) f.colorMatrix[k] = fx();
+                for (int k = 0; k < 20; ++k) f.colorMatrix[k] = rf();
                 out.push_back(f); } break;
             default: return;
         }
@@ -1307,6 +1356,10 @@ static std::shared_ptr<Character> decodeButton2(ByteView& bv,
         it.characterId = cid;
         it.matrix = readMatrix(bv);
         it.cxform = readCXForm(bv, true);    // DefineButton2 记录恒含 CXFORMWITHALPHA
+        // 记录标志高 4 位：0x20 HasBlendMode、0x10 HasFilterList（必须在读完 CXFORM 后消费，
+        // 否则滤镜/混合模式的字节会被当成下一条 BUTTONRECORD 解析出垃圾状态项）
+        if (recFlags & 0x20) it.blend = static_cast<BlendMode>(bv.readUI8());
+        if (recFlags & 0x10) parseFilterList(bv, it.filters);
         // 状态位：0x01 Up 0x02 Over 0x04 Down 0x08 Hit（可组合，组合时归入各桶）
         if (recFlags & 0x01) btn->up.push_back(it);
         if (recFlags & 0x02) btn->over.push_back(it);
@@ -1364,7 +1417,7 @@ static void decodeVideoFrameInto(VideoStream& vs, std::uint16_t fnum, FFmpegVide
 
 // ---------- 主解码 ----------
 namespace {
-struct Ctx {
+struct DecodeContext {
     Movie movie;
     std::map<std::uint16_t, std::shared_ptr<Character>> characters;
     std::vector<std::uint8_t> jpegTables;
@@ -1418,6 +1471,83 @@ struct Ctx {
         ++curFrame;
     }
 };
+
+// ---- Strategy：位图类 tag 集中处理 ----
+// 这些 tag 过去直接用 base + doff + n 做裸指针算术，长度字段一旦被篡改就越界。
+// 抽成 handler 后只能看到 TagReader（tag 边界视图），边界由 TagPipeline 统一保证。
+static void installBitmapHandlers(TagRegistry<DecodeContext>& reg) {
+    reg.add({6, 8, 21, 35, 20, 36},
+        [](TagReader& r, DecodeContext& ctx, std::uint16_t code) -> TagStatus {
+            if (code == 8) {  // JPEGTables：整段即表数据
+                if (r.size() == 0) return TagStatus::Ok;
+                ctx.jpegTables.assign(r.base(), r.base() + r.size());
+                return TagStatus::Ok;
+            }
+
+            const std::uint16_t id = r.readUI16();
+            if (r.overflow()) return TagStatus::Fail;
+
+            auto ch = std::make_shared<Character>();
+            ch->kind = Character::Kind::Bitmap;
+            ch->bitmap = std::make_shared<Bitmap>();
+
+            switch (code) {
+                case 6: {  // DefineBits：JPEGTables + 本 tag 剩余数据
+                    std::vector<std::uint8_t> blob;
+                    blob.insert(blob.end(), ctx.jpegTables.begin(), ctx.jpegTables.end());
+                    const std::size_t rest = r.remaining();
+                    if (rest > 0)
+                        blob.insert(blob.end(), r.current(), r.current() + rest);
+                    if (!blob.empty())
+                        decodeJpeg(blob.data(), static_cast<int>(blob.size()), *ch->bitmap);
+                    break;
+                }
+                case 21: {  // DefineBitsJPEG2：完整 JPEG
+                    const std::size_t rest = r.remaining();
+                    if (rest > 0 && rest <= static_cast<std::size_t>(INT_MAX))
+                        decodeJpeg(r.current(), static_cast<int>(rest), *ch->bitmap);
+                    break;
+                }
+                case 35: {  // DefineBitsJPEG3：UI32 jpegSize + JPEG + zlib alpha
+                    if (r.remaining() < 4) return TagStatus::Fail;
+                    const std::uint32_t jpegSize = r.readUI32();
+                    if (jpegSize > r.remaining()) return TagStatus::Fail;  // 杜绝下溢/越界
+                    const std::uint8_t* jpeg = r.current();
+                    r.skip(jpegSize);
+                    if (jpegSize > 0 && jpegSize <= static_cast<std::uint32_t>(INT_MAX))
+                        decodeJpeg(jpeg, static_cast<int>(jpegSize), *ch->bitmap);
+                    std::vector<std::uint8_t> alpha;
+                    if (r.remaining() > 0)
+                        inflateZlib(r.current(), r.remaining(), alpha);
+                    applyAlpha(*ch->bitmap, alpha);
+                    break;
+                }
+                case 20: case 36: {  // DefineBitsLossless / Lossless2
+                    const bool withAlpha = (code == 36);
+                    if (r.remaining() < 5) return TagStatus::Fail;
+                    const std::uint8_t fmt = r.readUI8();
+                    const std::uint16_t w = r.readUI16();
+                    const std::uint16_t h = r.readUI16();
+                    // 先限像素总量，再按文件字段分配，避免 65535x65535 的 17GB 分配。
+                    constexpr std::size_t kMaxPixels = 16ull * 1024ull * 1024ull;
+                    if (w == 0 || h == 0 ||
+                        static_cast<std::size_t>(w) * h > kMaxPixels) return TagStatus::Fail;
+                    std::vector<std::uint8_t> raw;
+                    if (!inflateZlib(r.current(), r.remaining(), raw))
+                        return TagStatus::Ok;
+                    ch->bitmap->width = w;
+                    ch->bitmap->height = h;
+                    ch->bitmap->rgba.assign(static_cast<std::size_t>(w) * h * 4, 0);
+                    if (!raw.empty()) decodeLossless(fmt, withAlpha, w, h, raw, *ch->bitmap);
+                    break;
+                }
+                default:
+                    return TagStatus::Ignored;
+            }
+            ctx.characters[id] = std::move(ch);
+            return TagStatus::Ok;
+        });
+}
 }  // namespace
 
 // 解析期按 cid 查角色表，SWF 允许**前向引用**（精灵里引用的形状可能定义在其后），
@@ -1450,13 +1580,25 @@ static void resolveForwardRefs(std::vector<Frame>& frames,
 
 bool decodeMovie(const std::uint8_t* data, std::size_t size, Movie& out, std::string& err) {
     if (size < 8) { err = "file too small"; return false; }
+    // 与 Parser::parse 保持同一套头校验，避免任意以 'F' 开头的字节流进入完整解码。
+    const char sig0 = static_cast<char>(data[0]);
+    if (data[1] != 'W' || data[2] != 'S' ||
+        (sig0 != 'F' && sig0 != 'C' && sig0 != 'Z')) {
+        err = "bad signature"; return false;
+    }
+    if (data[3] == 0) { err = "invalid SWF version"; return false; }
+    const std::uint32_t fileLength = static_cast<std::uint32_t>(data[4])
+        | (static_cast<std::uint32_t>(data[5]) << 8)
+        | (static_cast<std::uint32_t>(data[6]) << 16)
+        | (static_cast<std::uint32_t>(data[7]) << 24);
+    if (fileLength < 8) { err = "invalid FileLength"; return false; }
+
     // 解压成 FWS 缓冲
     std::vector<std::uint8_t> full;
-    char sig0 = static_cast<char>(data[0]);
     if (sig0 == 'C') {
         if (!inflateZlib(data + 8, size - 8, full)) { err = "zlib inflate failed"; return false; }
     } else if (sig0 == 'Z') {
-        if (!decodeLzmaAlone(data + 8, size - 8, full)) { err = "lzma failed"; return false; }
+        if (!decodeZws(data + 8, size - 8, full)) { err = "lzma failed"; return false; }
     } else if (sig0 == 'F') {
         full.assign(data + 8, data + size);   // 未压缩：body = 跳过 8 字节头
     } else { err = "bad signature"; return false; }
@@ -1480,7 +1622,7 @@ bool decodeMovie(const std::uint8_t* data, std::size_t size, Movie& out, std::st
         out.frameCount = bv.readUI16();
     }
 
-    Ctx ctx;
+    DecodeContext ctx;
     ctx.movie.backgroundColor = Color(255, 255, 255);
     ctx.movie.frameSize = out.frameSize;
     ctx.movie.frameRate = out.frameRate;
@@ -1497,675 +1639,792 @@ bool decodeMovie(const std::uint8_t* data, std::size_t size, Movie& out, std::st
         pos = bv.pos();
     }
 
-    for (;;) {
-        if (pos + 2 > avail) break;
-        std::uint16_t v = static_cast<std::uint16_t>(base[pos] | (base[pos + 1] << 8));
-        std::uint32_t len = v & 0x3F;
-        std::size_t cursor = pos + 2;
-        if (len == 63) {
-            if (cursor + 4 > avail) break;
-            len = static_cast<std::uint32_t>(base[cursor]) | (static_cast<std::uint32_t>(base[cursor+1])<<8)
-                | (static_cast<std::uint32_t>(base[cursor+2])<<16) | (static_cast<std::uint32_t>(base[cursor+3])<<24);
-            cursor += 4;
+    // Template Method：标签流骨架统一走 TagPipeline；
+    // 尚未迁移到 Registry 的 tag 由下面的 fallback（旧 switch）处理。
+    // fallback 拿到的 ByteView 带 tag 软边界，故 bv.pos() 等绝对偏移语义保持不变。
+    TagRegistry<DecodeContext> registry;
+    installBitmapHandlers(registry);
+    // M4 迁移（第一批，低风险 tag）：从 fallback switch 迁出为独立策略。
+    registry.add(9, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        readColor(r.bytes(), false, ctx.movie.backgroundColor);
+        return TagStatus::Ok;
+    });
+    registry.add(1, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        ctx.hasShowFrame = true;
+        ctx.snapshotFrame();
+        return TagStatus::Ok;
+    });
+    registry.add(43, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        std::string name;
+        while (r.bytes().pos() < r.length() && !r.bytes().overflow()) {
+            int c = r.bytes().readUI8();
+            if (c == 0 || c == -1) break;
+            name.push_back(static_cast<char>(c));
         }
-        if (cursor + len > avail) break;
-        std::uint16_t code = static_cast<std::uint16_t>(v >> 6);
-        std::size_t doff = cursor;
-        ByteView bv(base, avail); bv.seek(doff);
+        if (!name.empty()) ctx.movie.frameLabels[name] = ctx.curFrame + 1;
+        return TagStatus::Ok;
+    });
+    registry.add(0, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        if (!ctx.hasShowFrame) ctx.snapshotFrame();
+        return TagStatus::Stop;
+    });
 
-        switch (code) {
-            case 9: {  // SetBackgroundColor
-                readColor(bv, false, ctx.movie.backgroundColor);
-                break;
-            }
-            case 39: {  // DefineSprite：内含独立时间轴（子显示列表 + 子帧）
+    // M4 第二批：定义类 tag 迁出 switch（handler 内用 absView() 重建原绝对坐标）。
+    registry.add({2, 22, 32, 83}, [](TagReader& r, DecodeContext& ctx, std::uint16_t code) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        int ver = (code == 2) ? 1 : (code == 22) ? 2 : (code == 32) ? 3 : 4;
+        std::uint16_t id = bv.readUI16();
+        auto shp = decodeShape(bv, ver, id);
+        auto ch = std::make_shared<Character>();
+        ch->kind = Character::Kind::Shape;
+        ch->shape = shp;
+        ctx.characters[id] = ch;
+        return TagStatus::Ok;
+    });
+    registry.add(56, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        std::uint16_t num = bv.readUI16();
+        for (std::uint16_t k = 0; k < num; ++k) {
+            std::uint16_t cid = bv.readUI16();
+            std::string nm; int c;
+            while ((c = bv.readUI8()) != 0 && c != -1) nm.push_back(static_cast<char>(c));
+            if (!nm.empty()) ctx.movie.symbolClasses[nm] = cid;
+        }
+        return TagStatus::Ok;
+    });
+    registry.add({76, 77}, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        std::uint16_t num = bv.readUI16();
+        for (std::uint16_t k = 0; k < num; ++k) {
+            std::uint16_t cid = bv.readUI16();
+            std::string nm; int c;
+            while ((c = bv.readUI8()) != 0 && c != -1) nm.push_back(static_cast<char>(c));
+            std::string dot = nm; size_t pos;
+            while ((pos = dot.find("::")) != std::string::npos) dot.replace(pos, 2, ".");
+            ctx.movie.symbolClasses[dot] = cid;
+        }
+        return TagStatus::Ok;
+    });
+    registry.add(82, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        bv.readUI32();
+        while (bv.pos() < doff + len && bv.readUI8() != 0) {}
+        std::size_t abcStart = bv.pos();
+        if (abcStart < doff + len) {
+            abc::AbcFile f; std::string aerr;
+            if (abc::parseAbc(base + abcStart, (doff + len) - abcStart, f, aerr))
+                ctx.movie.abcFiles.push_back(std::move(f));
+        }
+        return TagStatus::Ok;
+    });
+    registry.add(34, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        std::uint16_t id = bv.readUI16();
+        auto btn = decodeButton2(bv, ctx.characters, ctx.swfVersion, doff + len);
+        ctx.characters[id] = btn;
+        return TagStatus::Ok;
+    });
+    registry.add(17, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        std::uint16_t id = bv.readUI16();
+        auto itc = ctx.characters.find(id);
+        if (itc != ctx.characters.end() && itc->second &&
+            itc->second->kind == Character::Kind::Button && itc->second->button) {
+            auto& btn = *itc->second->button;
+            std::uint16_t* slots[4] = {&btn.soundUp, &btn.soundOver, &btn.soundDown, &btn.soundOut};
+            for (int k = 0; k < 4 && bv.pos() + 2 <= doff + len; ++k) {
                 std::uint16_t sid = bv.readUI16();
-                bv.readUI16();  // 精灵帧数（渲染时按需取帧）
-                auto sp = std::make_shared<Character>();
-                sp->kind = Character::Kind::Sprite;
-                // 解析精灵内部标签流，直到 End(0) 或到达精灵数据末尾
-                std::map<std::uint16_t, DisplayItem> sub;
-                std::map<std::uint16_t, std::shared_ptr<Character>> subPlaced;
-                int subFrame = 0;
-                // 当前精灵帧累积的 DoAction。SWF 中一帧的 DoAction 位于该帧 ShowFrame **之前**，
-                // 若直接挂到已快照的 spriteFrames.back() 会错位一帧，且首帧（spriteFrames 尚空时）
-                // 的脚本会被整段丢弃——这正是"效果精灵放置瞬间的 Stop()/gotoAndStop() 未执行、
-                // 精灵自动外播露出覆盖物"的根因。故与主时间轴一致：先累积，ShowFrame 时并入该帧。
-                std::vector<avm1::Script> subPendingActions;
-                // 当前精灵帧累积的 StartSound：与 DoAction 一样在 ShowFrame 时并入该帧。
-                std::vector<SoundEvent> subPendingSounds;
-                std::size_t subEnd = doff + len;
-                while (bv.pos() + 2 <= subEnd) {
-                    std::uint16_t tv = bv.readUI16();
-                    std::uint32_t tlen = tv & 0x3F;
-                    if (tlen == 63) tlen = bv.readUI32();
-                    std::size_t tStart = bv.pos();
-                    std::size_t tEnd = tStart + tlen;
-                    std::uint16_t tc = static_cast<std::uint16_t>(tv >> 6);
-                    if (tEnd > subEnd) break;
-                    if (tc == 2 || tc == 22 || tc == 32 || tc == 83) {  // 嵌套定义形状
-                        int ver = (tc == 2) ? 1 : (tc == 22) ? 2 : (tc == 32) ? 3 : 4;
-                        std::uint16_t cid = bv.readUI16();
-                        auto shp = decodeShape(bv, ver, cid);
-                        auto ch = std::make_shared<Character>();
-                        ch->kind = Character::Kind::Shape;
-                        ch->shape = shp;
-                        ctx.characters[cid] = ch;
-                    } else if (tc == 4) {  // PlaceObject
-                        std::uint16_t cid = bv.readUI16();
-                        std::uint16_t depth = bv.readUI16();
-                        DisplayItem it; it.depth = depth; it.matrix = Matrix{};
-                        auto ic = ctx.characters.find(cid);
-                        it.character = (ic != ctx.characters.end()) ? ic->second : nullptr;
-                        sub[depth] = it;
-                    } else if (tc == 26) {  // PlaceObject2
-                        int f = bv.readUI8();
-                        DisplayItem it; it.depth = bv.readUI16();
-                        // Move 语义：不带 HasCharacter 的 PlaceObject2 只是移动/改样式，
-                        // 必须继承该 depth 上已有的角色，否则会新建一个空项，整层渲染不出来。
-                        { auto prev = sub.find(it.depth); if (prev != sub.end()) it = prev->second; }
-                        if (f & 0x02) { std::uint16_t cid = bv.readUI16(); auto ic = ctx.characters.find(cid); it.character = (ic != ctx.characters.end()) ? ic->second : nullptr; it.characterId = cid; }
-                        if (f & 0x04) it.matrix = readMatrix(bv);
-                        if (f & 0x08) it.cxform = readCXForm(bv, true);
-                        if (f & 0x10) it.ratio = static_cast<float>(bv.readUI16()) / 65535.0f;
-                        if (f & 0x20) { std::string nm = readStringZ(bv, tEnd); it.name = nm; }
-                        if (f & 0x40) it.clipDepth = bv.readUI16();
-                        if (f & 0x80) readClipActions(bv, tEnd, ctx.swfVersion, it.clipEvents);
-                        sub[it.depth] = it;
-                    } else if (tc == 70) {  // PlaceObject3
-                        int f = bv.readUI8(); int f2 = bv.readUI8();
-                        DisplayItem it; it.depth = bv.readUI16();
-                        if (f2 & 0x08) { while (bv.pos() < tEnd && bv.readUI8() != 0) {} }  // ClassName
-                        if (f2 & 0x01) parseFilterList(bv, it.filters);                       // FilterList
-                        if (f2 & 0x02) it.blend = static_cast<BlendMode>(bv.readUI8());       // BlendMode
-                        if (f2 & 0x04) bv.readUI8();                                          // CacheAsBitmap
-                        if (f2 & 0x20) bv.readUI8();                                          // Visible
-                        if (f2 & 0x40) { bv.readUI8(); bv.readUI8(); bv.readUI8(); bv.readUI8(); }  // OpaqueBackground
-                        { auto prev = sub.find(it.depth); if (prev != sub.end()) it = prev->second; }  // Move 语义
-                        if (f & 0x02) { std::uint16_t cid = bv.readUI16(); auto ic = ctx.characters.find(cid); it.character = (ic != ctx.characters.end()) ? ic->second : nullptr; it.characterId = cid; }
-                        if (f & 0x04) it.matrix = readMatrix(bv);
-                        if (f & 0x08) it.cxform = readCXForm(bv, true);
-                        if (f & 0x10) it.ratio = static_cast<float>(bv.readUI16()) / 65535.0f;
-                        if (f & 0x20) it.name = readStringZ(bv, tEnd);
-                        if (f & 0x40) it.clipDepth = bv.readUI16();
-                        if (f & 0x80) readClipActions(bv, tEnd, ctx.swfVersion, it.clipEvents);
-                        sub[it.depth] = it;
-                    } else if (tc == 5) {
-                        bv.readUI16(); std::uint16_t d = bv.readUI16();
-                        sub.erase(d); subPlaced.erase(d);   // 同步清理，见 RemoveObject2 处说明
-                    }
-                    else if (tc == 28) {
-                        std::uint16_t d = bv.readUI16();
-                        sub.erase(d); subPlaced.erase(d);
-                    }
-                    else if (tc == 1) {  // ShowFrame：快照精灵帧（记录各 depth 放置帧）
-                        Frame fr;
-                        for (auto& kv : sub) {
-                            DisplayItem it = kv.second;
-                            if (subPlaced.find(it.depth) == subPlaced.end() || subPlaced[it.depth] != it.character) {
-                                subPlaced[it.depth] = it.character;
-                                it.birthFrame = subFrame;
-                            }
-                            fr.items.push_back(it);
-                        }
-                        std::sort(fr.items.begin(), fr.items.end(),
-                                  [](const DisplayItem& a, const DisplayItem& b) { return a.depth < b.depth; });
-                        // 把本帧累积的 DoAction 并入该帧（多个 DoAction 按顺序合并为一段脚本）。
-                        if (!subPendingActions.empty()) {
-                            std::vector<std::uint8_t> bytes;
-                            for (auto& a : subPendingActions)
-                                bytes.insert(bytes.end(), a.bytes.begin(), a.bytes.end());
-                            fr.doActions.push_back(avm1::disassemble(bytes.data(), bytes.size()));
-                            subPendingActions.clear();
-                        }
-                        // 本帧的 StartSound 事件并入该帧（精灵内部音效，如金币/按钮音）。
-                        if (!subPendingSounds.empty()) {
-                            fr.soundEvents = std::move(subPendingSounds);
-                            subPendingSounds.clear();
-                        }
-                        sp->spriteFrames.push_back(std::move(fr));
-                        ++subFrame;
-                    }
-                    else if (tc == 12) {  // DoAction（精灵帧脚本）：累积到本帧，ShowFrame 时并入
-                        subPendingActions.push_back(
-                            avm1::disassemble(bv.base() + tStart, tEnd - tStart));
-                    }
-                    else if (tc == 15 || tc == 89) {  // StartSound / StartSound2：累积到本帧
-                        SoundEvent ev;
-                        if (tc == 15) {
-                            ev.soundId = bv.readUI16();
-                        } else {
-                            (void)readStringZ(bv, tEnd);   // 导出名（按名播放，暂不支持）
-                        }
-                        bool stop = false;
-                        ev.loop = readSoundInfoSkip(bv, tEnd, &stop);
-                        ev.stop = stop;
-                        if (tc == 15) subPendingSounds.push_back(ev);
-                    }
-                    else if (tc == 43) {  // FrameLabel：给**紧随其后**的那一帧起名（1 基帧号）
-                        // 与主时间轴一致：标签名指向 subFrame+1（正在构建的那一帧）。
-                        std::string nm = readStringZ(bv, tEnd);
-                        if (!nm.empty()) sp->frameLabels[nm] = subFrame + 1;
-                    }
-                    else if (tc == 59) {  // DoInitAction（精灵初始化脚本）
-                        bv.readUI16();  // spriteId
-                        avm1::Script sc = avm1::disassemble(bv.base() + bv.pos(), tEnd - bv.pos());
-                        ctx.movie.initActions[sid] = std::move(sc);
-                    }
-                    else if (tc == 0) { bv.seek(tEnd); break; }  // End of sprite
-                    bv.seek(tEnd);
-                }
-                ctx.characters[sid] = sp;
-                break;
+                readSoundInfoSkip(bv, doff + len, nullptr);
+                if (sid) *slots[k] = sid;
             }
-            case 2: case 22: case 32: case 83: {  // DefineShape 1/2/3/4
-                int ver = (code == 2) ? 1 : (code == 22) ? 2 : (code == 32) ? 3 : 4;
-                std::uint16_t id = bv.readUI16();
-                if (std::getenv("SWF_DUMP_SHAPES")) std::printf("SHAPE id=%u ver=%d tagDataStart=%zu\n", id, ver, bv.pos());
-                auto shp = decodeShape(bv, ver, id);
+        }
+        return TagStatus::Ok;
+    });
+    registry.add(10, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        std::uint16_t fid = bv.readUI16();
+        std::size_t offStart = bv.pos();
+        if (offStart + 2 > doff + len || bv.overflow()) return TagStatus::Ok;
+        std::uint16_t o0 = bv.readUI16();
+        int nGlyphs = static_cast<int>(o0) / 2;
+        if (nGlyphs <= 0 || nGlyphs > 65535) return TagStatus::Ok;
+        std::vector<std::uint32_t> offs(static_cast<std::size_t>(nGlyphs));
+        offs[0] = o0;
+        for (int i = 1; i < nGlyphs; ++i) offs[i] = bv.readUI16();
+        auto fg = std::make_shared<FontGlyphs>();
+        // DefineFont(10) 的字形坐标就是 twips（与 FontHeight 同尺度），
+        // 没有 EM square / HasLayout 度量表。
+        fg->glyphsInTwips = true;
+        fg->unitsPerEm = 1;
+        fg->shapes.resize(static_cast<std::size_t>(nGlyphs));
+        fg->advances.assign(static_cast<std::size_t>(nGlyphs), 0);
+        for (int i = 0; i < nGlyphs; ++i) {
+            std::size_t gstart = offStart + offs[static_cast<std::size_t>(i)];
+            std::size_t gend = (i + 1 < nGlyphs) ? offStart + offs[static_cast<std::size_t>(i + 1)] : doff + len;
+            if (gstart >= gend || gend > bv.limit()) continue;
+            ByteView gv(base, bv.size()); gv.seek(gstart); gv.setLimit(gend);
+            auto shp = std::make_shared<Shape>();
+            parseGlyphShape(gv, shp, 1);
+            fg->shapes[static_cast<std::size_t>(i)] = shp;
+        }
+        auto ch = std::make_shared<Character>();
+        ch->kind = Character::Kind::Font;
+        ch->font = fg;
+        ctx.characters[fid] = ch;
+        return TagStatus::Ok;
+    });
+    registry.add({48, 75}, [](TagReader& r, DecodeContext& ctx, std::uint16_t code) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        ByteView fv(base + doff, len);
+        std::uint16_t id = fv.readUI16();
+        auto fg = decodeFont(fv, ctx.swfVersion, code == 75);
+        auto ch = std::make_shared<Character>();
+        ch->kind = Character::Kind::Font;
+        ch->font = fg;
+        ctx.characters[id] = ch;
+        return TagStatus::Ok;
+    });
+    registry.add({13, 62}, [](TagReader& r, DecodeContext& ctx, std::uint16_t code) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        std::uint16_t fid = bv.readUI16();
+        if (code == 62) bv.readUI8();
+        int nameLen = bv.readUI8();
+        std::string fname; std::size_t nameStart = bv.pos();
+        for (int i = 0; i < nameLen; ++i) { int c = bv.readUI8(); if (c == 0) break; fname.push_back(static_cast<char>(c)); }
+        bv.seek(nameStart + static_cast<std::size_t>(nameLen));
+        std::uint8_t fflags = bv.readUI8();
+        bool wide = (code == 62) || (fflags & 0x01) != 0;
+        auto it = ctx.characters.find(fid);
+        if (it != ctx.characters.end() && it->second && it->second->font) {
+            FontGlyphs& fg = *it->second->font;
+            if (fg.name.empty() && !fname.empty()) fg.name = fname;
+            fg.italic = fg.italic || (fflags & 0x04) != 0;
+            fg.bold = fg.bold || (fflags & 0x02) != 0;
+            if (fg.codeToGlyph.empty()) {
+                int n = static_cast<int>(fg.shapes.size());
+                for (int i = 0; i < n && !bv.overflow(); ++i) {
+                    int cc = wide ? static_cast<int>(bv.readUI16()) : static_cast<int>(bv.readUI8());
+                    fg.codeToGlyph[cc] = i;
+                }
+            }
+        }
+        return TagStatus::Ok;
+    });
+    registry.add({11, 33}, [](TagReader& r, DecodeContext& ctx, std::uint16_t code) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        bool alpha = (code == 33);
+        std::uint16_t id = bv.readUI16();
+        auto td = decodeText(bv, alpha);
+        auto ch = std::make_shared<Character>();
+        ch->kind = Character::Kind::Text;
+        ch->text = td;
+        ctx.characters[id] = ch;
+        return TagStatus::Ok;
+    });
+    registry.add(37, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        std::uint16_t id = bv.readUI16();
+        auto et = decodeEditText(bv);
+        auto ch = std::make_shared<Character>();
+        ch->kind = Character::Kind::EditText;
+        ch->editText = et;
+        ctx.characters[id] = ch;
+        return TagStatus::Ok;
+    });
+    registry.add({46, 84}, [](TagReader& r, DecodeContext& ctx, std::uint16_t code) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        int ver = (code == 46) ? 1 : 2;
+        std::uint16_t id = bv.readUI16();
+        auto ms = decodeMorphShape(bv, ver, id);
+        auto ch = std::make_shared<Character>();
+        ch->kind = Character::Kind::Morph;
+        ch->morph = ms;
+        ctx.characters[id] = ch;
+        return TagStatus::Ok;
+    });
+
+    // M4 第三批：显示列表/脚本/声音/视频/标签类 tag 迁出 switch。
+    registry.add({5, 28}, [](TagReader& r, DecodeContext& ctx, std::uint16_t code) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset();
+        const std::size_t len = r.length();
+        // 同时清掉 placedChar：否则同一 depth 之后重新放置同一角色时，
+        // 比较结果相同而不会刷新 birthFrame，精灵内部帧号会一直按旧值算，
+        // 取到空帧 —— 表现为整块内容消失（swf.swf 的角色就是这样丢的）。
+        if (code == 5) {
+            bv.readUI16();
+            std::uint16_t depth = bv.readUI16();
+            ctx.displayList.erase(depth);
+            ctx.placedChar.erase(depth);
+        } else {
+            std::uint16_t depth = bv.readUI16();
+            ctx.displayList.erase(depth);
+            ctx.placedChar.erase(depth);
+        }
+        return TagStatus::Ok;
+    });
+    registry.add(12, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset();
+        const std::size_t len = r.length();
+        avm1::Script sc = avm1::disassemble(base + doff, len);
+        ctx.pendingFrameActions.push_back(std::move(sc));
+        return TagStatus::Ok;
+    });
+    registry.add(59, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset();
+        const std::size_t len = r.length();
+        if (len < 2) return TagStatus::Ok;  // 否则 len - 2 会无符号下溢成 0xFFFFFFFE
+        std::uint16_t spriteId = static_cast<std::uint16_t>(base[doff] | (base[doff + 1] << 8));
+        avm1::Script sc = avm1::disassemble(base + doff + 2, static_cast<std::size_t>(len - 2));
+        ctx.movie.initActions[spriteId] = std::move(sc);
+        return TagStatus::Ok;
+    });
+    registry.add(14, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset();
+        const std::size_t len = r.length();
+        if (len < 7) return TagStatus::Ok;  // 裸索引 base[doff..doff+6] 的前置条件
+        Sound snd;
+        snd.id = static_cast<std::uint16_t>(base[doff] | (base[doff + 1] << 8));
+        std::uint8_t flags = base[doff + 2];
+        snd.format = (flags >> 4) & 0x0F;
+        snd.rate = (flags >> 2) & 0x03;
+        snd.bits = (flags >> 1) & 0x01;
+        snd.channels = flags & 0x01;
+        snd.sampleCount = static_cast<std::uint32_t>(base[doff + 3]) | (static_cast<std::uint32_t>(base[doff + 4]) << 8)
+                        | (static_cast<std::uint32_t>(base[doff + 5]) << 16) | (static_cast<std::uint32_t>(base[doff + 6]) << 24);
+        int dataOff = (int)doff + 7;
+        int dataLen = (int)len - 7;
+        if (dataLen > 0) snd.data.assign(base + dataOff, base + dataOff + dataLen);
+        ctx.movie.sounds[snd.id] = std::move(snd);
+        return TagStatus::Ok;
+    });
+    registry.add({15, 89}, [](TagReader& r, DecodeContext& ctx, std::uint16_t code) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset();
+        const std::size_t len = r.length();
+        SoundEvent ev;
+        if (code == 15) {
+            ev.soundId = bv.readUI16();
+        } else {
+            // StartSound2：SoundId 为导出名（字符串），此处仅消费
+            readStringZ(bv, doff + len);
+        }
+        bool stop = false;
+        ev.loop = readSoundInfoSkip(bv, doff + len, &stop);
+        ev.stop = stop;
+        if (ev.soundId != 0 || code == 15) ctx.pendingSoundEvents.push_back(ev);
+        return TagStatus::Ok;
+    });
+    registry.add({18, 45}, [](TagReader& r, DecodeContext& ctx, std::uint16_t code) -> TagStatus {
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset();
+        const std::size_t len = r.length();
+        if (len >= 2) {
+            std::uint8_t b0 = base[doff], b1 = base[doff + 1];
+            auto& sa = ctx.movie.streamAudio;
+            sa.have = true;
+            sa.rate = (b1 >> 6) & 0x03;
+            sa.bits = (b1 >> 5) & 0x01;
+            sa.channels = (b1 >> 4) & 0x01;
+            // SoundStreamHead2(45) 含 8-bit 编码字节；SoundStreamHead(18) 隐含 PCM/ADPCM
+            sa.format = (code == 45) ? (b1 & 0x0F) : 0;
+        }
+        return TagStatus::Ok;
+    });
+    registry.add(19, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset();
+        const std::size_t len = r.length();
+        if (len > 0) {
+            SoundEvent ev;
+            ev.soundId = 0;
+            ev.streamBlock = ctx.streamBlockCount++;
+            ctx.pendingSoundEvents.push_back(ev);
+            ctx.movie.streamAudio.blocks.emplace_back(base + doff, base + doff + len);
+        }
+        return TagStatus::Ok;
+    });
+    registry.add(60, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset();
+        const std::size_t len = r.length();
+        if (len < 9) return TagStatus::Ok;
+        auto vs = std::make_shared<VideoStream>();
+        vs->id = static_cast<std::uint16_t>(base[doff] | (base[doff + 1] << 8));
+        vs->numFrames = static_cast<std::uint16_t>(base[doff + 2] | (base[doff + 3] << 8));
+        vs->width = static_cast<std::uint16_t>(base[doff + 4] | (base[doff + 5] << 8));
+        vs->height = static_cast<std::uint16_t>(base[doff + 6] | (base[doff + 7] << 8));
+        std::uint8_t vf = base[doff + 8];
+        // SWF VideoFlags（1 字节）：低 4 位 = VideoCodecID
+        //   2=H.263/Sorenson 3=ScreenVideo 4=VP6 5=VP6+alpha 6=ScreenVideo2 7=AVC
+        // 之上两位分别是 Smoothing(bit4) 与 Deblocking(bit5)，高位保留。
+        vs->codecId = vf & 0x0F;
+        vs->smoothing = (vf & 0x10) != 0;
+        vs->deblocking = (vf & 0x20) != 0;
+        ctx.movie.videos[vs->id] = vs;
+        // 同时注册为角色，便于 PlaceObject2 放置并由渲染器绘制当前帧
+        auto vch = std::make_shared<Character>();
+        vch->kind = Character::Kind::Video;
+        vch->video = vs;
+        ctx.characters[vs->id] = vch;
+        return TagStatus::Ok;
+    });
+    registry.add(61, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset();
+        const std::size_t len = r.length();
+        if (len < 4) return TagStatus::Ok;
+        std::uint16_t vid = static_cast<std::uint16_t>(base[doff] | (base[doff + 1] << 8));
+        std::uint16_t fnum = static_cast<std::uint16_t>(base[doff + 2] | (base[doff + 3] << 8));
+        auto vit = ctx.movie.videos.find(vid);
+        if (vit != ctx.movie.videos.end()) {
+            int dataOff = (int)doff + 4;
+            int dataLen = (int)len - 4;
+            if (dataLen > 0) {
+                auto& vs = *vit->second;
+                vs.frames[fnum].assign(base + dataOff, base + dataOff + dataLen);
+                std::uint8_t vcid = vs.codecId;
+                if (vcid == 3) {  // ScreenVideo：纯 C++ 解码（增量）
+                    const Bitmap* prev = nullptr;
+                    auto pit = vs.decoded.lower_bound(fnum);
+                    if (pit != vs.decoded.begin()) { --pit; prev = pit->second.get(); }
+                    vs.decoded[fnum] = decodeScreenVideo(
+                        vs.frames[fnum], vs.width, vs.height, prev);
+                } else if (vcid == 2 || vcid == 4 || vcid == 5 || vcid == 7) {
+                    // H.263(FLV1) / VP6 / VP6+alpha / AVC(H.264)：经 FFmpeg 解码
+                    auto& dec = ctx.videoDecoders[vs.id];
+                    if (!dec) {
+                        dec = std::make_unique<FFmpegVideoDecoder>();
+                        // AVC：本帧即 AVCDecoderConfigurationRecord（作为 extradata），不输出画面
+                        const std::vector<std::uint8_t>* extra =
+                            (vcid == 7) ? &vs.frames[fnum] : nullptr;
+                        std::string e;
+                        if (!dec->open(vcid, vs.width, vs.height,
+                                       extra ? *extra : std::vector<std::uint8_t>{}, e)) {
+                            ctx.videoDecodeError[vs.id] = e;
+                            dec.reset();
+                        } else if (vcid != 7) {
+                            decodeVideoFrameInto(vs, fnum, *dec);
+                        }
+                    } else if (dec) {
+                        decodeVideoFrameInto(vs, fnum, *dec);
+                    }
+                }
+            }
+        }
+        return TagStatus::Ok;
+    });
+    registry.add(86, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset();
+        const std::size_t len = r.length();
+        // 结构：SceneCount(UI32) [FrameOffset(UI32) SceneName(STRING)]*
+        //       FrameLabelCount(UI32) [FrameNum(UI32) FrameLabel(STRING)]*
+        // 注意 FrameNum 是 UI32（不是 UI16），字符串已含长度语义（以 0 结尾）。
+        // 计数一旦解析错位会变成天文数字，必须按标签长度夹紧，否则会空转极久。
+        ByteView fb(base, doff + len); fb.seek(doff); fb.setLimit(doff + len);
+        const std::size_t end = doff + len;
+        auto readStr = [&]() {
+            std::string s; int c;
+            while (fb.pos() < end && (c = fb.readUI8()) != 0) s.push_back((char)c);
+            return s;
+        };
+        // 每条记录最少 5 字节（UI32 + 1 字节结尾 0）
+        const std::uint32_t maxEntries = static_cast<std::uint32_t>(len / 5) + 1;
+        std::uint32_t sceneCount = fb.readUI32();
+        if (sceneCount > maxEntries) sceneCount = maxEntries;
+        for (std::uint32_t i = 0; i < sceneCount && fb.pos() < end; ++i) {
+            fb.readUI32();
+            readStr();
+        }
+        if (fb.pos() + 4 > end) return TagStatus::Ok;
+        std::uint32_t labelCount = fb.readUI32();
+        if (labelCount > maxEntries) labelCount = maxEntries;
+        for (std::uint32_t i = 0; i < labelCount && fb.pos() < end; ++i) {
+            std::uint32_t fn = fb.readUI32();
+            std::string name = readStr();
+            if (!name.empty()) ctx.movie.frameLabels[name] = static_cast<int>(fn) + 1;
+        }
+        return TagStatus::Ok;
+    });
+    registry.add(88, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset();
+        const std::size_t len = r.length();
+        ByteView fb(base, doff + len); fb.seek(doff); fb.setLimit(doff + len);
+        std::uint16_t fontId = fb.readUI16();
+        std::string name; int c;
+        while ((c = fb.readUI8()) != 0 && c != -1) name.push_back((char)c);
+        if (!name.empty()) {
+            ctx.movie.fontNames[fontId] = name;
+            auto fit = ctx.characters.find(fontId);
+            if (fit != ctx.characters.end() && fit->second && fit->second->font &&
+                fit->second->font->name.empty())
+                fit->second->font->name = std::move(name);
+        }
+        return TagStatus::Ok;
+    });
+
+    // M4 第四批：PlaceObject 系列（显示列表）迁出 switch。
+    registry.add(4, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        std::uint16_t cid = bv.readUI16();
+        std::uint16_t depth = bv.readUI16();
+        DisplayItem it;
+        it.depth = depth;
+        auto itc = ctx.characters.find(cid);
+        it.character = (itc != ctx.characters.end()) ? itc->second : nullptr;
+        it.characterId = cid;
+        it.matrix = Matrix{};
+        ctx.displayList[depth] = it;
+        return TagStatus::Ok;
+    });
+    registry.add(26, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        // flags（1 字节）位定义（与真实 SWF 数据核对得出）：
+        //   0x01 Move   0x02 HasCharacter 0x04 HasMatrix  0x08 HasCxform
+        //   0x10 HasRatio 0x20 HasName    0x40 HasClipDepth 0x80 HasClipActions
+        int f = bv.readUI8();
+        // 字段序：Flags, Depth(恒有), [CharacterId 若 HasCharacter], Matrix...
+        // 注意：SWF 规范写的是 CharacterId 在 Depth 之前，但本文件实测为
+        // Depth 在前——证据：按规范序会把 DefineFont2（cid22/25，tag48
+        // 字体"黑体"/"方正简体"）放上显示列表（非法）、矿工 char14 只有
+        // depth 序才被放置（dep14←cid14，矩阵与 Adobe 基准吻合）、
+        // RemoveObject2 连贯性（F1 放 dep1←cid6/dep8←cid7，F9 恰清除二者）、
+        // F9 连续九条 dep10←cid10…dep18←cid18 的典型生成器模式。
+        // 按"规范序"渲染会几乎全空（与基准 mean diff 241.8）。
+        std::uint16_t depth = bv.readUI16();
+        std::uint16_t cid = 0;
+        if (f & 0x02) cid = bv.readUI16();
+        // Move=1 表示"在已有显示对象上修改"（只改矩阵/比例/色彩变换等），
+        // 必须保留原 character，否则会把该 depth 上的内容整个抹掉。
+        // swf.swf 里有 71 个 flags=0x05（Move+矩阵、不带角色）的标签，
+        // 旧实现每次都用空 character 覆盖，导致大量角色凭空消失。
+        DisplayItem it;
+        if ((f & 0x01) != 0) {
+            auto e = ctx.displayList.find(depth);
+            if (e != ctx.displayList.end()) it = e->second;
+        }
+        it.depth = depth;
+        if (f & 0x02) {
+            auto itc = ctx.characters.find(cid);
+            it.character = (itc != ctx.characters.end()) ? itc->second : nullptr;
+            it.characterId = cid;
+        }
+        if (f & 0x04) it.matrix = readMatrix(bv);
+        if (f & 0x08) it.cxform = readCXForm(bv, true);
+        if (f & 0x10) it.ratio = static_cast<float>(bv.readUI16()) / 65535.0f;  // ratio
+        if (f & 0x20) it.name = readStringZ(bv, doff + len);          // 实例名
+        if (f & 0x40) it.clipDepth = bv.readUI16();
+        if (f & 0x80) readClipActions(bv, doff + len, ctx.swfVersion, it.clipEvents);
+        ctx.displayList[depth] = it;
+        return TagStatus::Ok;
+    });
+    registry.add(70, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        int f = bv.readUI8();
+        int f2 = bv.readUI8();
+        DisplayItem it;
+        it.depth = bv.readUI16();
+        if (f & 0x01) {   // Move：继承该 depth 上已有的对象
+            auto e = ctx.displayList.find(it.depth);
+            if (e != ctx.displayList.end()) it = e->second;
+        }
+        // PlaceFlag2（Reserved2）位定义（SWF 规范 6.2）：
+        //   0x01 HasFilterList  0x02 HasBlendMode  0x04 HasCacheAsBitmap
+        // 注意：PO3 **没有** ClassName 字段（ClassName 是 PlaceObject4 才引入的），
+        // 字段序：Depth → [CharacterId] → [Matrix] → [CXForm] → [Ratio]
+        //        → [Name] → [ClipDepth] → [FilterList] → [BlendMode] → [CacheAsBitmap] → [ClipActions]
+        if (f & 0x02) {
+            std::uint16_t cid = bv.readUI16();
+            auto itc = ctx.characters.find(cid);
+            it.character = (itc != ctx.characters.end()) ? itc->second : nullptr;
+            it.characterId = cid;
+        }
+        if (f & 0x04) it.matrix = readMatrix(bv);
+        if (f & 0x08) it.cxform = readCXForm(bv, true);
+        if (f & 0x10) it.ratio = static_cast<float>(bv.readUI16()) / 65535.0f;  // ratio
+        if (f & 0x20) it.name = readStringZ(bv, doff + len);          // 实例名
+        if (f & 0x40) it.clipDepth = bv.readUI16();
+        if (f2 & 0x01) parseFilterList(bv, it.filters);    // FilterList (HasFilterList=0x01)
+        if (f2 & 0x02) it.blend = static_cast<BlendMode>(bv.readUI8());  // BlendMode (0x02)
+        if (f2 & 0x04) bv.readUI8();                       // CacheAsBitmap (0x04)
+        if (f & 0x80) readClipActions(bv, doff + len, ctx.swfVersion, it.clipEvents);
+        ctx.displayList[it.depth] = it;
+        return TagStatus::Ok;
+    });
+    registry.add(81, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::uint8_t* base = r.fileBase();
+        const std::size_t doff = r.dataOffset(), tEnd = doff + r.length();
+        const std::size_t len = r.length();
+        int f = bv.readUI8();    // PlaceFlag：0x01 Move 0x02 HasCharacter 0x04 HasMatrix
+        int f2 = bv.readUI8();   // Reserved2：0x01 HasFilterList 0x02 HasBlendMode
+                                //            0x04 HasCacheAsBitmap 0x08 HasImage 0x10 HasClassName
+        DisplayItem it;
+        it.depth = bv.readUI16();
+        if (f & 0x01) {   // Move：继承该 depth 上已有的对象
+            auto e = ctx.displayList.find(it.depth);
+            if (e != ctx.displayList.end()) it = e->second;
+        }
+        // 字段序（规范）：Depth → [ClassName] → [CharacterId] → [Matrix] → [CXForm] → [Ratio]
+        //                → [Name] → [ClipDepth] → [BitmapCache(仅 HasImage)]
+        //                → [FilterList] → [BlendMode] → [CacheAsBitmap] → [ClipActions]
+        if ((f2 & 0x10) || ((f2 & 0x08) != 0 && (f & 0x02) != 0))
+            (void)readStringZ(bv, doff + len);            // ClassName
+        if (f & 0x02) {
+            std::uint16_t cid = bv.readUI16();
+            auto itc = ctx.characters.find(cid);
+            it.character = (itc != ctx.characters.end()) ? itc->second : nullptr;
+            it.characterId = cid;
+        }
+        if (f & 0x04) it.matrix = readMatrix(bv);
+        if (f & 0x08) it.cxform = readCXForm(bv, true);
+        if (f & 0x10) it.ratio = static_cast<float>(bv.readUI16()) / 65535.0f;  // ratio
+        if (f & 0x20) it.name = readStringZ(bv, doff + len);          // 实例名
+        if (f & 0x40) it.clipDepth = bv.readUI16();
+        if (f2 & 0x08) {                                   // BitmapCache（仅 HasImage 时存在）
+            bv.readUI16();                                 // Reserved
+            bv.readUI8();                                  // IsProtected
+            bv.readUI8();                                  // ClipShadows
+            std::uint16_t ci = bv.readUI16();              // ClassIndex（符号类注册表索引）
+            (void)ci;
+        }
+        if (f2 & 0x01) parseFilterList(bv, it.filters);    // FilterList (HasFilterList=0x01)
+        if (f2 & 0x02) it.blend = static_cast<BlendMode>(bv.readUI8());  // BlendMode (0x02)
+        if (f2 & 0x04) bv.readUI8();                       // CacheAsBitmap (0x04)
+        if (f & 0x80) readClipActions(bv, doff + len, ctx.swfVersion, it.clipEvents);
+        ctx.displayList[it.depth] = it;
+        return TagStatus::Ok;
+    });
+
+    // M4 收尾：DefineSprite（子时间轴，内部自解析子 tag 流）。
+    registry.add(39, [](TagReader& r, DecodeContext& ctx, std::uint16_t) -> TagStatus {
+        ByteView bv = r.absView();
+        const std::size_t doff = r.dataOffset();
+        const std::size_t len = r.length();
+        std::uint16_t sid = bv.readUI16();
+        bv.readUI16();  // 精灵帧数（渲染时按需取帧）
+        auto sp = std::make_shared<Character>();
+        sp->kind = Character::Kind::Sprite;
+        std::map<std::uint16_t, DisplayItem> sub;
+        std::map<std::uint16_t, std::shared_ptr<Character>> subPlaced;
+        int subFrame = 0;
+        // 与主时间轴一致：DoAction/StartSound 先累积，ShowFrame 时并入该帧。
+        std::vector<avm1::Script> subPendingActions;
+        std::vector<SoundEvent> subPendingSounds;
+        std::size_t subEnd = doff + len;
+        while (subEnd >= bv.pos() && subEnd - bv.pos() >= 2) {
+            std::uint16_t tv = bv.readUI16();
+            std::uint32_t tlen = tv & 0x3F;
+            if (tlen == 63) {
+                if (subEnd - bv.pos() < 4) break;  // 长头的 4 字节长度字段被截断
+                tlen = bv.readUI32();
+            }
+            const std::size_t tStart = bv.pos();
+            if (static_cast<std::size_t>(tlen) > subEnd - tStart) break;  // 防回绕/越界
+            const std::size_t tEnd = tStart + tlen;
+            std::uint16_t tc = static_cast<std::uint16_t>(tv >> 6);
+            if (tc == 2 || tc == 22 || tc == 32 || tc == 83) {  // 嵌套定义形状
+                int ver = (tc == 2) ? 1 : (tc == 22) ? 2 : (tc == 32) ? 3 : 4;
+                std::uint16_t cid = bv.readUI16();
+                auto shp = decodeShape(bv, ver, cid);
                 auto ch = std::make_shared<Character>();
                 ch->kind = Character::Kind::Shape;
                 ch->shape = shp;
-                ctx.characters[id] = ch;
-                break;
-            }
-            case 76: case 77: {  // SymbolClass：类名 <-> 角色 id 映射
-                std::uint16_t num = bv.readUI16();
-                for (std::uint16_t k = 0; k < num; ++k) {
-                    std::uint16_t cid = bv.readUI16();
-                    std::string nm;
-                    int c;
-                    while ((c = bv.readUI8()) != 0 && c != -1) nm.push_back(static_cast<char>(c));
-                    // 类名可能用 '.' 或 '::' 分隔，统一替换 '::' 为 '.'
-                    std::string dot = nm;
-                    size_t pos;
-                    while ((pos = dot.find("::")) != std::string::npos) dot.replace(pos, 2, ".");
-                    ctx.movie.symbolClasses[dot] = cid;
-                }
-                break;
-            }
-            case 82: {  // DoABC：AVM2 字节码
-                bv.readUI32();          // flags (lazy)
-                // Name: null-terminated string
-                while (bv.pos() < doff + len && bv.readUI8() != 0) {}
-                std::size_t abcStart = bv.pos();
-                if (abcStart < doff + len) {
-                    abc::AbcFile f;
-                    std::string aerr;
-                    if (abc::parseAbc(base + abcStart, (doff + len) - abcStart, f, aerr))
-                        ctx.movie.abcFiles.push_back(std::move(f));
-                }
-                break;
-            }
-            case 34: {  // DefineButton2（四态 + 动作脚本）
-                std::uint16_t id = bv.readUI16();
-                auto btn = decodeButton2(bv, ctx.characters, ctx.swfVersion, doff + len);
-                ctx.characters[id] = btn;
-                break;
-            }
-            case 17: {  // DefineButtonSound：按钮三态声音
-                std::uint16_t id = bv.readUI16();
-                auto itc = ctx.characters.find(id);
-                if (itc != ctx.characters.end() && itc->second &&
-                    itc->second->kind == Character::Kind::Button && itc->second->button) {
-                    auto& btn = *itc->second->button;
-                    // 依次：IdleToOverUp / OverUpToOverDown / OverDownToOverUp / OverUpToIdle
-                    std::uint16_t* slots[4] = {&btn.soundUp, &btn.soundOver,
-                                               &btn.soundDown, &btn.soundOut};
-                    for (int k = 0; k < 4 && bv.pos() + 2 <= doff + len; ++k) {
-                        std::uint16_t sid = bv.readUI16();
-                        readSoundInfoSkip(bv, doff + len, nullptr);
-                        if (sid) *slots[k] = sid;
-                    }
-                }
-                break;
-            }
-            case 10: {  // DefineFont（旧版，SWF<6）：仅字形轮廓，字符码表由随后的 DefineFontInfo(13) 提供
-                std::uint16_t fid = bv.readUI16();
-                std::size_t offStart = bv.pos();
-                if (offStart + 2 > doff + len || bv.overflow()) break;
-                std::uint16_t o0 = bv.readUI16();          // 首个偏移 = 偏移表字节长度 = nGlyphs*2
-                int nGlyphs = static_cast<int>(o0) / 2;
-                if (nGlyphs <= 0 || nGlyphs > 65535) break;
-                std::vector<std::uint32_t> offs(static_cast<std::size_t>(nGlyphs));
-                offs[0] = o0;
-                for (int i = 1; i < nGlyphs; ++i) offs[i] = bv.readUI16();
-                auto fg = std::make_shared<FontGlyphs>();
-                fg->shapes.resize(static_cast<std::size_t>(nGlyphs));
-                fg->advances.assign(static_cast<std::size_t>(nGlyphs), 0);
-                for (int i = 0; i < nGlyphs; ++i) {
-                    std::size_t gstart = offStart + offs[static_cast<std::size_t>(i)];
-                    std::size_t gend = (i + 1 < nGlyphs)
-                        ? offStart + offs[static_cast<std::size_t>(i + 1)]
-                        : doff + len;
-                    if (gstart >= gend || gend > bv.size()) continue;
-                    ByteView gv(base, bv.size()); gv.seek(gstart);
-                    auto shp = std::make_shared<Shape>();
-                    parseGlyphShape(gv, shp, 1);            // 字形为裸 SHAPE（DefineShape1 格式）
-                    fg->shapes[static_cast<std::size_t>(i)] = shp;
-                }
-                auto ch = std::make_shared<Character>();
-                ch->kind = Character::Kind::Font;
-                ch->font = fg;                              // codeToGlyph 暂空，待 DefineFontInfo 填充
-                ctx.characters[fid] = ch;
-                break;
-            }
-            case 48: case 75: {  // DefineFont2 / DefineFont3
-                ByteView fv(base + doff, len);   // 子视图：偏移/CodeTableOffset 相对字体记录起始解析
-                std::uint16_t id = fv.readUI16();
-                auto fg = decodeFont(fv, base[3]);
-                auto ch = std::make_shared<Character>();
-                ch->kind = Character::Kind::Font;
-                ch->font = fg;
-                ctx.characters[id] = ch;
-                break;
-            }
-            case 13: case 62: {  // DefineFontInfo / DefineFontInfo2：为前面的 DefineFont(10) 提供字符码表
-                std::uint16_t fid = bv.readUI16();
-                if (code == 62) bv.readUI8();             // DefineFontInfo2 多一个 LanguageCode
-                int nameLen = bv.readUI8();
-                std::string fname;
-                std::size_t nameStart = bv.pos();
-                for (int i = 0; i < nameLen; ++i) {
-                    int c = bv.readUI8();
-                    if (c == 0) break;
-                    fname.push_back(static_cast<char>(c));
-                }
-                bv.seek(nameStart + static_cast<std::size_t>(nameLen));
-                std::uint8_t fflags = bv.readUI8();
-                // DefineFontInfo 的 FontFlags（MSB→LSB）：Reserved[2]、SmallText(0x20)、
-                // ShiftJIS(0x10)、ANSI(0x08)、Italic(0x04)、Bold(0x02)、WideCodes(0x01)。
-                bool wide = (code == 62) || (fflags & 0x01) != 0;  // DefineFontInfo2 代码表恒为 UI16
-                auto it = ctx.characters.find(fid);
-                if (it != ctx.characters.end() && it->second && it->second->font) {
-                    FontGlyphs& fg = *it->second->font;
-                    if (fg.name.empty() && !fname.empty()) fg.name = fname;
-                    fg.italic = fg.italic || (fflags & 0x04) != 0;
-                    fg.bold = fg.bold || (fflags & 0x02) != 0;
-                    if (fg.codeToGlyph.empty()) {          // 仅当尚无代码表（旧版 DefineFont(10)）时填充
-                        int n = static_cast<int>(fg.shapes.size());
-                        for (int i = 0; i < n && !bv.overflow(); ++i) {
-                            int cc = wide ? static_cast<int>(bv.readUI16()) : static_cast<int>(bv.readUI8());
-                            fg.codeToGlyph[cc] = i;
-                        }
-                    }
-                }
-                break;
-            }
-            case 11: case 33: {  // DefineText / DefineText2
-                bool alpha = (code == 33);
-                std::uint16_t id = bv.readUI16();
-                auto td = decodeText(bv, alpha);
-                auto ch = std::make_shared<Character>();
-                ch->kind = Character::Kind::Text;
-                ch->text = td;
-                ctx.characters[id] = ch;
-                break;
-            }
-            case 37: {  // DefineEditText：时间轴文本框
-                std::uint16_t id = bv.readUI16();
-                auto et = decodeEditText(bv);
-                auto ch = std::make_shared<Character>();
-                ch->kind = Character::Kind::EditText;
-                ch->editText = et;
-                ctx.characters[id] = ch;
-                break;
-            }
-            case 46: case 84: {  // DefineMorphShape / DefineMorphShape2
-                int ver = (code == 46) ? 1 : 2;
-                std::uint16_t id = bv.readUI16();
-                auto ms = decodeMorphShape(bv, ver);
-                auto ch = std::make_shared<Character>();
-                ch->kind = Character::Kind::Morph;   // 由渲染器按 ratio 插值
-                ch->morph = ms;
-                ctx.characters[id] = ch;
-                break;
-            }
-            case 6: {  // DefineBits (JPEG, 依赖 JPEGTables)
-                std::uint16_t id = bv.readUI16();
-                int rest = static_cast<int>(len) - 2;
-                auto ch = std::make_shared<Character>();
-                ch->kind = Character::Kind::Bitmap;
-                ch->bitmap = std::make_shared<Bitmap>();
-                std::vector<std::uint8_t> blob;
-                if (!ctx.jpegTables.empty()) {
-                    blob.insert(blob.end(), ctx.jpegTables.begin(), ctx.jpegTables.end());
-                    blob.insert(blob.end(), base + doff + 2, base + doff + 2 + rest);
-                } else {
-                    blob.assign(base + doff + 2, base + doff + 2 + rest);
-                }
-                decodeJpeg(blob.data(), static_cast<int>(blob.size()), *ch->bitmap);
-                ctx.characters[id] = ch;
-                break;
-            }
-            case 8: {  // JPEGTables
-                ctx.jpegTables.assign(base + doff, base + doff + len);
-                break;
-            }
-            case 21: {  // DefineBitsJPEG2
-                std::uint16_t id = bv.readUI16();
-                int rest = static_cast<int>(len) - 2;
-                auto ch = std::make_shared<Character>();
-                ch->kind = Character::Kind::Bitmap;
-                ch->bitmap = std::make_shared<Bitmap>();
-                decodeJpeg(base + doff + 2, rest, *ch->bitmap);
-                ctx.characters[id] = ch;
-                break;
-            }
-            case 35: {  // DefineBitsJPEG3 (+alpha)
-                std::uint16_t id = bv.readUI16();
-                std::uint32_t jpegSize = bv.readUI32();
-                auto ch = std::make_shared<Character>();
-                ch->kind = Character::Kind::Bitmap;
-                ch->bitmap = std::make_shared<Bitmap>();
-                decodeJpeg(base + bv.pos(), static_cast<int>(jpegSize), *ch->bitmap);
-                const std::uint8_t* alphaPtr = base + bv.pos() + jpegSize;
-                std::size_t alphaLen = (doff + len) - (bv.pos() + jpegSize);
-                std::vector<std::uint8_t> alpha;
-                inflateZlib(alphaPtr, alphaLen, alpha);
-                applyAlpha(*ch->bitmap, alpha);
-                ctx.characters[id] = ch;
-                break;
-            }
-            case 20: case 36: {  // DefineBitsLossless / Lossless2
-                bool withAlpha = (code == 36);
-                std::uint16_t id = bv.readUI16();
-                std::uint8_t fmt = bv.readUI8();
-                std::uint16_t w = bv.readUI16();
-                std::uint16_t h = bv.readUI16();
-                std::vector<std::uint8_t> raw;
-                inflateZlib(base + bv.pos(), (doff + len) - bv.pos(), raw);
-                auto ch = std::make_shared<Character>();
-                ch->kind = Character::Kind::Bitmap;
-                ch->bitmap = std::make_shared<Bitmap>();
-                ch->bitmap->width = w; ch->bitmap->height = h;
-                ch->bitmap->rgba.resize(static_cast<std::size_t>(w) * h * 4, 0);
-                decodeLossless(fmt, withAlpha, w, h, raw, *ch->bitmap);
-                ctx.characters[id] = ch;
-                break;
-            }
-            case 4: {  // PlaceObject
+                ctx.characters[cid] = ch;
+            } else if (tc == 4) {  // PlaceObject
                 std::uint16_t cid = bv.readUI16();
                 std::uint16_t depth = bv.readUI16();
-                DisplayItem it;
-                it.depth = depth;
-                auto itc = ctx.characters.find(cid);
-                it.character = (itc != ctx.characters.end()) ? itc->second : nullptr;
-                it.characterId = cid;
-                it.matrix = Matrix{};
-                ctx.displayList[depth] = it;
-                break;
-            }
-            case 26: {  // PlaceObject2
-                // flags（1 字节）位定义（与真实 SWF 数据核对得出）：
-                //   0x01 Move   0x02 HasCharacter 0x04 HasMatrix  0x08 HasCxform
-                //   0x10 HasRatio 0x20 HasName    0x40 HasClipDepth 0x80 HasClipActions
+                DisplayItem it; it.depth = depth; it.matrix = Matrix{};
+                auto ic = ctx.characters.find(cid);
+                it.character = (ic != ctx.characters.end()) ? ic->second : nullptr;
+                sub[depth] = it;
+            } else if (tc == 26) {  // PlaceObject2
                 int f = bv.readUI8();
-                // 字段序：Flags, Depth(恒有), [CharacterId 若 HasCharacter], Matrix...
-                // 注意：SWF 规范写的是 CharacterId 在 Depth 之前，但本文件实测为
-                // Depth 在前——证据：按规范序会把 DefineFont2（cid22/25，tag48
-                // 字体"黑体"/"方正简体"）放上显示列表（非法）、矿工 char14 只有
-                // depth 序才被放置（dep14←cid14，矩阵与 Adobe 基准吻合）、
-                // RemoveObject2 连贯性（F1 放 dep1←cid6/dep8←cid7，F9 恰清除二者）、
-                // F9 连续九条 dep10←cid10…dep18←cid18 的典型生成器模式。
-                // 按"规范序"渲染会几乎全空（与基准 mean diff 241.8）。
-                std::uint16_t depth = bv.readUI16();
-                std::uint16_t cid = 0;
-                if (f & 0x02) cid = bv.readUI16();
-                // Move=1 表示"在已有显示对象上修改"（只改矩阵/比例/色彩变换等），
-                // 必须保留原 character，否则会把该 depth 上的内容整个抹掉。
-                // swf.swf 里有 71 个 flags=0x05（Move+矩阵、不带角色）的标签，
-                // 旧实现每次都用空 character 覆盖，导致大量角色凭空消失。
-                DisplayItem it;
-                if ((f & 0x01) != 0) {
-                    auto e = ctx.displayList.find(depth);
-                    if (e != ctx.displayList.end()) it = e->second;
-                }
-                it.depth = depth;
-                if (f & 0x02) {
-                    auto itc = ctx.characters.find(cid);
-                    it.character = (itc != ctx.characters.end()) ? itc->second : nullptr;
-                    it.characterId = cid;
-                }
+                DisplayItem it; it.depth = bv.readUI16();
+                { auto prev = sub.find(it.depth); if (prev != sub.end()) it = prev->second; }
+                if (f & 0x02) { std::uint16_t cid = bv.readUI16(); auto ic = ctx.characters.find(cid); it.character = (ic != ctx.characters.end()) ? ic->second : nullptr; it.characterId = cid; }
                 if (f & 0x04) it.matrix = readMatrix(bv);
                 if (f & 0x08) it.cxform = readCXForm(bv, true);
-                if (f & 0x10) it.ratio = static_cast<float>(bv.readUI16()) / 65535.0f;  // ratio
-                if (f & 0x20) it.name = readStringZ(bv, doff + len);          // 实例名
+                if (f & 0x10) it.ratio = static_cast<float>(bv.readUI16()) / 65535.0f;
+                if (f & 0x20) { std::string nm = readStringZ(bv, tEnd); it.name = nm; }
                 if (f & 0x40) it.clipDepth = bv.readUI16();
-                if (f & 0x80) readClipActions(bv, doff + len, ctx.swfVersion, it.clipEvents);
-                ctx.displayList[depth] = it;
-                break;
-            }
-            case 70: {  // PlaceObject3
-                int f = bv.readUI8();
-                int f2 = bv.readUI8();
-                DisplayItem it;
-                it.depth = bv.readUI16();
-                // PlaceFlag2 字段（按字节流顺序；位定义见 CommonLib/Adobe 规范）
-                if (f2 & 0x08) { while (bv.readUI8() != 0) {} }    // ClassName (HasClassName=0x08)
-                if (f2 & 0x01) parseFilterList(bv, it.filters);    // FilterList (HasFilterList=0x01)
-                if (f2 & 0x02) it.blend = static_cast<BlendMode>(bv.readUI8());  // BlendMode (0x02)
-                if (f2 & 0x04) bv.readUI8();                       // CacheAsBitmap (0x04)
-                if (f2 & 0x20) bv.readUI8();                       // Visible (0x20)
-                if (f2 & 0x40) { bv.readUI8(); bv.readUI8(); bv.readUI8(); bv.readUI8(); }  // OpaqueBackground RGBA (0x40)
-                if (f & 0x02) {
-                    std::uint16_t cid = bv.readUI16();
-                    auto itc = ctx.characters.find(cid);
-                    it.character = (itc != ctx.characters.end()) ? itc->second : nullptr;
-                    it.characterId = cid;
-                }
+                if (f & 0x80) readClipActions(bv, tEnd, ctx.swfVersion, it.clipEvents);
+                sub[it.depth] = it;
+            } else if (tc == 70) {  // PlaceObject3
+                int f = bv.readUI8(); int f2 = bv.readUI8();
+                DisplayItem it; it.depth = bv.readUI16();
+                { auto prev = sub.find(it.depth); if (prev != sub.end()) it = prev->second; }
+                if (f & 0x02) { std::uint16_t cid = bv.readUI16(); auto ic = ctx.characters.find(cid); it.character = (ic != ctx.characters.end()) ? ic->second : nullptr; it.characterId = cid; }
                 if (f & 0x04) it.matrix = readMatrix(bv);
                 if (f & 0x08) it.cxform = readCXForm(bv, true);
-                if (f & 0x10) it.ratio = static_cast<float>(bv.readUI16()) / 65535.0f;  // ratio
-                if (f & 0x20) it.name = readStringZ(bv, doff + len);          // 实例名
+                if (f & 0x10) it.ratio = static_cast<float>(bv.readUI16()) / 65535.0f;
+                if (f & 0x20) it.name = readStringZ(bv, tEnd);
                 if (f & 0x40) it.clipDepth = bv.readUI16();
-                if (f & 0x80) readClipActions(bv, doff + len, ctx.swfVersion, it.clipEvents);
-                ctx.displayList[it.depth] = it;
-                break;
+                if (f2 & 0x01) parseFilterList(bv, it.filters);
+                if (f2 & 0x02) it.blend = static_cast<BlendMode>(bv.readUI8());
+                if (f2 & 0x04) bv.readUI8();
+                if (f & 0x80) readClipActions(bv, tEnd, ctx.swfVersion, it.clipEvents);
+                sub[it.depth] = it;
+            } else if (tc == 81) {  // PlaceObject4
+                int f = bv.readUI8(); int f2 = bv.readUI8();
+                DisplayItem it; it.depth = bv.readUI16();
+                { auto prev = sub.find(it.depth); if (prev != sub.end()) it = prev->second; }
+                if ((f2 & 0x10) || ((f2 & 0x08) != 0 && (f & 0x02) != 0)) (void)readStringZ(bv, tEnd);
+                if (f & 0x02) { std::uint16_t cid = bv.readUI16(); auto ic = ctx.characters.find(cid); it.character = (ic != ctx.characters.end()) ? ic->second : nullptr; it.characterId = cid; }
+                if (f & 0x04) it.matrix = readMatrix(bv);
+                if (f & 0x08) it.cxform = readCXForm(bv, true);
+                if (f & 0x10) it.ratio = static_cast<float>(bv.readUI16()) / 65535.0f;
+                if (f & 0x20) it.name = readStringZ(bv, tEnd);
+                if (f & 0x40) it.clipDepth = bv.readUI16();
+                if (f2 & 0x08) { bv.readUI16(); bv.readUI8(); bv.readUI8(); (void)bv.readUI16(); }
+                if (f2 & 0x01) parseFilterList(bv, it.filters);
+                if (f2 & 0x02) it.blend = static_cast<BlendMode>(bv.readUI8());
+                if (f2 & 0x04) bv.readUI8();
+                if (f & 0x80) readClipActions(bv, tEnd, ctx.swfVersion, it.clipEvents);
+                sub[it.depth] = it;
+            } else if (tc == 46 || tc == 84) {  // DefineMorphShape / DefineMorphShape2
+                int ver = (tc == 46) ? 1 : 2;
+                std::uint16_t cid = bv.readUI16();
+                auto ms = decodeMorphShape(bv, ver, cid);
+                auto ch = std::make_shared<Character>();
+                ch->kind = Character::Kind::Morph;
+                ch->morph = ms;
+                ctx.characters[cid] = ch;
+            } else if (tc == 5) {
+                bv.readUI16(); std::uint16_t d = bv.readUI16();
+                sub.erase(d); subPlaced.erase(d);
             }
-            case 5: case 28: {  // RemoveObject / RemoveObject2
-                // 同时清掉 placedChar：否则同一 depth 之后重新放置同一角色时，
-                // 比较结果相同而不会刷新 birthFrame，精灵内部帧号会一直按旧值算，
-                // 取到空帧 —— 表现为整块内容消失（swf.swf 的角色就是这样丢的）。
-                if (code == 5) {
-                    bv.readUI16();
-                    std::uint16_t depth = bv.readUI16();
-                    ctx.displayList.erase(depth);
-                    ctx.placedChar.erase(depth);
-                } else {
-                    std::uint16_t depth = bv.readUI16();
-                    ctx.displayList.erase(depth);
-                    ctx.placedChar.erase(depth);
+            else if (tc == 28) {
+                std::uint16_t d = bv.readUI16();
+                sub.erase(d); subPlaced.erase(d);
+            }
+            else if (tc == 1) {  // ShowFrame：快照精灵帧
+                Frame fr;
+                for (auto& kv : sub) {
+                    DisplayItem it = kv.second;
+                    if (subPlaced.find(it.depth) == subPlaced.end() || subPlaced[it.depth] != it.character) {
+                        subPlaced[it.depth] = it.character;
+                        it.birthFrame = subFrame;
+                    }
+                    fr.items.push_back(it);
                 }
-                break;
-            }
-            case 1: {  // ShowFrame
-                ctx.hasShowFrame = true;
-                ctx.snapshotFrame();
-                break;
-            }
-            case 43: {  // FrameLabel：给**紧随其后**的那一帧起名（1 基帧号）
-                // 格式：STRING（以 0 结尾）+ 可选 UI8 标志（SWF>=8，bit0=命名锚点）。
-                // 标签通常紧跟在它所属帧的 ShowFrame 之后，故名字指向下一帧；
-                // 若出现在帧内容中间或文件开头，指向的仍是**正在构建**的那一帧。
-                std::string name;
-                while (bv.pos() < doff + len && !bv.overflow()) {
-                    int c = bv.readUI8();
-                    if (c == 0 || c == -1) break;
-                    name.push_back(static_cast<char>(c));
+                std::sort(fr.items.begin(), fr.items.end(),
+                          [](const DisplayItem& a, const DisplayItem& b) { return a.depth < b.depth; });
+                if (!subPendingActions.empty()) {
+                    std::vector<std::uint8_t> bytes;
+                    for (auto& a : subPendingActions)
+                        bytes.insert(bytes.end(), a.bytes.begin(), a.bytes.end());
+                    fr.doActions.push_back(avm1::disassemble(bytes.data(), bytes.size()));
+                    subPendingActions.clear();
                 }
-                if (!name.empty()) ctx.movie.frameLabels[name] = ctx.curFrame + 1;
-                break;
+                if (!subPendingSounds.empty()) {
+                    fr.soundEvents = std::move(subPendingSounds);
+                    subPendingSounds.clear();
+                }
+                sp->spriteFrames.push_back(std::move(fr));
+                ++subFrame;
             }
-            case 0: {  // End
-                if (!ctx.hasShowFrame) ctx.snapshotFrame();  // 无 ShowFrame 时补一帧
-                goto done;
+            else if (tc == 12) {  // DoAction：累积到本帧，ShowFrame 时并入
+                subPendingActions.push_back(avm1::disassemble(bv.base() + tStart, tEnd - tStart));
             }
-            default:
-                break;  // 其它标签暂忽略
-            case 12: {  // DoAction（主时间轴脚本）
-                avm1::Script sc = avm1::disassemble(base + doff, len);
-                ctx.pendingFrameActions.push_back(std::move(sc));
-                break;
-            }
-            case 59: {  // DoInitAction
-                std::uint16_t spriteId = static_cast<std::uint16_t>(base[doff] | (base[doff + 1] << 8));
-                avm1::Script sc = avm1::disassemble(base + doff + 2, len - 2);
-                ctx.movie.initActions[spriteId] = std::move(sc);
-                break;
-            }
-            case 14: {  // DefineSound
-                Sound snd;
-                snd.id = static_cast<std::uint16_t>(base[doff] | (base[doff + 1] << 8));
-                std::uint8_t flags = base[doff + 2];
-                snd.format = (flags >> 4) & 0x0F;
-                snd.rate = (flags >> 2) & 0x03;
-                snd.bits = (flags >> 1) & 0x01;
-                snd.channels = flags & 0x01;
-                snd.sampleCount = static_cast<std::uint32_t>(base[doff + 3]) | (static_cast<std::uint32_t>(base[doff + 4]) << 8)
-                                | (static_cast<std::uint32_t>(base[doff + 5]) << 16) | (static_cast<std::uint32_t>(base[doff + 6]) << 24);
-                int dataOff = (int)doff + 7;
-                int dataLen = (int)len - 7;
-                if (dataLen > 0) snd.data.assign(base + dataOff, base + dataOff + dataLen);
-                ctx.movie.sounds[snd.id] = std::move(snd);
-                break;
-            }
-            case 15: case 89: {  // StartSound / StartSound2：记录到本帧声音事件队列
+            else if (tc == 15 || tc == 89) {  // StartSound / StartSound2
                 SoundEvent ev;
-                if (code == 15) {
+                if (tc == 15) {
                     ev.soundId = bv.readUI16();
                 } else {
-                    // StartSound2：SoundId 为导出名（字符串），此处仅消费
-                    readStringZ(bv, doff + len);
+                    (void)readStringZ(bv, tEnd);
                 }
                 bool stop = false;
-                ev.loop = readSoundInfoSkip(bv, doff + len, &stop);
+                ev.loop = readSoundInfoSkip(bv, tEnd, &stop);
                 ev.stop = stop;
-                if (ev.soundId != 0 || code == 15) ctx.pendingSoundEvents.push_back(ev);
-                break;
+                if (tc == 15) subPendingSounds.push_back(ev);
             }
-            case 18: case 45: {  // SoundStreamHead / SoundStreamHead2：记录流式声音参数
-                if (len >= 2) {
-                    std::uint8_t b0 = base[doff], b1 = base[doff + 1];
-                    auto& sa = ctx.movie.streamAudio;
-                    sa.have = true;
-                    sa.rate = (b1 >> 6) & 0x03;
-                    sa.bits = (b1 >> 5) & 0x01;
-                    sa.channels = (b1 >> 4) & 0x01;
-                    // SoundStreamHead2(45) 含 8-bit 编码字节；SoundStreamHead(18) 隐含 PCM/ADPCM
-                    sa.format = (code == 45) ? (b1 & 0x0F) : 0;
-                }
-                break;
+            else if (tc == 43) {  // FrameLabel：给紧随其后的那一帧起名
+                std::string nm = readStringZ(bv, tEnd);
+                if (!nm.empty()) sp->frameLabels[nm] = subFrame + 1;
             }
-            case 19: {  // SoundStreamBlock：累积每帧压缩音频 + 记录流事件
-                if (len > 0) {
-                    SoundEvent ev;
-                    ev.soundId = 0;
-                    ev.streamBlock = ctx.streamBlockCount++;
-                    ctx.pendingSoundEvents.push_back(ev);
-                    ctx.movie.streamAudio.blocks.emplace_back(base + doff, base + doff + len);
-                }
-                break;
+            else if (tc == 59) {  // DoInitAction（精灵初始化脚本）
+                bv.readUI16();
+                avm1::Script sc = avm1::disassemble(bv.base() + bv.pos(), tEnd - bv.pos());
+                ctx.movie.initActions[sid] = std::move(sc);
             }
-            case 60: {  // DefineVideoStream
-                auto vs = std::make_shared<VideoStream>();
-                vs->id = static_cast<std::uint16_t>(base[doff] | (base[doff + 1] << 8));
-                vs->numFrames = static_cast<std::uint16_t>(base[doff + 2] | (base[doff + 3] << 8));
-                vs->width = static_cast<std::uint16_t>(base[doff + 4] | (base[doff + 5] << 8));
-                vs->height = static_cast<std::uint16_t>(base[doff + 6] | (base[doff + 7] << 8));
-                std::uint8_t vf = base[doff + 8];
-                // SWF VideoFlags（1 字节）：低 4 位 = VideoCodecID
-                //   2=H.263/Sorenson 3=ScreenVideo 4=VP6 5=VP6+alpha 6=ScreenVideo2 7=AVC
-                // 之上两位分别是 Smoothing(bit4) 与 Deblocking(bit5)，高位保留。
-                vs->codecId = vf & 0x0F;
-                vs->smoothing = (vf & 0x10) != 0;
-                vs->deblocking = (vf & 0x20) != 0;
-                ctx.movie.videos[vs->id] = vs;
-                // 同时注册为角色，便于 PlaceObject2 放置并由渲染器绘制当前帧
-                auto vch = std::make_shared<Character>();
-                vch->kind = Character::Kind::Video;
-                vch->video = vs;
-                ctx.characters[vs->id] = vch;
-                break;
-            }
-            case 61: {  // VideoFrame
-                std::uint16_t vid = static_cast<std::uint16_t>(base[doff] | (base[doff + 1] << 8));
-                std::uint16_t fnum = static_cast<std::uint16_t>(base[doff + 2] | (base[doff + 3] << 8));
-                auto vit = ctx.movie.videos.find(vid);
-                if (vit != ctx.movie.videos.end()) {
-                    int dataOff = (int)doff + 4;
-                    int dataLen = (int)len - 4;
-                    if (dataLen > 0) {
-                        auto& vs = *vit->second;
-                        vs.frames[fnum].assign(base + dataOff, base + dataOff + dataLen);
-                        std::uint8_t vcid = vs.codecId;
-                        if (vcid == 3) {  // ScreenVideo：纯 C++ 解码（增量）
-                            const Bitmap* prev = nullptr;
-                            auto pit = vs.decoded.lower_bound(fnum);
-                            if (pit != vs.decoded.begin()) { --pit; prev = pit->second.get(); }
-                            vs.decoded[fnum] = decodeScreenVideo(
-                                vs.frames[fnum], vs.width, vs.height, prev);
-                        } else if (vcid == 2 || vcid == 4 || vcid == 5 || vcid == 7) {
-                            // H.263(FLV1) / VP6 / VP6+alpha / AVC(H.264)：经 FFmpeg 解码
-                            auto& dec = ctx.videoDecoders[vs.id];
-                            if (!dec) {
-                                dec = std::make_unique<FFmpegVideoDecoder>();
-                                // AVC：本帧即 AVCDecoderConfigurationRecord（作为 extradata），不输出画面
-                                const std::vector<std::uint8_t>* extra =
-                                    (vcid == 7) ? &vs.frames[fnum] : nullptr;
-                                std::string e;
-                                if (!dec->open(vcid, vs.width, vs.height,
-                                               extra ? *extra : std::vector<std::uint8_t>{}, e)) {
-                                    ctx.videoDecodeError[vs.id] = e;
-                                    dec.reset();
-                                } else if (vcid != 7) {
-                                    decodeVideoFrameInto(vs, fnum, *dec);
-                                }
-                            } else if (dec) {
-                                decodeVideoFrameInto(vs, fnum, *dec);
-                            }
-                        }
-                    }
-                }
-                break;
-            }
-            case 86: {  // DefineSceneAndFrameLabelData
-                ByteView fb(base, avail); fb.seek(doff);
-                auto readStr = [&]() {
-                    std::string s; int c;
-                    while ((c = fb.readUI8()) != 0 && c != -1) s.push_back((char)c);
-                    return s;
-                };
-                std::uint32_t sceneCount = fb.readUI32();
-                for (std::uint32_t i = 0; i < sceneCount; ++i) { fb.readUI32(); readStr(); }
-                std::uint32_t labelCount = fb.readUI32();
-                std::uint8_t ver = base[3];
-                for (std::uint32_t i = 0; i < labelCount; ++i) {
-                    std::uint16_t fn = fb.readUI16();
-                    std::string name = readStr();
-                    if (ver >= 8 && fb.pos() < doff + len) fb.readUI8();  // UTF-8 标志
-                    ctx.movie.frameLabels[name] = (int)fn + 1;
-                }
-                break;
-            }
-            case 88: {  // DefineFontName：为已有 FontId 补上字体族名
-                ByteView fb(base, avail); fb.seek(doff);
-                std::uint16_t fontId = fb.readUI16();
-                std::string name; int c;
-                while ((c = fb.readUI8()) != 0 && c != -1) name.push_back((char)c);
-                if (!name.empty()) {
-                    ctx.movie.fontNames[fontId] = name;
-                    auto fit = ctx.characters.find(fontId);
-                    if (fit != ctx.characters.end() && fit->second && fit->second->font &&
-                        fit->second->font->name.empty())
-                        fit->second->font->name = std::move(name);
-                }
-                break;
-            }
+            else if (tc == 0) { bv.seek(tEnd); break; }  // End of sprite
+            bv.seek(tEnd);
         }
-        pos = cursor + len;
-    }
-done:
+        ctx.characters[sid] = sp;
+        return TagStatus::Ok;
+    });
+
+    TagPipeline<DecodeContext> pipeline(registry,
+        [base, avail](ByteView& bv, DecodeContext& ctx, const TagHeader& th) -> TagStatus {
+            const std::uint16_t code = th.code;
+            const std::uint32_t len = th.length;
+            const std::size_t doff = th.dataOffset;
+
+        switch (code) {
+            // case 6/8/21/35/20/36 已迁移到 installBitmapHandlers（Strategy），
+            // 由 TagPipeline 在进入 switch 之前按 Registry 分派。
+
+            default:
+                break;  // 其它标签暂忽略
+        }
+        return TagStatus::Ok;
+    });
+    // End(Stop) / 数据不足(Incomplete) / 损坏(Fail) 都会让管道停下；
+    // 与旧实现一致，此处保留已解析出的帧并正常收尾。
+    pipeline.run(base, avail, pos, ctx);
     if (ctx.movie.frames.empty()) ctx.snapshotFrame();
     ctx.movie.characters = std::move(ctx.characters);
     { std::vector<const Character*> seen;
@@ -2177,33 +2436,39 @@ done:
 // Lossless 位图：format 3(调色板) / 4(15/16bit) / 5(24/32bit)
 static void decodeLossless(std::uint8_t fmt, bool withAlpha, std::uint16_t w, std::uint16_t h,
                           const std::vector<std::uint8_t>& raw, Bitmap& bmp) {
-    std::size_t n = static_cast<std::size_t>(w) * h;
+    const std::size_t n = static_cast<std::size_t>(w) * h;
+    if (bmp.rgba.size() < n * 4) return;
     std::size_t p = 0;
+    // 统一安全取值器：损坏/截断的解压数据越界时补 0，而不是 raw[p++] 越界读。
+    auto byte = [&]() -> std::uint8_t { return p < raw.size() ? raw[p++] : 0; };
+    auto u16 = [&]() -> std::uint16_t {
+        const std::uint16_t lo = byte();
+        return static_cast<std::uint16_t>(lo | (static_cast<std::uint16_t>(byte()) << 8));
+    };
     if (fmt == 3) {
-        int entries = raw[p++] + 1;
-        int ch = withAlpha ? 4 : 3;
-        std::vector<Color> pal(entries);
+        const int entries = static_cast<int>(byte()) + 1;
+        std::vector<Color> pal(static_cast<std::size_t>(entries));
         for (int i = 0; i < entries; ++i) {
-            pal[i].r = raw[p++]; pal[i].g = raw[p++]; pal[i].b = raw[p++];
-            pal[i].a = withAlpha ? raw[p++] : 0xFF;
+            pal[static_cast<std::size_t>(i)].r = byte();
+            pal[static_cast<std::size_t>(i)].g = byte();
+            pal[static_cast<std::size_t>(i)].b = byte();
+            pal[static_cast<std::size_t>(i)].a = withAlpha ? byte() : 0xFF;
         }
         for (std::size_t i = 0; i < n; ++i) {
-            std::uint8_t idx = raw[p++];
+            std::uint8_t idx = byte();
             if (idx >= entries) idx = 0;
             bmp.rgba[i*4+0] = pal[idx].r; bmp.rgba[i*4+1] = pal[idx].g;
             bmp.rgba[i*4+2] = pal[idx].b; bmp.rgba[i*4+3] = pal[idx].a;
         }
     } else if (fmt == 4) {
-        int bpp = withAlpha ? 4 : 2;  // 4444 or 555
         for (std::size_t i = 0; i < n; ++i) {
+            const std::uint16_t v = u16();
             if (withAlpha) {
-                std::uint16_t v = static_cast<std::uint16_t>(raw[p] | (raw[p+1]<<8)); p += 2;
                 bmp.rgba[i*4+0] = static_cast<std::uint8_t>((v & 0x0F00) >> 4);
                 bmp.rgba[i*4+1] = static_cast<std::uint8_t>((v & 0x00F0) << 0);
                 bmp.rgba[i*4+2] = static_cast<std::uint8_t>((v & 0x000F) << 4);
                 bmp.rgba[i*4+3] = static_cast<std::uint8_t>((v & 0xF000) >> 8);
             } else {
-                std::uint16_t v = static_cast<std::uint16_t>(raw[p] | (raw[p+1]<<8)); p += 2;
                 bmp.rgba[i*4+0] = static_cast<std::uint8_t>((v & 0x7C00) >> 7);
                 bmp.rgba[i*4+1] = static_cast<std::uint8_t>((v & 0x03E0) >> 2);
                 bmp.rgba[i*4+2] = static_cast<std::uint8_t>((v & 0x001F) << 3);
@@ -2211,12 +2476,11 @@ static void decodeLossless(std::uint8_t fmt, bool withAlpha, std::uint16_t w, st
             }
         }
     } else if (fmt == 5) {
-        int bpp = withAlpha ? 4 : 3;
         for (std::size_t i = 0; i < n; ++i) {
-            bmp.rgba[i*4+0] = raw[p++];
-            bmp.rgba[i*4+1] = raw[p++];
-            bmp.rgba[i*4+2] = raw[p++];
-            bmp.rgba[i*4+3] = withAlpha ? raw[p++] : 0xFF;
+            bmp.rgba[i*4+0] = byte();
+            bmp.rgba[i*4+1] = byte();
+            bmp.rgba[i*4+2] = byte();
+            bmp.rgba[i*4+3] = withAlpha ? byte() : 0xFF;
         }
     }
 }

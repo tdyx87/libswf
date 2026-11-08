@@ -7,7 +7,9 @@
 #include "swf/FFmpeg.hpp"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -198,8 +200,10 @@ bool decodeStreamSound(const Movie& m, PcmData& out, std::string& err) {
 }
 
 bool writeWav(const std::string& path, const PcmData& pcm) {
-    std::FILE* f = std::fopen(path.c_str(), "wb");
-    if (!f) return false;
+    // M7：FILE* 交给 RAII，避免写 WAV 中途提前返回/异常时泄漏文件句柄。
+    std::unique_ptr<std::FILE, int(*)(std::FILE*)> guard(std::fopen(path.c_str(), "wb"), &std::fclose);
+    if (!guard) return false;
+    std::FILE* f = guard.get();
     int ch = pcm.channels, bits = 16;
     std::uint32_t byteRate = static_cast<std::uint32_t>(pcm.rate) * ch * bits / 8;
     std::uint16_t blockAlign = static_cast<std::uint16_t>(ch * bits / 8);
@@ -211,14 +215,23 @@ bool writeWav(const std::string& path, const PcmData& pcm) {
     w32(static_cast<std::uint32_t>(pcm.rate)); w32(byteRate); w16(blockAlign); w16(static_cast<std::uint16_t>(bits));
     std::fwrite("data", 1, 4, f); w32(dataSize);
     for (auto s : pcm.samples) w16(static_cast<std::uint16_t>(static_cast<std::uint16_t>(s)));
-    std::fclose(f);
-    return true;
+    return true;   // guard 析构自动 fclose
 }
+
+// RAII：离开作用域时自动 waveOutClose，避免提前返回/异常路径遗漏关闭设备。
+#ifdef _WIN32
+struct WaveOutHandle {
+    HWAVEOUT h = nullptr;
+    ~WaveOutHandle() { if (h) waveOutClose(h); }
+    operator HWAVEOUT() const { return h; }
+    HWAVEOUT* operator&() { return &h; }
+};
+#endif
 
 bool playPcm(const PcmData& pcm, std::string& err) {
 #ifdef _WIN32
     if (pcm.samples.empty()) return true;
-    HWAVEOUT h = nullptr;
+    WaveOutHandle h;
     WAVEFORMATEX wfx;
     std::memset(&wfx, 0, sizeof wfx);
     wfx.wFormatTag = WAVE_FORMAT_PCM;
@@ -234,11 +247,21 @@ bool playPcm(const PcmData& pcm, std::string& err) {
     std::memset(&hdr, 0, sizeof hdr);
     hdr.lpData = reinterpret_cast<LPSTR>(const_cast<std::int16_t*>(pcm.samples.data()));
     hdr.dwBufferLength = static_cast<DWORD>(pcm.samples.size() * 2);
-    waveOutPrepareHeader(h, &hdr, sizeof hdr);
-    waveOutWrite(h, &hdr, sizeof hdr);
-    while (!(hdr.dwFlags & WHDR_DONE)) Sleep(10);
+    if (waveOutPrepareHeader(h, &hdr, sizeof hdr) != MMSYSERR_NOERROR ||
+        waveOutWrite(h, &hdr, sizeof hdr) != MMSYSERR_NOERROR) {
+        err = "waveOutPrepareHeader/waveOutWrite 失败";
+        return false;   // h 析构自动 waveOutClose
+    }
+    // 无音频设备时 WHDR_DONE 可能永不置位：给等待加时限并显式报告失败。
+    bool done = false;
+    for (int i = 0; i < 1000; ++i) {
+        if (hdr.dwFlags & WHDR_DONE) { done = true; break; }
+        Sleep(10);
+    }
+    if (!done) waveOutReset(h);  // 先撤销仍在队列里的缓冲再 Unprepare
     waveOutUnprepareHeader(h, &hdr, sizeof hdr);
-    waveOutClose(h);
+    // h 析构自动 waveOutClose
+    if (!done) { err = "waveOut 播放超时（设备未响应）"; return false; }
     return true;
 #else
     err = "实时播放仅支持 Windows（waveOut）"; return false;
@@ -270,8 +293,8 @@ struct AudioOut::Impl {
     std::deque<Seg> queue_;
 };
 
-AudioOut::AudioOut() : impl_(new Impl) {}
-AudioOut::~AudioOut() { close(); delete impl_; }
+AudioOut::AudioOut() : impl_(std::make_unique<Impl>()) {}
+AudioOut::~AudioOut() { close(); }   // impl_ 由 unique_ptr 自动释放
 
 bool AudioOut::open(int rate, int channels) {
     std::lock_guard<std::mutex> lk(impl_->mtx_);
@@ -296,6 +319,8 @@ bool AudioOut::open(int rate, int channels) {
     wfx.nAvgBytesPerSec = static_cast<DWORD>(rate) * wfx.nBlockAlign;
     if (waveOutOpen(&impl_->h_, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
         impl_->h_ = nullptr;
+        impl_->open_ = false;
+        impl_->quit_ = true;   // 无 worker 时 queue() 必须拒绝，否则 FIFO 无限增长
         return false;
     }
     for (int i = 0; i < Impl::kBufCount; ++i) {
@@ -309,17 +334,19 @@ bool AudioOut::open(int rate, int channels) {
     impl_->open_ = true;
     impl_->rate_ = rate;
     impl_->channels_ = channels;
-    // 启动后台线程：从 FIFO 填充波形缓冲并提交给 waveOut
-    Impl* imp = impl_;
+    // 后台线程只启动一次：重复 open（不同采样率）只重建设备与缓冲。
+    // 对 joinable 的 std::thread 直接赋值会触发 std::terminate。
+    Impl* imp = impl_.get();
+    if (imp->worker_.joinable()) return true;
     imp->worker_ = std::thread([imp]() {
         for (;;) {
-            {
-                std::unique_lock<std::mutex> lk(imp->mtx_);
-                imp->cv_.wait_for(lk, std::chrono::milliseconds(10),
-                                  [imp] { return imp->quit_; });
-                if (imp->quit_) break;
-            }
-            if (!imp->h_) continue;
+            // 整个循环体持锁：open() 会在锁内重建 h_/hdrs_/bufs_，
+            // 若 worker 在锁外访问这些成员就是数据竞争，甚至拿到悬垂引用。
+            std::unique_lock<std::mutex> lk(imp->mtx_);
+            imp->cv_.wait_for(lk, std::chrono::milliseconds(10),
+                              [imp] { return imp->quit_; });
+            if (imp->quit_) break;
+            if (!imp->h_) continue;  // continue 时 lk 析构，下一轮重新获取
             for (int i = 0; i < Impl::kBufCount; ++i) {
                 WAVEHDR& hdr = imp->hdrs_[i];
                 if (hdr.dwFlags & WHDR_INQUEUE) continue;
@@ -336,7 +363,7 @@ bool AudioOut::open(int rate, int channels) {
                     const std::size_t need = buf.size();      // int16 个数
                     std::size_t maxWritten = 0;
                     {
-                        std::lock_guard<std::mutex> lk(imp->mtx_);
+                        // 外层已持有 imp->mtx_（见上），此处不可再嵌套加锁。
                         std::memset(buf.data(), 0, need * sizeof(std::int16_t));
                         for (std::size_t s = 0; s < imp->queue_.size(); ) {
                             auto& seg = imp->queue_[s];
@@ -388,6 +415,7 @@ void AudioOut::queue(const std::int16_t* samples, std::size_t count, bool loop) 
 #ifdef _WIN32
     {
         std::lock_guard<std::mutex> lk(impl_->mtx_);
+        if (!impl_->open_ || impl_->quit_) return;  // 设备不可用时不堆积数据
         Impl::Seg seg;
         seg.data.assign(samples, samples + count);
         seg.loop = loop;

@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <ctime>
+#include <functional>
 
 namespace swf {
 namespace avm1 {
@@ -316,6 +317,15 @@ static Value dispatchMethod(Machine& m, Value object, Value method, const std::v
         return Value(object.str.substr((std::size_t)start, (std::size_t)std::max(0, len)));
     }
 
+    // MovieClip 扩展方法：显示列表运行期增删、拖拽、包围盒、遮罩。
+    if (mname == "attachMovie" || mname == "duplicateMovieClip" ||
+        mname == "createEmptyMovieClip" || mname == "startDrag" ||
+        mname == "stopDrag" || mname == "getBounds" || mname == "setMask") {
+        if (ic) return ic->callExt(mname, args);
+        if (clip) return clip->callExt(mname, args);
+        return Value::undef();
+    }
+
     // 命名实例：时间轴方法作用于该实例的精灵时间轴
     if (ic) {
         if (mname == "hitTest") {
@@ -358,6 +368,7 @@ struct Frame {
     bool ret = false;
     Value retValue;
     std::map<int, int> posToIdx;
+    bool isRoot = false;   // 是否为最外层（根）帧；变量定义/赋值时决定落到 globals 还是作用域
 };
 
 // 以两种写法写主时间轴变量表（原样 key + 归一化 key），使脚本混用写法时仍指向同一槽。
@@ -372,16 +383,365 @@ static void ensureBuiltins(std::map<std::string, Value>& globals) {
     if (globals.find("System") == globals.end()) globals["System"] = makeObj("System");
 }
 
+// ---------- AVM1 opcode 命令化（M5）----------
+// 仿 M4 的 TagRegistry：把 opcode 分发从大 switch 改为「code -> handler」注册表。
+// handler 直接操作 Frame（操作数栈/pc/ret）与 Machine（globals/时间轴）；
+// 控制流（Jump/If/Return）通过 OpResult 表达：jumped 时设置新 pc，否则主循环自行 ++pc。
+struct OpResult { bool jumped = false; int newPc = 0; };
+using OpHandler = std::function<OpResult(Machine&, Frame&, const Action&)>;
+
+class OpRegistry {
+    std::map<int, OpHandler> m_;
+public:
+    void add(std::uint8_t code, OpHandler h) { m_[code] = std::move(h); }
+    void add(std::initializer_list<std::uint8_t> cs, OpHandler h) { for (auto c : cs) m_[c] = h; }
+    OpHandler* find(std::uint8_t code) { auto it = m_.find(code); return it == m_.end() ? nullptr : &it->second; }
+};
+inline OpRegistry& avm1Ops() { static OpRegistry r; return r; }
+inline Value popVF(Frame& F) {   // 空栈保护弹出（与 run 内 popV 等价）
+    if (F.stack.empty()) return Value::undef();
+    Value v = F.stack.back(); F.stack.pop_back(); return v;
+}
+// 当前调用栈指针：run 与 callFunctionValue 执行期各自令其指向自己的局部 frames，
+// 使 CallFunction handler 能 push 新帧（两处执行器共享同一套 OpRegistry handler）。
+static thread_local std::vector<Frame>* g_callStack = nullptr;
+// 把所有 AVM1 opcode 注册进 avm1Ops()（M5 渐进迁移：当前仅示例 End，其余仍走 switch）。
+void registerAvm1Ops() {
+    avm1Ops().add(0x00, [](Machine&, Frame& F, const Action&) -> OpResult {  // End
+        F.ret = true; return {};
+    });
+    // ---- 算术 / 比较 / 逻辑 / 栈：纯操作数栈操作 ----
+    avm1Ops().add(0x0A, [](Machine&, Frame& F, const Action&) -> OpResult {  // Add
+        Value b=popVF(F); Value c=popVF(F);
+        bool str=(b.type==Value::T::String||c.type==Value::T::String);
+        F.stack.push_back(str?Value(c.toString()+b.toString()):Value(b.toNumber()+c.toNumber())); return {}; });
+    avm1Ops().add(0x0B, [](Machine&, Frame& F, const Action&) -> OpResult {  // Subtract
+        Value b=popVF(F); Value c=popVF(F); F.stack.push_back(Value(c.toNumber()-b.toNumber())); return {}; });
+    avm1Ops().add(0x0C, [](Machine&, Frame& F, const Action&) -> OpResult {  // Multiply
+        Value b=popVF(F); Value c=popVF(F); F.stack.push_back(Value(b.toNumber()*c.toNumber())); return {}; });
+    avm1Ops().add(0x0D, [](Machine&, Frame& F, const Action&) -> OpResult {  // Divide
+        Value b=popVF(F); Value c=popVF(F); double d=b.toNumber();
+        F.stack.push_back(Value(d==0?std::nan(""):c.toNumber()/d)); return {}; });
+    avm1Ops().add(0x0E, [](Machine&, Frame& F, const Action&) -> OpResult {  // Equals
+        Value b=popVF(F); Value c=popVF(F); F.stack.push_back(Value(b.toString()==c.toString())); return {}; });
+    avm1Ops().add(0x0F, [](Machine&, Frame& F, const Action&) -> OpResult {  // Less
+        Value b=popVF(F); Value c=popVF(F); F.stack.push_back(Value(c.toNumber()<b.toNumber())); return {}; });
+    avm1Ops().add(0x10, [](Machine&, Frame& F, const Action&) -> OpResult {  // And
+        Value b=popVF(F); Value c=popVF(F); F.stack.push_back(Value(b.toBool()&&c.toBool())); return {}; });
+    avm1Ops().add(0x11, [](Machine&, Frame& F, const Action&) -> OpResult {  // Or
+        Value b=popVF(F); Value c=popVF(F); F.stack.push_back(Value(b.toBool()||c.toBool())); return {}; });
+    avm1Ops().add(0x12, [](Machine&, Frame& F, const Action&) -> OpResult {  // Not
+        Value b=popVF(F); F.stack.push_back(Value(!b.toBool())); return {}; });
+    avm1Ops().add(0x13, [](Machine&, Frame& F, const Action&) -> OpResult {  // StringEquals
+        Value b=popVF(F); Value c=popVF(F); F.stack.push_back(Value(b.toString()==c.toString())); return {}; });
+    avm1Ops().add(0x14, [](Machine&, Frame& F, const Action&) -> OpResult {  // StringLength
+        Value b=popVF(F); F.stack.push_back(Value((double)b.toString().size())); return {}; });
+    avm1Ops().add({0x15,0x35}, [](Machine&, Frame& F, const Action&) -> OpResult {  // StringExtract/MBStringExtract
+        Value cntV=popVF(F); Value idxV=popVF(F); Value strV=popVF(F);
+        std::string s=strV.toString(); int i=(int)idxV.toNumber(); int n=(int)cntV.toNumber();
+        std::string sub=(i>=1&&i<=(int)s.size())?s.substr((size_t)(i-1),(size_t)std::max(0,n)):"";
+        F.stack.push_back(Value(sub)); return {}; });
+    avm1Ops().add(0x17, [](Machine&, Frame& F, const Action&) -> OpResult { popVF(F); return {}; });  // Pop
+    avm1Ops().add(0x18, [](Machine&, Frame& F, const Action&) -> OpResult {  // ToInteger
+        Value b=popVF(F); F.stack.push_back(Value(std::floor(b.toNumber()))); return {}; });
+    // ---- 纯栈 / 定义辅助组（第二批）----
+    avm1Ops().add(0x21, [](Machine&, Frame& F, const Action&) -> OpResult {  // StringAdd
+        Value b=popVF(F); Value c=popVF(F); F.stack.push_back(Value(c.toString()+b.toString())); return {}; });
+    avm1Ops().add(0x26, [](Machine&, Frame& F, const Action&) -> OpResult {  // Trace
+        Value b=popVF(F); std::fprintf(stderr, "[AVM1 Trace] %s\n", b.toString().c_str()); return {}; });
+    avm1Ops().add(0x29, [](Machine&, Frame& F, const Action&) -> OpResult {  // StringLess
+        Value b=popVF(F); Value c=popVF(F); F.stack.push_back(Value(c.toString()<b.toString())); return {}; });
+    avm1Ops().add(0x2A, [](Machine&, Frame& F, const Action&) -> OpResult { popVF(F); return {}; });  // Throw
+    avm1Ops().add(0x2B, [](Machine&, Frame& F, const Action&) -> OpResult {  // CastOp
+        popVF(F); Value v=popVF(F); F.stack.push_back(v); return {}; });
+    avm1Ops().add(0x2C, [](Machine&, Frame& F, const Action&) -> OpResult {  // ImplementsOp
+        popVF(F); Value v=popVF(F); F.stack.push_back(v); return {}; });
+    avm1Ops().add(0x30, [](Machine&, Frame& F, const Action&) -> OpResult {  // RandomNumber
+        Value b=popVF(F); int mx=(int)b.toNumber(); F.stack.push_back(Value((double)(mx>0?std::rand()%mx:0))); return {}; });
+    avm1Ops().add(0x31, [](Machine&, Frame& F, const Action&) -> OpResult {  // MBStringLength
+        Value b=popVF(F); F.stack.push_back(Value((double)b.toString().size())); return {}; });
+    avm1Ops().add({0x32,0x36}, [](Machine&, Frame& F, const Action&) -> OpResult {  // CharToAscii/MBCharToAscii
+        Value b=popVF(F); std::string s=b.toString(); F.stack.push_back(Value((double)(s.empty()?0:(unsigned char)s[0]))); return {}; });
+    avm1Ops().add({0x33,0x37}, [](Machine&, Frame& F, const Action&) -> OpResult {  // AsciiToChar/MBAsciiToChar
+        Value b=popVF(F); int c=(int)b.toNumber(); F.stack.push_back(Value(std::string(1,(char)c))); return {}; });
+    avm1Ops().add(0x34, [](Machine&, Frame& F, const Action&) -> OpResult {  // GetTime
+        F.stack.push_back(Value((double)((std::uint32_t)std::clock()))); return {}; });
+    avm1Ops().add(0x3A, [](Machine&, Frame& F, const Action&) -> OpResult { popVF(F); F.stack.push_back(Value(true)); return {}; });  // Delete
+    avm1Ops().add(0x3B, [](Machine&, Frame& F, const Action&) -> OpResult { popVF(F); popVF(F); F.stack.push_back(Value(true)); return {}; });  // Delete2
+    avm1Ops().add(0x4A, [](Machine&, Frame& F, const Action&) -> OpResult {  // ToNumber
+        Value b=popVF(F); F.stack.push_back(Value(b.toNumber())); return {}; });
+    avm1Ops().add(0x4B, [](Machine&, Frame& F, const Action&) -> OpResult {  // ToString
+        Value b=popVF(F); F.stack.push_back(Value(b.toString())); return {}; });
+    avm1Ops().add(0x50, [](Machine&, Frame& F, const Action&) -> OpResult {  // Increment
+        Value b=popVF(F); F.stack.push_back(Value(b.toNumber()+1)); return {}; });
+    avm1Ops().add(0x51, [](Machine&, Frame& F, const Action&) -> OpResult {  // Decrement
+        Value b=popVF(F); F.stack.push_back(Value(b.toNumber()-1)); return {}; });
+    avm1Ops().add(0x66, [](Machine&, Frame& F, const Action&) -> OpResult {  // StrictEquals
+        Value b=popVF(F); Value c=popVF(F); F.stack.push_back(Value(b.type==c.type && b.toString()==c.toString())); return {}; });
+    avm1Ops().add(0x67, [](Machine&, Frame& F, const Action&) -> OpResult {  // Greater
+        Value b=popVF(F); Value c=popVF(F); F.stack.push_back(Value(c.toNumber()>b.toNumber())); return {}; });
+    avm1Ops().add(0x68, [](Machine&, Frame& F, const Action&) -> OpResult {  // StringGreater
+        Value b=popVF(F); Value c=popVF(F); F.stack.push_back(Value(c.toString()>b.toString())); return {}; });
+    // ---- 定义 / 属性组（第三批）----
+    avm1Ops().add(0x3F, [](Machine&, Frame& F, const Action&) -> OpResult {  // Modulo
+        Value b=popVF(F); Value c=popVF(F); double d=b.toNumber();
+        F.stack.push_back(Value(d==0?std::nan(""):std::fmod(c.toNumber(),d))); return {}; });
+    avm1Ops().add(0x40, [](Machine&, Frame& F, const Action&) -> OpResult {  // NewObject
+        Value name=popVF(F); Value nargsV=popVF(F); int nargs=(int)nargsV.toNumber();
+        if(nargs<0)nargs=0; for(int k=0;k<nargs && !F.stack.empty();++k) popVF(F);
+        F.stack.push_back(makeObj(name.toString())); return {}; });
+    avm1Ops().add(0x42, [](Machine&, Frame& F, const Action&) -> OpResult {  // InitArray
+        Value nV=popVF(F); int n=(int)nV.toNumber(); if(n<0)n=0;
+        Value o=makeObj("Array"); std::vector<Value> elems;
+        for(int k=0;k<n && !F.stack.empty();++k) elems.push_back(popVF(F));
+        for(int k=0;k<(int)elems.size();++k) (*o.obj)[std::to_string(k)]=elems[elems.size()-1-k];
+        F.stack.push_back(o); return {}; });
+    avm1Ops().add(0x43, [](Machine&, Frame& F, const Action&) -> OpResult {  // InitObject
+        Value nV=popVF(F); int n=(int)nV.toNumber(); if(n<0)n=0;
+        Value o=makeObj("Object"); std::vector<std::pair<std::string,Value>> kv;
+        for(int k=0;k<n && F.stack.size()>=2;++k){ Value v=popVF(F); Value nm=popVF(F); kv.push_back({nm.toString(),v}); }
+        for(auto& p:kv) (*o.obj)[p.first]=p.second; F.stack.push_back(o); return {}; });
+    avm1Ops().add(0x44, [](Machine&, Frame& F, const Action&) -> OpResult {  // TypeOf
+        Value v=popVF(F); std::string t;
+        if(v.isClip) t="movieclip";
+        else switch(v.type){
+            case Value::T::Number: t="number"; break;
+            case Value::T::Bool: t="boolean"; break;
+            case Value::T::String: t="string"; break;
+            case Value::T::Function: t="function"; break;
+            case Value::T::Null: t="null"; break;
+            case Value::T::Undefined: t="undefined"; break;
+            default: t="object"; break;
+        }
+        F.stack.push_back(Value(t)); return {}; });
+    avm1Ops().add(0x45, [](Machine& m, Frame& F, const Action&) -> OpResult {  // TargetPath
+        Value v=popVF(F); std::string p;
+        if(v.isClip) p = v.iclip ? v.iclip->getPath() : m.timeline->targetPath();
+        F.stack.push_back(Value(p)); return {}; });
+    avm1Ops().add({0x46,0x55}, [](Machine&, Frame& F, const Action&) -> OpResult {  // Enumerate/Enumerate2
+        popVF(F); F.stack.push_back(Value::nullV()); return {}; });
+    avm1Ops().add(0x47, [](Machine&, Frame& F, const Action&) -> OpResult {  // Add2
+        Value b=popVF(F); Value c=popVF(F); bool str=(b.type==Value::T::String||c.type==Value::T::String);
+        F.stack.push_back(str?Value(c.toString()+b.toString()):Value(b.toNumber()+c.toNumber())); return {}; });
+    avm1Ops().add(0x48, [](Machine&, Frame& F, const Action&) -> OpResult {  // Less2
+        Value b=popVF(F); Value c=popVF(F); F.stack.push_back(Value(c.toNumber()<b.toNumber())); return {}; });
+    avm1Ops().add(0x49, [](Machine&, Frame& F, const Action&) -> OpResult {  // Equals2
+        Value b=popVF(F); Value c=popVF(F); bool eq;
+        if(b.type==Value::T::Number && c.type==Value::T::Number) eq=(b.num==c.num);
+        else if(b.type==Value::T::String || c.type==Value::T::String) eq=(b.toString()==c.toString());
+        else eq=(b.toNumber()==c.toNumber());
+        F.stack.push_back(Value(eq)); return {}; });
+    avm1Ops().add(0x4C, [](Machine&, Frame& F, const Action&) -> OpResult {  // PushDuplicate
+        if(!F.stack.empty()) F.stack.push_back(F.stack.back()); return {}; });
+    avm1Ops().add(0x4D, [](Machine&, Frame& F, const Action&) -> OpResult {  // StackSwap
+        if(F.stack.size()>=2){ Value t=F.stack.back(); F.stack.back()=*(F.stack.end()-2); *(F.stack.end()-2)=t; } return {}; });
+    avm1Ops().add(0x52, [](Machine& m, Frame& F, const Action&) -> OpResult {  // CallMethod
+        Value method=popVF(F); Value object=popVF(F); Value nargsV=popVF(F);
+        int nargs=(int)nargsV.toNumber(); if(nargs<0)nargs=0;
+        std::vector<Value> args;
+        for(int k=0;k<nargs && !F.stack.empty();++k){ args.push_back(F.stack.back()); F.stack.pop_back(); }
+        F.stack.push_back(dispatchMethod(m, object, method, args)); return {}; });
+    avm1Ops().add(0x53, [](Machine&, Frame& F, const Action&) -> OpResult {  // NewMethod
+        Value method=popVF(F); Value object=popVF(F); Value nargsV=popVF(F);
+        int nargs=(int)nargsV.toNumber(); if(nargs<0)nargs=0;
+        for(int k=0;k<nargs && !F.stack.empty();++k) popVF(F);
+        F.stack.push_back(makeObj(method.toString())); return {}; });
+    avm1Ops().add(0x54, [](Machine&, Frame& F, const Action&) -> OpResult {  // InstanceOf
+        popVF(F); popVF(F); F.stack.push_back(Value(false)); return {}; });
+    avm1Ops().add({0x60,0x61,0x62,0x63,0x64,0x65}, [](Machine&, Frame& F, const Action& a) -> OpResult {  // BitOps
+        Value b=popVF(F); Value c=popVF(F);
+        std::int64_t x=(std::int64_t)b.toNumber(), y=(std::int64_t)c.toNumber();
+        std::int64_t r=0;
+        switch(a.code){
+            case 0x60: r=x&y; break;
+            case 0x61: r=x|y; break;
+            case 0x62: r=x^y; break;
+            case 0x63: r=x<<(y&63); break;
+            case 0x64: r=x>>(y&63); break;
+            case 0x65: r=((std::uint64_t)x)>>(y&63); break;
+        }
+        F.stack.push_back(Value((double)(std::int32_t)r)); return {}; });
+    avm1Ops().add(0x69, [](Machine&, Frame& F, const Action&) -> OpResult {  // Extends
+        popVF(F); Value v=popVF(F); F.stack.push_back(v); return {}; });
+    avm1Ops().add(0x87, [](Machine&, Frame& F, const Action& a) -> OpResult {  // StoreRegister
+        Value v=popVF(F); std::uint8_t r = a.raw.empty()?0:a.raw[0];
+        if(r>=(int)F.registers.size()) F.registers.resize(r+1);
+        F.registers[r]=v; return {}; });
+    avm1Ops().add(0x88, [](Machine&, Frame& F, const Action& a) -> OpResult {  // ConstantPool
+        F.constantPool.clear(); for(auto& str:a.strs) F.constantPool.push_back(Value(str)); return {}; });
+    avm1Ops().add(0x96, [](Machine&, Frame& F, const Action& a) -> OpResult {  // Push
+        pushValues(a.pushData, F.stack, F.registers, F.constantPool); return {}; });
+    // ---- 变量 / 成员组（第四批）----
+    avm1Ops().add(0x1C, [](Machine& m, Frame& F, const Action&) -> OpResult {
+        Value name=popVF(F); Value vv;
+        if(name.type==Value::T::String){ std::string n=name.str;
+            if(n.find('.')!=std::string::npos && n!="."){
+                if(auto* sob=(IClip*)m.timeline->resolveClipPath(n)){ F.stack.push_back(makeIClip(sob)); return {}; }
+                if(resolveTrailingPath(m.timeline,n,vv)){ F.stack.push_back(vv); return {}; } }
+            if(n=="this"){ F.stack.push_back(m.currentThis?makeIClip(m.currentThis):(m.currentParent?makeIClip(m.currentParent):makeClip(m.currentClip?m.currentClip:m.timeline))); }
+            else if(n=="_root"||n=="_global"||n=="_level0"){ F.stack.push_back(makeClip(m.timeline)); }
+            else if(n=="_parent"){ F.stack.push_back(m.currentParent?makeIClip(m.currentParent):Value::undef()); }
+            else if(isRootVarName(n)){ auto* p=findVar(m.globals,n); F.stack.push_back(p?*p:Value::undef()); }
+            else { auto sit=F.scope.find(n);
+                if(sit!=F.scope.end()) F.stack.push_back(sit->second);
+                else if(clipVarGet(m,n,vv)){ F.stack.push_back(vv); }
+                else { auto* p=findVar(m.globals,n); F.stack.push_back(p?*p:Value::undef()); } } }
+        else F.stack.push_back(Value::undef()); return {}; });
+    avm1Ops().add(0x1D, [](Machine& m, Frame& F, const Action&) -> OpResult {
+        Value val=popVF(F); Value name=popVF(F);
+        if(name.type==Value::T::String){
+            if(isRootVarName(name.str)) storeVar(m.globals,name.str,val);
+            else if(m.currentThis){ int pid=clipPropByName(name.str); if(pid>=0) m.currentThis->setNumberProp(pid,val.toNumber()); else clipVarSet(m,name.str,val); }
+            else if(F.isRoot) storeVar(m.globals,name.str,val);
+            else F.scope[name.str]=val; } return {}; });
+    avm1Ops().add(0x3C, [](Machine& m, Frame& F, const Action&) -> OpResult {
+        Value val=popVF(F); Value name=popVF(F);
+        if(name.type==Value::T::String){
+            if(m.currentThis) clipVarSet(m,name.str,val);
+            else if(F.isRoot) storeVar(m.globals,name.str,val);
+            else F.scope[name.str]=val; } return {}; });
+    avm1Ops().add(0x41, [](Machine& m, Frame& F, const Action&) -> OpResult {
+        Value name=popVF(F);
+        if(name.type==Value::T::String){
+            if(m.currentThis) clipVarSet(m,name.str,Value::undef());
+            else if(F.isRoot) storeVar(m.globals,name.str,Value::undef());
+            else F.scope[name.str]=Value::undef(); } return {}; });
+    avm1Ops().add(0x4E, [](Machine& m, Frame& F, const Action&) -> OpResult {
+        Value name=popVF(F); Value obj=popVF(F);
+        if(obj.isClip && name.type==Value::T::String){ std::string n=name.str;
+            if(obj.iclip){
+                if(n=="gotoAndPlay"||n=="gotoAndStop"||n=="play"||n=="stop"||n=="nextFrame"||n=="prevFrame"||n=="stopAllSounds"||n=="hitTest"||n=="attachMovie"||n=="duplicateMovieClip"||n=="createEmptyMovieClip"||n=="startDrag"||n=="stopDrag"||n=="getBounds"||n=="setMask"){ Value mm; mm.type=Value::T::Object; mm.isMethod=true; mm.methodName=n; mm.iclip=obj.iclip; F.stack.push_back(mm); return {}; }
+                if(n=="_parent"){ void* p=obj.iclip->parentClip(); F.stack.push_back(p?makeIClip((IClip*)p):makeClip(m.timeline)); return {}; }
+                if(n=="_root"||n=="_level0"||n=="_global"){ F.stack.push_back(makeClip(m.timeline)); return {}; }
+                int pid=clipPropByName(n); Value out; if(pid>=0 && iclipGetProp(obj.iclip,pid,out)){ F.stack.push_back(out); return {}; }
+                if(void* ch=obj.iclip->findChildClip(n)){ F.stack.push_back(makeIClip((IClip*)ch)); return {}; }
+                auto it=obj.iclip->members->find(n); if(it!=obj.iclip->members->end()){ F.stack.push_back(it->second); return {}; }
+                F.stack.push_back(Value::undef()); return {}; }
+            ITimeline* t=(ITimeline*)obj.clip;
+            if(n=="_root"){ F.stack.push_back(makeClip(m.timeline)); return {}; }
+            if(n=="_currentframe"||n=="_currentFrame"){ F.stack.push_back(Value((double)t->currentFrame())); return {}; }
+            if(n=="_totalframes"||n=="_totalFrames"){ F.stack.push_back(Value((double)t->totalFrames())); return {}; }
+            if(n=="_framesloaded"){ F.stack.push_back(Value((double)t->framesLoaded())); return {}; }
+            if(n=="_parent"){ F.stack.push_back(makeClip(t)); return {}; }
+            if(n=="_x"||n=="_y"||n=="_width"||n=="_height"||n=="_rotation"){ F.stack.push_back(Value(0.0)); return {}; }
+            if(n=="_xscale"||n=="_yscale"||n=="_alpha"){ F.stack.push_back(Value(100.0)); return {}; }
+            if(n=="_visible"){ F.stack.push_back(Value(true)); return {}; }
+            if(n=="_name"){ F.stack.push_back(Value(t->clipName())); return {}; }
+            if(n=="_target"){ F.stack.push_back(Value(t->targetPath())); return {}; }
+            // _root 上按实例名取子剪辑：GetVariable 只处理带点号的完整路径，
+            // 而 AVM1 的 _root.bonus.gotoAndPlay(2) 是先 GetMember(_root,"bonus")。
+            // 解析不到会让整条调用链静默失效（钩爪回收后无法触发复位）。
+            if(!n.empty() && n.find('.')==std::string::npos && n[0]!='/'){
+                std::string cp="_root."+n;
+                if(void* ch=t->resolveClipPath(cp)){ F.stack.push_back(makeIClip((IClip*)ch)); return {}; }
+            }
+            { auto* gp=findVar(m.globals,n); if(gp){ F.stack.push_back(*gp); return {}; } }
+            F.stack.push_back(Value::undef()); return {}; }
+        if(obj.type==Value::T::Object && obj.obj){ auto it=obj.obj->find(name.toString()); if(it!=obj.obj->end()){ F.stack.push_back(it->second); return {}; } }
+        if(name.type==Value::T::String && name.str=="length" && obj.type==Value::T::String){ F.stack.push_back(Value((double)obj.str.size())); return {}; }
+        F.stack.push_back(Value::undef()); return {}; });
+    avm1Ops().add(0x4F, [](Machine& m, Frame& F, const Action&) -> OpResult {
+        Value val=popVF(F); Value name=popVF(F); Value obj=popVF(F);
+        if(obj.iclip && name.type==Value::T::String){ int pid=clipPropByName(name.str);
+            if(pid>=0){ obj.iclip->setNumberProp(pid, val.toNumber()); return {}; }
+            (*obj.iclip->members)[name.str]=val; return {}; }
+        if(obj.isClip && name.type==Value::T::String){ storeVar(m.globals,name.str,val); return {}; }
+        if(obj.type==Value::T::Object && obj.obj){ (*obj.obj)[name.toString()]=val; } return {}; });
+    // ---- 时间轴控制 ----
+    avm1Ops().add(0x04, [](Machine& m, Frame&, const Action&) -> OpResult { (m.currentClip?m.currentClip:m.timeline)->nextFrame(); return {}; });
+    avm1Ops().add(0x05, [](Machine& m, Frame&, const Action&) -> OpResult { (m.currentClip?m.currentClip:m.timeline)->prevFrame(); return {}; });
+    avm1Ops().add(0x06, [](Machine& m, Frame&, const Action&) -> OpResult { (m.currentClip?m.currentClip:m.timeline)->play(); return {}; });
+    avm1Ops().add(0x07, [](Machine& m, Frame&, const Action&) -> OpResult { (m.currentClip?m.currentClip:m.timeline)->stop(); return {}; });
+    avm1Ops().add(0x08, [](Machine&, Frame&, const Action&) -> OpResult { return {}; });  // ToggleQuality 忽略
+    avm1Ops().add(0x09, [](Machine& m, Frame&, const Action&) -> OpResult { m.timeline->stopAllSounds(); return {}; });
+    avm1Ops().add(0x81, [](Machine& m, Frame&, const Action& a) -> OpResult { (m.currentClip?m.currentClip:m.timeline)->gotoAndStop(a.gotoFrame + 1); return {}; });
+    avm1Ops().add(0x8C, [](Machine&, Frame&, const Action&) -> OpResult { return {}; });  // GotoLabel 忽略
+    avm1Ops().add(0x9F, [](Machine& m, Frame& F, const Action& a) -> OpResult {
+        bool playFlag=(a.raw.empty()?false:(a.raw[0]&1)!=0); Value fr=popVF(F); int f=resolveFrame(m,fr);
+        if(f>0){ auto* CL=m.currentClip?m.currentClip:m.timeline; if(playFlag) CL->gotoAndPlay(f); else CL->gotoAndStop(f); } return {}; });
+    // ---- 短桩 ----
+    avm1Ops().add(0x20, [](Machine&, Frame& F, const Action&) -> OpResult { popVF(F); return {}; });  // SetTarget2
+    avm1Ops().add(0x22, [](Machine& m, Frame& F, const Action&) -> OpResult {
+        Value idx=popVF(F); Value tgt=popVF(F); int i=(int)idx.toNumber();
+        ITimeline* cl=(tgt.isClip)?(ITimeline*)tgt.clip:(m.currentClip?m.currentClip:m.timeline); Value out=Value::undef();
+        switch(i){ case 0: case 1: out=Value(0.0); break; case 2: case 3: out=Value(100.0); break;
+            case 4: out=Value((double)cl->currentFrame()); break; case 5: out=Value((double)cl->totalFrames()); break;
+            case 6: out=Value(100.0); break; case 7: out=Value(true); break;
+            case 8: case 9: case 10: out=Value(0.0); break;
+            case 11: out=Value(cl->targetPath()); break; case 12: out=Value((double)cl->framesLoaded()); break;
+            case 13: out=Value(cl->clipName()); break; default: out=Value::undef(); break; }
+        F.stack.push_back(out); return {}; });
+    avm1Ops().add(0x23, [](Machine&, Frame& F, const Action&) -> OpResult {
+        Value val=popVF(F); Value idx=popVF(F); Value tgt=popVF(F);
+        if(tgt.iclip){ int i=(int)idx.toNumber(); tgt.iclip->setNumberProp(i, val.toNumber()); } return {}; });
+    avm1Ops().add({0x24,0x25,0x27,0x28}, [](Machine&, Frame& F, const Action&) -> OpResult { popVF(F); popVF(F); popVF(F); return {}; });  // CloneSprite/RemoveSprite/StartDrag/EndDrag
+    avm1Ops().add(0x83, [](Machine&, Frame&, const Action&) -> OpResult { return {}; });  // GetURL 忽略
+    avm1Ops().add(0x8B, [](Machine&, Frame& F, const Action&) -> OpResult { popVF(F); return {}; });  // SetTarget
+    avm1Ops().add(0x9A, [](Machine&, Frame&, const Action&) -> OpResult { return {}; });  // GetURL2 忽略
+    // ---- 控制流（最后）----
+    avm1Ops().add(0x3D, [](Machine& m, Frame& F, const Action&) -> OpResult {  // CallFunction
+        Value name=popVF(F); Value nargsV=popVF(F);
+        int nargs=(int)nargsV.toNumber(); if(nargs<0)nargs=0;
+        std::vector<Value> args;
+        for(int k=0;k<nargs && !F.stack.empty();++k){ args.push_back(F.stack.back()); F.stack.pop_back(); }
+        Value fnv;
+        if(name.type==Value::T::String){
+            auto sit=F.scope.find(name.str);
+            if(sit!=F.scope.end()) fnv=sit->second;
+            else { auto git=m.globals.find(name.str); if(git!=m.globals.end()) fnv=git->second; }
+        }
+        if(fnv.type==Value::T::Function && fnv.func && g_callStack->size()<(size_t)m.maxCallDepth){
+            ++F.pc;
+            g_callStack->push_back(Frame{});
+            Frame& nf=*g_callStack->rbegin();
+            nf.fn=fnv.func; nf.script=&fnv.func->body;
+            for(size_t i=0;i<fnv.func->body.actions.size();++i) nf.posToIdx[fnv.func->body.actions[i].bytePos]=(int)i;
+            nf.registers.resize(fnv.func->regCount>0?fnv.func->regCount:0);
+            for(size_t i=0;i<fnv.func->params.size();++i){
+                Value arg=(i<args.size())?args[i]:Value::undef();
+                int reg=(i<fnv.func->paramRegs.size())?fnv.func->paramRegs[i]:0;
+                if(reg>0 && reg<(int)nf.registers.size()) nf.registers[reg]=arg;
+                else nf.scope[fnv.func->params[i]]=arg;
+            }
+            return {true, F.pc};
+        }
+        F.stack.push_back(Value::undef()); return {}; });
+    avm1Ops().add(0x3E, [](Machine&, Frame& F, const Action&) -> OpResult { F.retValue=popVF(F); F.ret=true; return {}; });
+    avm1Ops().add(0x99, [](Machine&, Frame& F, const Action& a) -> OpResult {
+        auto it=F.posToIdx.find(a.byteEnd+a.offset);
+        if(it!=F.posToIdx.end()) return {true, it->second};
+        F.ret=true; return {}; });
+    avm1Ops().add(0x9D, [](Machine&, Frame& F, const Action& a) -> OpResult {
+        Value cond=popVF(F);
+        if(cond.toBool()){ auto it=F.posToIdx.find(a.byteEnd+a.offset); if(it!=F.posToIdx.end()) return {true, it->second}; F.ret=true; return {}; }
+        return {}; });
+    avm1Ops().add({0x9B,0x8E}, [](Machine& m, Frame& F, const Action& a) -> OpResult {
+        auto fn2=std::make_shared<Avm1Function>();
+        fn2->name=a.funcName; fn2->params=a.funcParams; fn2->paramRegs=a.funcParamRegs;
+        fn2->regCount=a.funcRegCount; fn2->body=disassemble(a.funcBody.data(), a.funcBody.size());
+        Value fv; fv.type=Value::T::Function; fv.func=fn2;
+        F.stack.push_back(fv);
+        if(!a.funcName.empty()){
+            if(F.isRoot) storeVar(m.globals, a.funcName, fv);   // 顶层函数入全局，支持全局/递归调用
+            else F.scope[a.funcName]=fv;
+        } return {}; });
+    avm1Ops().add(0x9E, [](Machine&, Frame&, const Action&) -> OpResult { return {}; });  // Call（忽略）
+}
+
 void Machine::run(const Script& s) {
     if (!timeline || s.actions.empty()) return;
     ensureBuiltins(globals);
 
     std::vector<Frame> frames;
     frames.push_back(Frame{});
-    { Frame& f0 = frames.back(); f0.script = &s;
+    { Frame& f0 = frames.back(); f0.script = &s; f0.isRoot = true;
       for (size_t i = 0; i < s.actions.size(); ++i) f0.posToIdx[s.actions[i].bytePos] = (int)i; }
+    g_callStack = &frames;
 
+    // 统一执行预算：后向跳转 / 递归调用此前没有任何上限，会永久占用主线程。
+    std::size_t steps = 0;
     while (!frames.empty()) {
+        if (++steps > 2000000) break;
         Frame& F = frames.back();
         // 帧结束（Return/End/越界）：弹出并把返回值交给调用方
         if (F.ret || F.pc < 0 || F.pc >= (int)F.script->actions.size()) {
@@ -406,313 +766,15 @@ void Machine::run(const Script& s) {
         ITimeline* CL = currentClip ? currentClip : timeline;
         const Action& a = F.script->actions[pc];
         bool jumped = false;
-        switch (a.code) {
-            // ---- 时间轴控制 ----
-            case 0x00: ret = true; break;                          // End
-            case 0x04: CL->nextFrame(); break;                     // NextFrame
-            case 0x05: CL->prevFrame(); break;                     // PrevFrame
-            case 0x06: CL->play(); break;                    // Play
-            case 0x07: CL->stop(); break;                    // Stop
-            case 0x08: break;                                      // ToggleQuality（忽略）
-            case 0x09: timeline->stopAllSounds(); break;           // StopSounds
-            // ---- 算术 / 比较 / 逻辑 ----
-            case 0x0A: { Value b=popV(); Value c=popV();           // Add
-                         bool str=(b.type==Value::T::String||c.type==Value::T::String);
-                         stack.push_back(str?Value(c.toString()+b.toString())
-                                            :Value(b.toNumber()+c.toNumber())); } break;
-            case 0x0B: { Value b=popV(); Value c=popV(); stack.push_back(Value(c.toNumber()-b.toNumber())); } break;  // Subtract
-            case 0x0C: { Value b=popV(); Value c=popV(); stack.push_back(Value(b.toNumber()*c.toNumber())); } break;  // Multiply
-            case 0x0D: { Value b=popV(); Value c=popV(); double d=b.toNumber();
-                         stack.push_back(Value(d==0?std::nan(""):c.toNumber()/d)); } break;                          // Divide
-            case 0x0E: { Value b=popV(); Value c=popV(); stack.push_back(Value(b.toString()==c.toString())); } break; // Equals
-            case 0x0F: { Value b=popV(); Value c=popV(); stack.push_back(Value(c.toNumber()<b.toNumber())); } break;  // Less
-            case 0x10: { Value b=popV(); Value c=popV(); stack.push_back(Value(b.toBool()&&c.toBool())); } break;     // And
-            case 0x11: { Value b=popV(); Value c=popV(); stack.push_back(Value(b.toBool()||c.toBool())); } break;     // Or
-            case 0x12: { Value b=popV(); stack.push_back(Value(!b.toBool())); } break;                                // Not
-            case 0x13: { Value b=popV(); Value c=popV(); stack.push_back(Value(b.toString()==c.toString())); } break; // StringEquals
-            case 0x14: { Value b=popV(); stack.push_back(Value((double)b.toString().size())); } break;                // StringLength
-            case 0x15: case 0x35: {                                // StringExtract / MBStringExtract
-                         Value cntV=popV(); Value idxV=popV(); Value strV=popV();
-                         std::string s=strV.toString(); int i=(int)idxV.toNumber(); int n=(int)cntV.toNumber();
-                         std::string sub=(i>=1&&i<=(int)s.size())?s.substr((size_t)(i-1),(size_t)std::max(0,n)):"";
-                         stack.push_back(Value(sub)); } break;
-            case 0x17: popV(); break;                              // Pop
-            case 0x18: { Value b=popV(); stack.push_back(Value(std::floor(b.toNumber()))); } break;  // ToInteger
-            // ---- 变量 ----
-            case 0x1C: { Value name=popV(); Value vv;             // GetVariable
-                         if(name.type==Value::T::String){
-                             std::string n=name.str;
-                             // 带点路径（如 _root.T4.ob.price）：GetVariable 会做路径解析得到剪辑对象。
-                             if(n.find('.')!=std::string::npos && n!="."){
-                                 if(auto* sob = (IClip*)timeline->resolveClipPath(n)){ stack.push_back(makeIClip(sob)); break; }
-                                 Value pv;
-                                 if(resolveTrailingPath(timeline, n, pv)){ stack.push_back(pv); break; }
-                             }
-                             if(n=="this"){ stack.push_back(currentThis?makeIClip(currentThis):(currentParent?makeIClip(currentParent):makeClip(currentClip?currentClip:timeline))); }
-                             else if(n=="_root"||n=="_global"||n=="_level0"){ stack.push_back(makeClip(timeline)); }
-                             else if(n=="_parent"){ stack.push_back(currentParent?makeIClip(currentParent):Value::undef()); }
-                             else if(isRootVarName(n)){ auto* p=findVar(globals,n); stack.push_back(p?*p:Value::undef()); }
-                             else {
-                                 auto sit=F.scope.find(n);
-                                 if(sit!=F.scope.end()) stack.push_back(sit->second);
-                                 else if(clipVarGet(*this,n,vv)){ stack.push_back(vv); }
-                                 else { auto* p=findVar(globals,n); stack.push_back(p?*p:Value::undef()); }
-                             }
-                         } else stack.push_back(Value::undef()); } break;
-            case 0x1D: { Value val=popV(); Value name=popV();      // SetVariable（先弹 value 再弹 name）
-                         if(name.type==Value::T::String){
-                             if(isRootVarName(name.str)) storeVar(globals,name.str,val);
-                             else if(isRoot && !currentThis) storeVar(globals,name.str,val);
-                             else if(currentThis) { int pid=clipPropByName(name.str);
-                                 if(pid>=0){ double d=(name.str=="_target"||name.str=="_name")?0:val.toNumber(); currentThis->setNumberProp(pid,d); }
-                                 else clipVarSet(*this,name.str,val); }
-                             else F.scope[name.str]=val;
-                         } } break;
-            case 0x20: popV(); break;                              // SetTarget2（忽略）
-            case 0x21: { Value b=popV(); Value c=popV(); stack.push_back(Value(c.toString()+b.toString())); } break;  // StringAdd
-            case 0x22: { Value idx=popV(); Value tgt=popV();       // GetProperty
-                         int i=(int)idx.toNumber(); Value out=Value::undef();
-                         if (tgt.iclip) {
-                             if (!iclipGetProp(tgt.iclip, i, out)) out = Value::undef();
-                         } else {
-                             // 目标不是剪辑对象（例如空串 ""）时，Flash 语义指向"当前时间轴"
-                             // （正在执行脚本的剪辑）；主时间轴脚本的 currentClip 为空 → 主时间轴。
-                             ITimeline* cl=(tgt.isClip)?(ITimeline*)tgt.clip:(currentClip?currentClip:timeline);
-                             switch(i){
-                                 case 0: case 1: out=Value(0.0); break;                          // _x/_y
-                                 case 2: case 3: out=Value(100.0); break;                        // _xscale/_yscale
-                                 case 4: out=Value((double)cl->currentFrame()); break;           // _currentframe
-                                 case 5: out=Value((double)cl->totalFrames()); break;            // _totalframes
-                                 case 6: out=Value(100.0); break;                                // _alpha
-                                 case 7: out=Value(true); break;                                 // _visible
-                                 case 8: case 9: case 10: out=Value(0.0); break;                 // _width/_height/_rotation
-                                 case 11: out=Value(cl->targetPath()); break;                    // _target
-                                 case 12: out=Value((double)cl->framesLoaded()); break;          // _framesloaded
-                                 case 13: out=Value(cl->clipName()); break;                      // _name
-                                 default: out=Value::undef(); break;
-                             }
-                         }
-                         stack.push_back(out); } break;
-            case 0x23: { Value val=popV(); Value idx=popV(); Value tgt=popV();   // SetProperty
-                         if (tgt.iclip) { int i=(int)idx.toNumber(); tgt.iclip->setNumberProp(i, val.toNumber()); } } break;
-            case 0x24: case 0x25: case 0x27: case 0x28:            // CloneSprite/RemoveSprite/StartDrag/EndDrag
-                popV(); popV(); popV(); break;
-            case 0x26: { Value b=popV(); std::fprintf(stderr, "[AVM1 Trace] %s\n", b.toString().c_str()); } break;
-            case 0x29: { Value b=popV(); Value c=popV(); stack.push_back(Value(c.toString()<b.toString())); } break; // StringLess
-            case 0x2A: popV(); break;                              // Throw（忽略）
-            case 0x2B: { popV(); Value v=popV(); stack.push_back(v); } break;   // CastOp
-            case 0x2C: { popV(); Value v=popV(); stack.push_back(v); } break;   // ImplementsOp
-            case 0x30: { Value b=popV(); int mx=(int)b.toNumber();
-                         stack.push_back(Value((double)(mx>0?std::rand()%mx:0))); } break;   // RandomNumber
-            case 0x31: { Value b=popV(); stack.push_back(Value((double)b.toString().size())); } break;  // MBStringLength
-            case 0x32: case 0x36: { Value b=popV(); std::string s=b.toString();              // CharToAscii/MBCharToAscii
-                         stack.push_back(Value((double)(s.empty()?0:(unsigned char)s[0]))); } break;
-            case 0x33: case 0x37: { Value b=popV(); int c=(int)b.toNumber();                 // AsciiToChar/MBAsciiToChar
-                         stack.push_back(Value(std::string(1,(char)c))); } break;
-            case 0x34: stack.push_back(Value((double)((std::uint32_t)std::clock()))); break; // GetTime
-            case 0x3A: popV(); stack.push_back(Value(true)); break;   // Delete
-            case 0x3B: popV(); popV(); stack.push_back(Value(true)); break;  // Delete2
-            case 0x3C: { Value val=popV(); Value name=popV();         // DefineLocal（先弹 value 再弹 name）
-                         if(name.type==Value::T::String){
-                             if(currentThis) clipVarSet(*this,name.str,val);
-                             else if(isRoot) storeVar(globals,name.str,val);
-                             else F.scope[name.str]=val; } } break;
-            case 0x41: { Value name=popV();                           // DefineLocal2（仅名字，值 undefined）
-                         if(name.type==Value::T::String){
-                             if(currentThis) clipVarSet(*this,name.str,Value::undef());
-                             else if(isRoot) storeVar(globals,name.str,Value::undef());
-                             else F.scope[name.str]=Value::undef(); } } break;
-            case 0x3D: { // CallFunction：pop name, pop nargs, pop 参数, 调用, push 返回值
-                         Value name=popV(); Value nargsV=popV();
-                         int nargs=(int)nargsV.toNumber(); if(nargs<0)nargs=0;
-                         std::vector<Value> args;
-                         for(int k=0;k<nargs && !stack.empty();++k){ args.push_back(stack.back()); stack.erase(stack.end()-1); }
-                         Value fnv;
-                         if(name.type==Value::T::String){
-                             auto sit=F.scope.find(name.str);
-                             if(sit!=F.scope.end()) fnv=sit->second;
-                             else { auto git=globals.find(name.str); if(git!=globals.end()) fnv=git->second; }
-                         }
-                         if(fnv.type==Value::T::Function && fnv.func && frames.size()<(size_t)maxCallDepth){
-                             ++pc;  // 返回后从下一条继续
-                             frames.push_back(Frame{});
-                             Frame& nf=frames.back();
-                             nf.fn=fnv.func; nf.script=&fnv.func->body;
-                             for(size_t i=0;i<fnv.func->body.actions.size();++i) nf.posToIdx[fnv.func->body.actions[i].bytePos]=(int)i;
-                             nf.registers.resize(fnv.func->regCount>0?fnv.func->regCount:0);
-                             for(size_t i=0;i<fnv.func->params.size();++i){
-                                 Value arg=(i<args.size())?args[i]:Value::undef();
-                                 int reg=(i<fnv.func->paramRegs.size())?fnv.func->paramRegs[i]:0;
-                                 if(reg>0 && reg<(int)nf.registers.size()) nf.registers[reg]=arg;
-                                 else nf.scope[fnv.func->params[i]]=arg;
-                             }
-                             jumped=true;
-                         } else {
-                             stack.push_back(Value::undef());
-                         } } break;
-            case 0x3E: { F.retValue = popV(); ret=true; } break;      // Return
-            case 0x3F: { Value b=popV(); Value c=popV(); double d=b.toNumber();    // Modulo
-                         stack.push_back(Value(d==0?std::nan(""):std::fmod(c.toNumber(),d))); } break;
-            case 0x40: { Value name=popV(); Value nargsV=popV();      // NewObject
-                         int nargs=(int)nargsV.toNumber(); if(nargs<0)nargs=0;
-                         for(int k=0;k<nargs && !stack.empty();++k) popV();
-                         stack.push_back(makeObj(name.toString())); } break;
-            case 0x42: { Value nV=popV(); int n=(int)nV.toNumber(); if(n<0)n=0;   // InitArray
-                         Value o=makeObj("Array");
-                         std::vector<Value> elems;
-                         for(int k=0;k<n && !stack.empty();++k) elems.push_back(popV());
-                         for(int k=0;k<(int)elems.size();++k) (*o.obj)[std::to_string(k)]=elems[elems.size()-1-k];
-                         stack.push_back(o); } break;
-            case 0x43: { Value nV=popV(); int n=(int)nV.toNumber(); if(n<0)n=0;   // InitObject
-                         Value o=makeObj("Object");
-                         std::vector<std::pair<std::string,Value>> kv;
-                         for(int k=0;k<n && stack.size()>=2;++k){ Value v=popV(); Value nm=popV(); kv.push_back({nm.toString(),v}); }
-                         for(auto& p:kv) (*o.obj)[p.first]=p.second;
-                         stack.push_back(o); } break;
-            case 0x44: { Value v=popV(); std::string t;               // TypeOf
-                         if(v.isClip) t="movieclip";
-                         else switch(v.type){
-                             case Value::T::Number: t="number"; break;
-                             case Value::T::Bool: t="boolean"; break;
-                             case Value::T::String: t="string"; break;
-                             case Value::T::Function: t="function"; break;
-                             case Value::T::Null: t="null"; break;
-                             case Value::T::Undefined: t="undefined"; break;
-                             default: t="object"; break;
-                         }
-                         stack.push_back(Value(t)); } break;
-            case 0x45: { Value v=popV(); std::string p;               // TargetPath
-                         if(v.isClip) p = v.iclip ? v.iclip->getPath() : timeline->targetPath();
-                         stack.push_back(Value(p)); } break;
-            case 0x46: case 0x55: popV(); stack.push_back(Value::nullV()); break;  // Enumerate/Enumerate2
-            case 0x47: { Value b=popV(); Value c=popV();              // Add2
-                         bool str=(b.type==Value::T::String||c.type==Value::T::String);
-                         stack.push_back(str?Value(c.toString()+b.toString())
-                                            :Value(b.toNumber()+c.toNumber())); } break;
-            case 0x48: { Value b=popV(); Value c=popV(); stack.push_back(Value(c.toNumber()<b.toNumber())); } break;  // Less2
-            case 0x49: { Value b=popV(); Value c=popV();              // Equals2
-                         bool eq;
-                         if(b.type==Value::T::Number && c.type==Value::T::Number) eq=(b.num==c.num);
-                         else if(b.type==Value::T::String || c.type==Value::T::String) eq=(b.toString()==c.toString());
-                         else eq=(b.toNumber()==c.toNumber());
-                         stack.push_back(Value(eq)); } break;
-            case 0x4A: { Value b=popV(); stack.push_back(Value(b.toNumber())); } break;   // ToNumber
-            case 0x4B: { Value b=popV(); stack.push_back(Value(b.toString())); } break;   // ToString
-            case 0x4C: if(!stack.empty()) stack.push_back(stack.back()); break;           // PushDuplicate
-            case 0x4D: if(stack.size()>=2){ Value t=stack.back(); stack.back()=*(stack.end()-2); *(stack.end()-2)=t; } break;  // StackSwap
-            case 0x4E: { Value name=popV(); Value obj=popV();         // GetMember
-                         if(obj.isClip && name.type==Value::T::String){
-                             std::string n=name.str;
-                             if (obj.iclip) {
-                                 if(n=="gotoAndPlay"||n=="gotoAndStop"||n=="play"||n=="stop"||
-                                    n=="nextFrame"||n=="prevFrame"||n=="stopAllSounds"||n=="hitTest"){
-                                     Value m; m.type=Value::T::Object; m.isMethod=true;
-                                     m.methodName=n; m.iclip=obj.iclip; stack.push_back(m); break;
-                                 }
-                                 // 剪辑对象的父子/根引用（AS1/AS2 中 `clip._parent`、`clip._root` 很常用）。
-                                 if(n=="_parent"){ void* p=obj.iclip->parentClip();
-                                                  stack.push_back(p?makeIClip((IClip*)p):makeClip(timeline)); break; }
-                                 if(n=="_root"||n=="_level0"||n=="_global"){ stack.push_back(makeClip(timeline)); break; }
-                                 int pid=clipPropByName(n);
-                                 if(pid>=0){ Value out; if(!iclipGetProp(obj.iclip,pid,out)) out=Value::undef();
-                                             stack.push_back(out); break; }
-                                 if (void* ch = obj.iclip->findChildClip(n)) { stack.push_back(makeIClip((IClip*)ch)); break; }
-                                 { auto it=obj.iclip->members->find(n);
-                                   if(it!=obj.iclip->members->end()){ stack.push_back(it->second); break; } }
-                                 stack.push_back(Value::undef()); break;
-                             }
-                             if(n=="gotoAndPlay"||n=="gotoAndStop"||n=="play"||n=="stop"||n=="nextFrame"||n=="prevFrame"||n=="stopAllSounds"){
-                                 Value m; m.type=Value::T::Object; m.isMethod=true; m.methodName=n; m.clip=obj.clip; stack.push_back(m); break;
-                             }
-                             if (void* ch = ((ITimeline*)obj.clip)->findChildClip(n)) { stack.push_back(makeIClip((IClip*)ch)); break; }
-                             ITimeline* t=(ITimeline*)obj.clip;
-                             if(n=="_currentframe"||n=="_currentFrame"){stack.push_back(Value((double)t->currentFrame()));break;}
-                             if(n=="_totalframes"||n=="_totalFrames"){stack.push_back(Value((double)t->totalFrames()));break;}
-                             if(n=="_framesloaded"){stack.push_back(Value((double)t->framesLoaded()));break;}
-                             if(n=="_root"){stack.push_back(makeClip(timeline));break;}
-                             if(n=="_parent"){stack.push_back(makeClip(t));break;}
-                             if(n=="_x"||n=="_y"||n=="_width"||n=="_height"||n=="_rotation"){stack.push_back(Value(0.0));break;}
-                             if(n=="_xscale"||n=="_yscale"||n=="_alpha"){stack.push_back(Value(100.0));break;}
-                             if(n=="_visible"){stack.push_back(Value(true));break;}
-                             if(n=="_name"){stack.push_back(Value(t->clipName()));break;}
-                             if(n=="_target"){stack.push_back(Value(t->targetPath()));break;}
-                             { auto* gp=findVar(globals,n); if(gp){ stack.push_back(*gp); break; } }
-                             stack.push_back(Value::undef()); break;
-                         }
-                         if(obj.type==Value::T::Object && obj.obj){ auto it=obj.obj->find(name.toString()); if(it!=obj.obj->end()){stack.push_back(it->second);break;} }
-                         if(name.type==Value::T::String && name.str=="length" && obj.type==Value::T::String)
-                             { stack.push_back(Value((double)obj.str.size())); break; }
-                         stack.push_back(Value::undef()); } break;
-            case 0x4F: { Value val=popV(); Value name=popV(); Value obj=popV();  // SetMember
-                         if(obj.iclip && name.type==Value::T::String){
-                             int pid=clipPropByName(name.str);
-                             if(pid>=0){ obj.iclip->setNumberProp(pid, val.toNumber()); break; }
-                             (*obj.iclip->members)[name.str]=val; break;
-                         }
-                         if(obj.isClip && name.type==Value::T::String){ storeVar(globals,name.str,val); break; }
-                         if(obj.type==Value::T::Object && obj.obj){ (*obj.obj)[name.toString()]=val; } } break;
-            case 0x50: { Value b=popV(); stack.push_back(Value(b.toNumber()+1)); } break;   // Increment
-            case 0x51: { Value b=popV(); stack.push_back(Value(b.toNumber()-1)); } break;   // Decrement
-            case 0x52: { // CallMethod：pop method, pop object, pop nargs, pop args（自顶向下）
-                         Value method=popV(); Value object=popV(); Value nargsV=popV();
-                         int nargs=(int)nargsV.toNumber(); if(nargs<0)nargs=0;
-                         std::vector<Value> args;
-                         for(int k=0;k<nargs && !stack.empty();++k){ args.push_back(stack.back()); stack.erase(stack.end()-1); }
-                         stack.push_back(dispatchMethod(*this, object, method, args)); } break;
-            case 0x53: { // NewMethod
-                         Value method=popV(); Value object=popV(); Value nargsV=popV();
-                         int nargs=(int)nargsV.toNumber(); if(nargs<0)nargs=0;
-                         for(int k=0;k<nargs && !stack.empty();++k) popV();
-                         stack.push_back(makeObj(method.toString())); } break;
-            case 0x54: { popV(); popV(); stack.push_back(Value(false)); } break;   // InstanceOf
-            case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: {   // 位运算
-                         Value b=popV(); Value c=popV();
-                         std::int64_t x=(std::int64_t)b.toNumber(), y=(std::int64_t)c.toNumber();
-                         std::int64_t r=0;
-                         switch(a.code){
-                             case 0x60: r=x&y; break;
-                             case 0x61: r=x|y; break;
-                             case 0x62: r=x^y; break;
-                             case 0x63: r=x<<(y&63); break;
-                             case 0x64: r=x>>(y&63); break;
-                             case 0x65: r=((std::uint64_t)x)>>(y&63); break;
-                         }
-                         stack.push_back(Value((double)(std::int32_t)r)); } break;
-            case 0x66: { Value b=popV(); Value c=popV();
-                         stack.push_back(Value(b.type==c.type && b.toString()==c.toString()));} break;  // StrictEquals
-            case 0x67: { Value b=popV(); Value c=popV(); stack.push_back(Value(c.toNumber()>b.toNumber())); } break;  // Greater
-            case 0x68: { Value b=popV(); Value c=popV(); stack.push_back(Value(c.toString()>b.toString())); } break;  // StringGreater
-            case 0x69: { popV(); Value v=popV(); stack.push_back(v); } break;   // Extends
-            case 0x87: { Value v=popV(); std::uint8_t r = a.raw.empty()?0:a.raw[0];   // StoreRegister
-                         if(r>=(int)registers.size()) registers.resize(r+1);
-                         registers[r]=v; } break;
-            case 0x88: constantPool.clear(); for(auto& str:a.strs) constantPool.push_back(Value(str)); break;  // ConstantPool
-            case 0x96: pushValues(a.pushData, stack, registers, constantPool); break;   // Push
-            case 0x81: CL->gotoAndStop(a.gotoFrame + 1); break;   // GotoFrame（0-based → 1-based）
-            case 0x83: break;   // GetURL（无网络）
-            case 0x8C: { int f = resolveFrame(*this, Value(a.str)); if(f>0) CL->gotoAndPlay(f); } break;  // GotoLabel
-            case 0x8B: break;   // SetTarget
-            case 0x9A: { popV(); popV(); } break;   // GetURL2：pop SendVars 方法 + URL（无网络导航）
-            case 0x99: { auto it=posToIdx.find(a.byteEnd + a.offset);   // Jump
-                         if(it!=posToIdx.end()) { pc=it->second; jumped=true; } else ret=true; } break;
-            case 0x9D: { Value cond=popV();                             // If
-                         if(cond.toBool()){ auto it=posToIdx.find(a.byteEnd + a.offset);
-                             if(it!=posToIdx.end()) { pc=it->second; jumped=true; } else ret=true; } } break;
-            case 0x9F: { bool playFlag = (a.raw.empty()?false:(a.raw[0]&1)!=0);   // GotoFrame2
-                         Value fr=popV(); int f=resolveFrame(*this, fr);
-                         if(f>0){ if(playFlag) CL->gotoAndPlay(f); else CL->gotoAndStop(f); } } break;
-            case 0x9B: case 0x8E: { // DefineFunction[2]：构造函数值压栈；具名则绑定到当前作用域
-                         auto fn=std::make_shared<Avm1Function>();
-                         fn->name=a.funcName; fn->params=a.funcParams; fn->paramRegs=a.funcParamRegs; fn->regCount=a.funcRegCount;
-                         fn->body=disassemble(a.funcBody.data(), a.funcBody.size());
-                         Value fv; fv.type=Value::T::Function; fv.func=fn;
-                         stack.push_back(fv);
-                         if(!a.funcName.empty()){ if(isRoot) globals[a.funcName]=fv; else F.scope[a.funcName]=fv; } } break;
-            case 0x9E: popV(); break;   // Call（帧子程序）：弹帧引用，暂不执行目标帧
-            default:
-                // 未知动作：忽略（不破坏栈，避免误弹）
-                break;
+        {   // M5 注册表优先分派；未注册 opcode 仍走下方 switch（渐进迁移）
+            static const bool inited = (registerAvm1Ops(), true);
+            if (auto* oh = avm1Ops().find(a.code)) {
+                OpResult r = (*oh)(*this, F, a);
+                if (r.jumped) F.pc = r.newPc; else ++F.pc;
+                continue;
+            }
         }
+        switch (a.code) { default: break; }
         if (!jumped) ++pc;
     }
 }
@@ -724,19 +786,10 @@ Value Machine::callFunctionValue(const Value& v, const std::vector<Value>& args)
     static thread_local int s_depth = 0;
     if (s_depth > maxCallDepth) return Value::undef();
 
-    struct LFrame {
-        const Script* script = nullptr;
-        std::vector<Value> stack;
-        std::vector<Value> registers;
-        std::vector<Value> constantPool;
-        std::map<std::string, Value> scope;
-        std::map<int, int> posToIdx;
-        int pc = 0; bool ret = false; Value retValue;
-    };
-    std::vector<LFrame> frames;
+    std::vector<Frame> frames;
     frames.emplace_back();
     {
-        LFrame& f0 = frames.back();
+        Frame& f0 = frames.back();
         f0.script = &v.func->body;
         f0.registers.resize(v.func->regCount > 0 ? v.func->regCount : 0);
         for (size_t i = 0; i < v.func->params.size(); ++i) {
@@ -748,10 +801,12 @@ Value Machine::callFunctionValue(const Value& v, const std::vector<Value>& args)
         for (size_t i = 0; i < f0.script->actions.size(); ++i)
             f0.posToIdx[f0.script->actions[i].bytePos] = (int)i;
     }
+    std::vector<Frame>* saveCS = g_callStack;
+    g_callStack = &frames;
     ++s_depth;
     Value result;
     while (!frames.empty()) {
-        LFrame& F = frames.back();
+        Frame& F = frames.back();
         if (F.ret || F.pc < 0 || F.pc >= (int)F.script->actions.size()) {
             Value rv = F.retValue;
             frames.pop_back();
@@ -759,170 +814,16 @@ Value Machine::callFunctionValue(const Value& v, const std::vector<Value>& args)
             else result = rv;
             continue;
         }
-        std::vector<Value>& stack = F.stack;
-        auto popV = [&stack]() -> Value {
-            if (stack.empty()) return Value::undef();
-            Value v = stack.back(); stack.erase(stack.end() - 1); return v;
-        };
-        int& pc = F.pc;
-        bool jumped = false;
-        // 无目标的播放控制作用于"当前剪辑"：执行精灵帧脚本时即该精灵，否则主时间轴。
-        ITimeline* CL = currentClip ? currentClip : timeline;
-        const Action& a = F.script->actions[pc];
-        switch (a.code) {
-            case 0x00: F.ret = true; break;
-            case 0x0A: { Value b=popV(); Value c=popV();
-                         bool str=(b.type==Value::T::String||c.type==Value::T::String);
-                         stack.push_back(str?Value(c.toString()+b.toString()):Value(b.toNumber()+c.toNumber()));} break;
-            case 0x0B: { Value b=popV(); Value c=popV(); stack.push_back(Value(c.toNumber()-b.toNumber()));} break;
-            case 0x0C: { Value b=popV(); Value c=popV(); stack.push_back(Value(b.toNumber()*c.toNumber()));} break;
-            case 0x0D: { Value b=popV(); Value c=popV(); double d=b.toNumber(); stack.push_back(Value(d==0?std::nan(""):c.toNumber()/d));} break;
-            case 0x0E: { Value b=popV(); Value c=popV(); stack.push_back(Value(b.toString()==c.toString()));} break;
-            case 0x0F: { Value b=popV(); Value c=popV(); stack.push_back(Value(c.toNumber()<b.toNumber()));} break;
-            case 0x10: { Value b=popV(); Value c=popV(); stack.push_back(Value(b.toBool()&&c.toBool()));} break;
-            case 0x11: { Value b=popV(); Value c=popV(); stack.push_back(Value(b.toBool()||c.toBool()));} break;
-            case 0x12: { Value b=popV(); stack.push_back(Value(!b.toBool()));} break;   // Not
-            case 0x14: { Value b=popV(); stack.push_back(Value((double)b.toString().size()));} break;
-            case 0x17: popV(); break;   // Pop
-            case 0x1C: { Value name=popV(); Value vv;   // GetVariable
-                         if(name.type==Value::T::String){
-                             std::string n=name.str;
-                             if(n.find('.')!=std::string::npos && n!="."){
-                                 if(auto* sob = (IClip*)timeline->resolveClipPath(n)){ stack.push_back(makeIClip(sob)); break; }
-                                 Value pv;
-                                 if(resolveTrailingPath(timeline, n, pv)){ stack.push_back(pv); break; }
-                             }
-                             if(n=="this"){ stack.push_back(currentThis?makeIClip(currentThis):(currentParent?makeIClip(currentParent):makeClip(currentClip?currentClip:timeline))); }
-                             else if(n=="_root"||n=="_global"||n=="_level0"){ stack.push_back(makeClip(timeline)); }
-                             else if(n=="_parent"){ stack.push_back(currentParent?makeIClip(currentParent):Value::undef()); }
-                             else if(isRootVarName(n)){ auto* p=findVar(globals,n); stack.push_back(p?*p:Value::undef()); }
-                             else { auto sit=F.scope.find(n);
-                                 if(sit!=F.scope.end()) stack.push_back(sit->second);
-                                 else if(clipVarGet(*this,n,vv)){ stack.push_back(vv); }
-                                 else { auto* p=findVar(globals,n); stack.push_back(p?*p:Value::undef()); } }
-                         } else stack.push_back(Value::undef()); } break;
-            case 0x1D: { Value val=popV(); Value name=popV();   // SetVariable
-                         if(name.type==Value::T::String){
-                             if(isRootVarName(name.str)) storeVar(globals,name.str,val);
-                             else if(currentThis){ int pid=clipPropByName(name.str);
-                                 if(pid>=0) currentThis->setNumberProp(pid,val.toNumber());
-                                 else clipVarSet(*this,name.str,val);
-                             } else F.scope[name.str]=val;
-                         } } break;
-            case 0x21: { Value b=popV(); Value c=popV(); stack.push_back(Value(c.toString()+b.toString()));} break;
-            case 0x22: { Value idx=popV(); Value tgt=popV(); int i=(int)idx.toNumber();
-                         ITimeline* cl=(tgt.isClip)?(ITimeline*)tgt.clip:(currentClip?currentClip:timeline); Value out=Value::undef();
-                         switch(i){ case 0: case 1: out=Value(0.0); break; case 2: case 3: out=Value(100.0); break;
-                             case 4: out=Value((double)cl->currentFrame()); break; case 5: out=Value((double)cl->totalFrames()); break;
-                             case 12: out=Value((double)cl->framesLoaded()); break; case 11: out=Value(cl->targetPath()); break;
-                             default: out=Value::undef(); break; }
-                         stack.push_back(out); } break;
-            case 0x26: { Value b=popV(); std::fprintf(stderr, "[AVM1 Trace] %s\n", b.toString().c_str()); } break;
-            case 0x2A: popV(); break;
-            case 0x30: { Value b=popV(); int mx=(int)b.toNumber(); stack.push_back(Value((double)(mx>0?std::rand()%mx:0)));} break;
-            case 0x3D: { // CallFunction
-                         Value name=popV(); Value nargsV=popV();
-                         int nargs=(int)nargsV.toNumber(); if(nargs<0)nargs=0;
-                         std::vector<Value> fargs;
-                         for(int k=0;k<nargs && !stack.empty();++k){ fargs.push_back(stack.back()); stack.erase(stack.end()-1); }
-                         Value fnv;
-                         if(name.type==Value::T::String){
-                             auto sit=F.scope.find(name.str);
-                             if(sit!=F.scope.end()) fnv=sit->second;
-                             else { auto git=globals.find(name.str); if(git!=globals.end()) fnv=git->second; }
-                         }
-                         if(fnv.type==Value::T::Function && fnv.func && frames.size()<(size_t)maxCallDepth){
-                             ++pc;
-                             frames.emplace_back();
-                             LFrame& nf=frames.back();
-                             nf.script=&fnv.func->body;
-                             nf.registers.resize(fnv.func->regCount>0?fnv.func->regCount:0);
-                             for(size_t i=0;i<fnv.func->params.size();++i){
-                                 Value arg=(i<fargs.size())?fargs[i]:Value::undef();
-                                 int reg=(i<fnv.func->paramRegs.size())?fnv.func->paramRegs[i]:0;
-                                 if(reg>0 && reg<(int)nf.registers.size()) nf.registers[reg]=arg;
-                                 else nf.scope[fnv.func->params[i]]=arg;
-                             }
-                             for(size_t i=0;i<nf.script->actions.size();++i)
-                                 nf.posToIdx[nf.script->actions[i].bytePos]=(int)i;
-                             jumped=true;
-                         } else stack.push_back(Value::undef()); } break;
-            case 0x3E: { F.retValue = popV(); F.ret=true; } break;
-            case 0x3C: { Value val=popV(); Value name=popV(); if(name.type==Value::T::String) F.scope[name.str]=val; } break;  // DefineLocal
-            case 0x40: { Value name=popV(); Value nargsV=popV();   // NewObject
-                         int nargs=(int)nargsV.toNumber(); if(nargs<0)nargs=0;
-                         for(int k=0;k<nargs && !stack.empty();++k) popV();
-                         stack.push_back(makeObj(name.toString())); } break;
-            case 0x47: { Value b=popV(); Value c=popV();
-                         bool str=(b.type==Value::T::String||c.type==Value::T::String);
-                         stack.push_back(str?Value(c.toString()+b.toString()):Value(b.toNumber()+c.toNumber()));} break;
-            case 0x48: { Value b=popV(); Value c=popV(); stack.push_back(Value(c.toNumber()<b.toNumber()));} break;
-            case 0x49: { Value b=popV(); Value c=popV();
-                         bool eq;
-                         if(b.type==Value::T::Number && c.type==Value::T::Number) eq=(b.num==c.num);
-                         else if(b.type==Value::T::String || c.type==Value::T::String) eq=(b.toString()==c.toString());
-                         else eq=(b.toNumber()==c.toNumber());
-                         stack.push_back(Value(eq));} break;
-            case 0x4A: { Value b=popV(); stack.push_back(Value(b.toNumber()));} break;
-            case 0x4B: { Value b=popV(); stack.push_back(Value(b.toString()));} break;
-            case 0x4C: if(!stack.empty()) stack.push_back(stack.back()); break;
-            case 0x4D: if(stack.size()>=2){ Value t=stack.back(); stack.back()=*(stack.end()-2); *(stack.end()-2)=t; } break;
-            case 0x4E: { Value name=popV(); Value obj=popV();   // GetMember
-                         if(obj.isClip && name.type==Value::T::String){
-                             std::string n=name.str;
-                             if (obj.iclip){
-                                 if(n=="gotoAndPlay"||n=="gotoAndStop"||n=="play"||n=="stop"||
-                                    n=="nextFrame"||n=="prevFrame"||n=="stopAllSounds"||n=="hitTest"){
-                                     Value m; m.type=Value::T::Object; m.isMethod=true;
-                                     m.methodName=n; m.iclip=obj.iclip; stack.push_back(m); break;
-                                 }
-                                 int pid=clipPropByName(n); Value out; if(pid>=0 && iclipGetProp(obj.iclip,pid,out)){ stack.push_back(out); break; }
-                                 if (void* ch = obj.iclip->findChildClip(n)) { stack.push_back(makeIClip((IClip*)ch)); break; }
-                                 auto it=obj.iclip->members->find(n); if(it!=obj.iclip->members->end()){stack.push_back(it->second);break;}
-                                 stack.push_back(Value::undef()); break; }
-                             ITimeline* t=(ITimeline*)obj.clip;
-                             if(n=="_root"){stack.push_back(makeClip(timeline));break;}
-                             if(n=="_currentframe"){stack.push_back(Value((double)t->currentFrame()));break;}
-                             { auto* gp=findVar(globals,n); if(gp){ stack.push_back(*gp); break; } }
-                             stack.push_back(Value::undef()); break;
-                         }
-                         if(obj.type==Value::T::Object && obj.obj){ auto it=obj.obj->find(name.toString()); if(it!=obj.obj->end()){stack.push_back(it->second);break;} }
-                         if(obj.type==Value::T::String && name.type==Value::T::String && name.str=="length"){ stack.push_back(Value((double)obj.str.size())); break; }
-                         stack.push_back(Value::undef()); } break;
-            case 0x4F: { Value val=popV(); Value name=popV(); Value obj=popV();   // SetMember
-                         if(obj.iclip && name.type==Value::T::String){ int pid=clipPropByName(name.str);
-                             if(pid>=0){ obj.iclip->setNumberProp(pid, val.toNumber()); break; } (*obj.iclip->members)[name.str]=val; break; }
-                         if(obj.isClip && name.type==Value::T::String){ storeVar(globals,name.str,val); break; }
-                         if(obj.type==Value::T::Object && obj.obj){ (*obj.obj)[name.toString()]=val; } } break;
-            case 0x50: { Value b=popV(); stack.push_back(Value(b.toNumber()+1));} break;
-            case 0x51: { Value b=popV(); stack.push_back(Value(b.toNumber()-1));} break;
-            case 0x52: { Value method=popV(); Value object=popV(); Value nargsV=popV();   // CallMethod
-                         int nargs=(int)nargsV.toNumber(); if(nargs<0)nargs=0;
-                         std::vector<Value> args;
-                         for(int k=0;k<nargs && !stack.empty();++k){ args.push_back(stack.back()); stack.erase(stack.end()-1); }
-                         stack.push_back(dispatchMethod(*this, object, method, args)); } break;
-            case 0x81: CL->gotoAndStop(a.gotoFrame + 1); break;
-            case 0x88: F.constantPool.clear(); for(auto& str:a.strs) F.constantPool.push_back(Value(str)); break;
-            case 0x96: pushValues(a.pushData, stack, F.registers, F.constantPool); break;
-            case 0x99: { auto it=F.posToIdx.find(a.byteEnd + a.offset);
-                         if(it!=F.posToIdx.end()){ pc=it->second; jumped=true; } else F.ret=true; } break;
-            case 0x9D: { Value cond=popV();
-                         if(cond.toBool()){ auto it=F.posToIdx.find(a.byteEnd + a.offset);
-                             if(it!=F.posToIdx.end()){ pc=it->second; jumped=true; } else F.ret=true; } } break;
-            case 0x9F: { bool playFlag=(a.raw.empty()?false:(a.raw[0]&1)!=0); Value fr=popV(); int f=resolveFrame(*this,fr);
-                         if(f>0){ if(playFlag) CL->gotoAndPlay(f); else CL->gotoAndStop(f); } } break;
-            case 0x9B: case 0x8E: { // DefineFunction[2]
-                         auto fn2=std::make_shared<Avm1Function>();
-                         fn2->name=a.funcName; fn2->params=a.funcParams; fn2->paramRegs=a.funcParamRegs;
-                         fn2->regCount=a.funcRegCount; fn2->body=disassemble(a.funcBody.data(), a.funcBody.size());
-                         Value fv; fv.type=Value::T::Function; fv.func=fn2;
-                         stack.push_back(fv);
-                         if(!a.funcName.empty()) F.scope[a.funcName]=fv; } break;
-            default: break;   // 未覆盖动作：忽略（事件处理器多为简单赋值/调用）
+        const Action& a = F.script->actions[F.pc];
+        if (auto* oh = avm1Ops().find(a.code)) {
+            OpResult r = (*oh)(*this, F, a);
+            if (r.jumped) F.pc = r.newPc; else ++F.pc;
+            continue;
         }
-        if (!jumped) ++pc;
+        ++F.pc;  // 未注册 opcode：跳过（与原 default: break 语义一致）
     }
     --s_depth;
+    g_callStack = saveCS;
     return result;
 }
 

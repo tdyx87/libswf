@@ -1,6 +1,6 @@
 // PlaceObject3(tag 70) 解析测试（CTest: swfparser_placeobject3）。
 // 验证 PlaceFlag2 位定义（HasBlendMode=0x02 等）与字段顺序：
-// 带 BlendMode 的 PlaceObject3 必须消费该字节，后续 CharacterId 才能对齐（旧实现位错误会错位→角色为空）。
+// 规范顺序为 Depth → CharacterId → ... → BlendMode，CharacterId 必须能正确对齐（旧实现位错误会错位→角色为空）。
 #include "swf/Decoder.hpp"
 
 #include <algorithm>
@@ -67,8 +67,8 @@ int main() {
     po3.push_back(0x02);               // PlaceFlag: HasCharacter
     po3.push_back(0x02);               // PlaceFlag2: HasBlendMode
     po3.push_back(0x01); po3.push_back(0x00);  // depth = 1
-    po3.push_back(0x02);               // BlendMode byte (must be consumed)
     po3.push_back(0x01); po3.push_back(0x00);  // CharacterId = 1
+    po3.push_back(0x02);               // BlendMode byte (must be consumed, 位于 CharacterId 之后)
 
     // body
     std::vector<std::uint8_t> body;

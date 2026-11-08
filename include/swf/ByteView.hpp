@@ -15,9 +15,10 @@ public:
     static constexpr std::size_t kUnknownSize = static_cast<std::size_t>(-1);
 
     ByteView() = default;
-    ByteView(const std::uint8_t* data, std::size_t size) : base_(data), size_(size) {}
+    ByteView(const std::uint8_t* data, std::size_t size)
+        : base_(data), size_(size), limit_(size) {}
     explicit ByteView(const std::vector<std::uint8_t>& buf)
-        : base_(buf.data()), size_(buf.size()) {}
+        : base_(buf.data()), size_(buf.size()), limit_(buf.size()) {}
 
     const std::uint8_t* base() const { return base_; }
     std::size_t pos() const { return pos_; }
@@ -28,14 +29,23 @@ public:
     void mark() { saved_ = pos_; }
     void rewindToMark() { pos_ = saved_; }
 
+    // 软边界：只收紧「可读范围」，不改变 size()/pos() 的绝对偏移语义。
+    // 这样旧解析器里 bv.pos()、base + bv.pos()、doff + len 等表达式无需改动，
+    // 但所有 readUI* 都会被自动限制在当前 tag 内。
+    void setLimit(std::size_t end) { limit_ = end < size_ ? end : size_; }
+    std::size_t limit() const { return limit_; }
+    void noteOverflow() { overflow_ = true; }
+    void clearOverflow() { overflow_ = false; }
+
     std::size_t remaining() const {
-        if (size_ == kUnknownSize) return kUnknownSize;
-        return pos_ < size_ ? size_ - pos_ : 0;
+        if (size_ == kUnknownSize || limit_ == kUnknownSize) return kUnknownSize;
+        return pos_ < limit_ ? limit_ - pos_ : 0;
     }
 
     bool has(std::size_t n) const {
-        if (size_ == kUnknownSize) return true;  // 对应 v5[1] == -1 的“长度未知”分支
-        return pos_ + n <= size_;
+        if (size_ == kUnknownSize || limit_ == kUnknownSize) return true;
+        if (pos_ > limit_) return false;
+        return n <= limit_ - pos_;  // 减法，避免 pos_ + n 回绕
     }
 
     std::uint8_t readUI8() {
@@ -77,12 +87,20 @@ public:
         return c;
     }
 
-    const std::uint8_t* current() const { return base_ + pos_; }
-    void skip(std::size_t n) { pos_ += n; }
+    // pos_ 越过可读范围时返回 one-past-end 指针，避免构造出野指针。
+    const std::uint8_t* current() const {
+        const std::size_t p = (pos_ < limit_) ? pos_ : limit_;
+        return base_ + p;
+    }
+    void skip(std::size_t n) {
+        if (n > static_cast<std::size_t>(-1) - pos_) { pos_ = limit_; return; }
+        pos_ += n;
+    }
 
 private:
     const std::uint8_t* base_ = nullptr;
     std::size_t size_ = 0;
+    std::size_t limit_ = 0;
     std::size_t pos_ = 0;
     std::size_t saved_ = 0;
     bool overflow_ = false;

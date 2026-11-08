@@ -8,6 +8,8 @@
 //   swfparser <file.swf> --render o.png --frame N
 //   swfparser <file.swf> --render-all outdir  导出所有帧为 outdir/frame_000.png ...
 //   swfparser <file.swf> --opcodes        列出 AVM1 操作码表
+#include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -15,10 +17,13 @@
 #include <cstdlib>
 #include <future>
 #include <map>
+#include <memory>
 #include <utility>
 #include <vector>
 
 #include "swf/Avm1Opcodes.hpp"
+#include "swf/Avm2Opcodes.hpp"
+#include "swf/Fvm.hpp"
 #include "swf/Parser.hpp"
 #include "swf/TagCode.hpp"
 #include "swf/Decoder.hpp"
@@ -47,6 +52,7 @@ static void printUsage() {
     std::printf("  swfparser <file.swf> --render out.png [--frame N]   render a frame to PNG\n");
     std::printf("  swfparser <file.swf> --render-all outdir   export every frame as outdir/frame_NNN.png\n");
     std::printf("  swfparser <file.swf> --opcodes            list AVM1 opcode table\n");
+    std::printf("  swfparser --avm2-opcodes                  list AVM2 opcode table + interpreter coverage\n");
     std::printf("  swfparser <file.swf> --list-avm1          disassemble & print AVM1 scripts + audio/video\n");
     std::printf("  swfparser <file.swf> --extract-audio <id> <out>   export a DefineSound to WAV/raw\n");
     std::printf("  swfparser <file.swf> --wav <id> <out.wav>      decode a DefineSound (MP3/Speex/Nellymoser) to WAV\n");
@@ -70,6 +76,49 @@ static void printOpcodes() {
         }
         std::printf("  0x%02X  %-22s %s\n", i, name, handler);
     }
+}
+
+// AVM2 规范 opcode 表 + 解释器覆盖度（S=标准 E=扩展 B=分支 R=返回 V=运行时栈）。
+static void printAvm2Opcodes() {
+    namespace a = swf::avm2;
+    bool impl[256] = {};
+    for (std::uint8_t op : swf::fvm::implementedOpcodes()) impl[op] = true;
+    const auto standard = a::standardOpcodes();
+    std::printf("AVM2 opcode table (avmplus 256-slot numbering; %zu standard opcodes)\n",
+                standard.size());
+    std::printf("  0xNN  mnemonic              operands          stack       flags  impl\n");
+    for (int i = 0; i < 256; ++i) {
+        const a::OpInfo& info = a::opInfo(static_cast<std::uint8_t>(i));
+        if (!info.valid()) continue;
+        std::string flags;
+        flags += (info.flags & a::FlagStandard) ? 'S' : 'E';
+        if (info.flags & a::FlagBranch) flags += 'B';
+        if (info.flags & a::FlagReturn) flags += 'R';
+        if (info.flags & a::FlagThrow) flags += 'T';
+        if (info.flags & a::FlagDebug) flags += 'D';
+        if (info.flags & a::FlagVariableStack) flags += 'V';
+        char stack[48];
+        if (info.variableStack())
+            std::snprintf(stack, sizeof(stack), "%d+%d*n->%d",
+                          info.popBase, info.popPerArg, info.push);
+        else
+            std::snprintf(stack, sizeof(stack), "%d->%d", info.popBase, info.push);
+        std::printf("  0x%02X  %-20s %-16s %-11s %-6s %s\n",
+                    i, info.name, a::operandName(info.operand), stack,
+                    flags.c_str(), impl[i] ? "yes" : "-");
+    }
+    std::size_t missing = 0;
+    std::string missingList;
+    for (std::uint8_t op : standard) {
+        if (impl[op]) continue;
+        char b[16];
+        std::snprintf(b, sizeof(b), " 0x%02X", op);
+        missingList += b;
+        ++missing;
+    }
+    std::printf("\nstandard opcode coverage: %zu/%zu implemented\n",
+                standard.size() - missing, standard.size());
+    if (missing) std::printf("missing:%s\n", missingList.c_str());
 }
 
 // 主时间轴播放控制器：把 AVM1 的 gotoAndPlay/stop 等映射到逐帧渲染。
@@ -186,9 +235,20 @@ static std::future<bool> writePngAsync(std::string path, std::vector<std::uint8_
                       });
 }
 
+// 双缓冲版：缓冲由播放循环持有并复用，避免每帧重新分配整幅 RGBA。
+static std::future<bool> writePngAsync(std::string path,
+                                       std::shared_ptr<std::vector<std::uint8_t>> rgba,
+                                       int W, int H) {
+    return std::async(std::launch::async,
+                      [path = std::move(path), rgba = std::move(rgba), W, H] {
+                          return stbi_write_png(path.c_str(), W, H, 4, rgba->data(), W * 4) != 0;
+                      });
+}
+
 int main(int argc, char** argv) {
     std::string path;
-    bool opcodes = false, render = false, renderAll = false, inspect = false, runAs = false, play = false;
+    bool opcodes = false, avm2Opcodes = false;
+    bool render = false, renderAll = false, inspect = false, runAs = false, play = false;
     bool listAvm1 = false, extractAudio = false, playAvm1 = false;
     bool wav = false, playSound = false, wavStream = false, renderVideo = false;
     bool playGame = false, noRender = false;
@@ -209,6 +269,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--opcodes" || a == "-o") opcodes = true;
+        else if (a == "--avm2-opcodes") avm2Opcodes = true;
         else if (a == "--render" && i + 1 < argc) { render = true; outPath = argv[++i]; }
         else if (a == "--render-all" && i + 1 < argc) { renderAll = true; outDir = argv[++i]; }
         else if (a == "--inspect") inspect = true;
@@ -274,6 +335,7 @@ int main(int argc, char** argv) {
         else path = a;
     }
 
+    if (avm2Opcodes && path.empty()) { printAvm2Opcodes(); return 0; }
     if (opcodes && path.empty()) { printOpcodes(); return 0; }
     if (path.empty()) { printUsage(); return 1; }
 
@@ -297,7 +359,28 @@ int main(int argc, char** argv) {
             up[c.frame + 2] = {c.x, c.y};   // 按住 2 帧后释放
         }
         char fnbuf[512];
-        std::future<bool> pendingPng;   // 上一帧的后台 PNG 编码
+        // 帧序列导出以吞吐优先；zlib 级别 8 对每帧 4MB RGBA 是主要 CPU 开销。
+        // 可用 SWF_PNG_LEVEL 覆盖（例如归档时设 8）。
+        stbi_write_png_compression_level = std::getenv("SWF_PNG_LEVEL")
+            ? std::atoi(std::getenv("SWF_PNG_LEVEL")) : 1;
+        // stb 默认对每行试 5 种 PNG filter 并计算熵择优；帧序列用 None filter 足够，
+        // 省掉约 5 倍的逐行扫描。需要更小体积时设 SWF_PNG_FILTER=-1 恢复自适应。
+        stbi_write_force_png_filter = std::getenv("SWF_PNG_FILTER")
+            ? std::atoi(std::getenv("SWF_PNG_FILTER")) : 0;
+        const bool perf = std::getenv("SWF_PERF") != nullptr;
+        using Clock = std::chrono::steady_clock;
+        double tTick = 0.0, tRender = 0.0, tPng = 0.0;
+        // 多套 RGBA 缓冲轮换：渲染写当前槽时，其它槽可在后台并行编码；
+        // 槽数大于「单帧编码时间 / 单帧渲染时间」即可把 PNG 完全隐藏。
+        int slots = 4;
+        if (const char* se = std::getenv("SWF_PNG_SLOTS")) {
+            const int v = std::atoi(se);
+            if (v >= 1 && v <= 8) slots = v;
+        }
+        std::vector<std::shared_ptr<std::vector<std::uint8_t>>> buffers(
+            static_cast<std::size_t>(slots));
+        for (auto& b : buffers) b = std::make_shared<std::vector<std::uint8_t>>();
+        std::vector<std::future<bool>> pendingPng(static_cast<std::size_t>(slots));
         for (int step = 0; step < playCount; ++step) {
             // 悬停：从指定步开始每帧都重设鼠标位置（显示列表每帧重建，按钮态需持续刷新）。
             for (const auto& hv : hovers)
@@ -318,16 +401,32 @@ int main(int argc, char** argv) {
             if (u != up.end()) { player.setMouse(u->second.first, u->second.second); player.mouseUp(); }
             for (const auto& kv : keys)
                 if (kv.first == step) player.keyDown(kv.second);
+            auto t0 = Clock::now();
             player.tick();
-            std::vector<std::uint8_t> rgba; int W = 0, H = 0;
-            if (player.render(rgba, W, H, targetW, targetH)) {
-                std::snprintf(fnbuf, sizeof(fnbuf), "%s/p_%04d.png", outDir.c_str(), step);
-                if (pendingPng.valid()) pendingPng.get();   // 等上一帧编码完成再复用缓冲
-                pendingPng = writePngAsync(fnbuf, std::move(rgba), W, H);
-            }
+            if (perf) tTick += std::chrono::duration<double>(Clock::now() - t0).count();
             std::printf("step=%d frame=%d\n", step, player.currentFrame());
+            if (noRender) continue;
+            const std::size_t s = static_cast<std::size_t>(step % slots);
+            auto& cur = buffers[s];
+            // 该槽位上一次（slots 帧前）的编码必须先结束，才能覆盖缓冲。
+            if (pendingPng[s].valid()) {
+                auto t1 = Clock::now();
+                pendingPng[s].get();
+                if (perf) tPng += std::chrono::duration<double>(Clock::now() - t1).count();
+            }
+            int W = 0, H = 0;
+            auto t2 = Clock::now();
+            const bool ok = player.render(*cur, W, H, targetW, targetH);
+            if (perf) tRender += std::chrono::duration<double>(Clock::now() - t2).count();
+            if (ok) {
+                std::snprintf(fnbuf, sizeof(fnbuf), "%s/p_%04d.png", outDir.c_str(), step);
+                pendingPng[s] = writePngAsync(fnbuf, cur, W, H);
+            }
         }
-        if (pendingPng.valid()) pendingPng.get();   // 收尾：等最后一帧编码落盘
+        for (auto& f : pendingPng) if (f.valid()) f.get();
+        if (perf)
+            std::fprintf(stderr, "[perf] steps=%d tick=%.3fs render=%.3fs png_wait=%.3fs\n",
+                         playCount, tTick, tRender, tPng);
         std::printf("played %d steps -> %s/\n", playCount, outDir.c_str());
         return 0;
     }
@@ -509,6 +608,17 @@ int main(int argc, char** argv) {
             if (!(render || renderAll)) return 0;
         }
 
+        // 含 DoABC 的影片：静态帧列表只反映"设计期"放置，像 service_error_mc 这样由
+        // AS3 首帧脚本控制可见性的对象必须执行脚本，才能与 Flash Player 播放的首帧一致。
+        // 仅首帧启用运行时显示树（第 0 帧初始化 + 一次 tick 执行 addFrameScript(0)），
+        // 其余帧仍按静态帧渲染，避免改变 --render-all / --frame N 的既有语义。
+        bool firstFrameRuntime = false;
+        if ((render || renderAll) && !runAs && !movie.abcFiles.empty()) {
+            auto vms = swf::fvm::runMovieScripts(movie, 0);
+            for (auto& vm : vms) vm->tick();
+            firstFrameRuntime = !movie.runtimeStage.empty();
+        }
+
         if (inspect) {
             std::printf("characters: %zu\n", movie.characters.size());
             for (const auto& kv : movie.characters) {
@@ -614,6 +724,7 @@ int main(int argc, char** argv) {
             char fnbuf[512];
             std::future<bool> pendingPng;
             for (std::size_t f = 0; f < movie.frames.size(); ++f) {
+                if (f > 0 && firstFrameRuntime) movie.runtimeStage.clear();
                 std::snprintf(fnbuf, sizeof(fnbuf), "frame_%03zu.png", f);
                 std::filesystem::path outp = std::filesystem::path(outDir) / fnbuf;
                 std::vector<std::uint8_t> next;
@@ -632,6 +743,7 @@ int main(int argc, char** argv) {
         }
 
         if (frame >= static_cast<int>(movie.frames.size())) frame = 0;
+        if (frame > 0 && firstFrameRuntime) movie.runtimeStage.clear();
         if (!swf::renderMovieToPNG(movie, frame, outPath.c_str())) {
             std::fprintf(stderr, "render failed\n");
             return 1;
@@ -672,6 +784,7 @@ int main(int argc, char** argv) {
         std::printf("  [%5u] %-28s len=%-8u %s\n",
                     t.code, swf::tagName(t.code), t.length, t.note.c_str());
     }
+    if (avm2Opcodes) { std::printf("\n"); printAvm2Opcodes(); }
     if (opcodes) { std::printf("\n"); printOpcodes(); }
     return 0;
 }

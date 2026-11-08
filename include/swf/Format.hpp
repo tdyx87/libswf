@@ -27,10 +27,6 @@ struct SwfHeader {
     }
 };
 
-struct Rect2 {
-    std::int32_t xMin = 0, xMax = 0, yMin = 0, yMax = 0;
-};
-
 // 头之后的 body 结构：RECT(frameSize) + UI16(frameRate) + UI16(frameCount)
 struct SwfBodyHeader {
     Rect frameSize;

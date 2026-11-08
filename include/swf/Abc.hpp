@@ -10,10 +10,12 @@
 namespace swf {
 namespace abc {
 
-// 常量池条目种类
+// method_info.option_detail / trait Slot 默认值使用的 ConstantKind（AVM2 Overview）。
 enum class ConstKind {
-    Int = 0x00, Uint = 0x01, Double = 0x02, String = 0x03,
-    Namespace = 0x04, NsSet = 0x05, Multiname = 0x06, Unsupported = 0x07
+    Undefined = 0x00, Utf8 = 0x01, Decimal = 0x02, Int = 0x03, UInt = 0x04,
+    PrivateNs = 0x05, Double = 0x06, Namespace = 0x08, False = 0x0A,
+    True = 0x0B, Null = 0x0C, PackageNs = 0x16, PackageInternalNs = 0x17,
+    ProtectedNs = 0x18, ExplicitNs = 0x19, StaticProtectedNs = 0x1A
 };
 
 struct NamespaceInfo {
@@ -38,9 +40,10 @@ struct Traits {
     uint8_t  kind = 0;      // Trait_Slot=0, Trait_Method=1, Trait_Getter=2, Trait_Setter=3, Trait_Class=4, Trait_Function=5, Trait_Const=6
     uint32_t typeName = 0;
     uint32_t slotId = 0;
-    uint32_t functionName = 0;  // method/getter/setter: method index
+    uint32_t functionName = 0;  // method/getter/setter: method index；Slot/Const: 默认值常量池索引(vindex)
+    uint8_t  vkind = 0;         // Slot/Const 默认值的常量种类（vkind）
     int      dispId = 0;
-    uint8_t  metadataCount = 0;
+    uint32_t metadataCount = 0;
 };
 
 struct MethodParam {
@@ -49,10 +52,17 @@ struct MethodParam {
     uint32_t typeName = 0;
 };
 
+// 可选参数默认值（method_info 的 option_detail：常量池索引 + 常量种类）
+struct OptionalDefault {
+    uint32_t val = 0;    // 常量池索引
+    uint8_t  kind = 0;   // ConstKind（Int/Uint/Double/String…）
+};
+
 struct MethodInfo {
     uint32_t param_count = 0;
     uint32_t returnType = 0;
     std::vector<MethodParam> params;
+    std::vector<OptionalDefault> optionalDefaults;  // 末尾若干参数的默认值
     uint32_t nameIndex = 0;    // 方法名（常量池索引）
     std::string name;          // 由 nameIndex 解析出的名字（便于查找）
     uint16_t flags = 0;
@@ -75,7 +85,7 @@ struct InstanceInfo {
     uint32_t name = 0;        // multiname
     uint16_t flags = 0;
     uint32_t superClass = 0;  // multiname index
-    uint8_t  protectedNs = 0;
+    uint32_t protectedNs = 0;   // ClassProtectedNs：u30
     std::vector<uint32_t> interfaces;  // multiname
     uint32_t iinit = 0;       // 实例初始化方法 index
     std::vector<Traits> traits;

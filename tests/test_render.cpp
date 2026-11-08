@@ -51,6 +51,9 @@ int main() {
     tg.fontId = 1; tg.glyphIndex = 0;
     tg.color = swf::Color(255, 0, 0, 255);
     tg.x = 0; tg.y = 0; tg.advance = 200;
+    // TEXTRECORD 的 FontHeight 是字形缩放的唯一依据（twips）。
+    // 字形画在 EM square 坐标系里，字号取同样数值即 1:1 映射。
+    tg.fontHeight = static_cast<std::uint16_t>(swf::kFontEmSquare);
     td->glyphs.push_back(tg);
     auto textCh = std::make_shared<swf::Character>();
     textCh->kind = swf::Character::Kind::Text;

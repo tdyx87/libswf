@@ -2,6 +2,7 @@
 #include "swf/Render.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +51,8 @@ struct Paint {
     std::vector<GradientStop> grad;
     Matrix gmat;                // 形状局部 -> 渐变空间（gradientMatrix 的逆）
     float focalX = 0.0f, focalY = 0.0f;  // 焦点渐变焦点（相对渐变中心）
+    std::uint8_t spread = 0;    // GRADIENT SpreadMode：0=Pad 1=Reflect 2=Repeat
+    std::uint8_t interp = 0;    // GRADIENT InterpolationMode：0=sRGB 1=Linear RGB
     const Bitmap* bmp = nullptr;
     Matrix bmat;                // 形状局部 -> 位图像素
     ColorTransform cx;
@@ -57,7 +60,48 @@ struct Paint {
     bool winding = false;
 };
 
-Color sampleGrad(const std::vector<GradientStop>& g, float t) {
+// sRGB <-> 线性光查表。InterpolationMode=LinearRGB 时 Flash 在线性光空间
+// 插值色停、再转回 sRGB；直接用字节域 lerp 会让中间色明显偏暗/偏色
+// （门户页气泡标签的橙→黄→橙渐变即是这种情况）。
+static const std::array<float, 256>& srgbToLinearLut() {
+    static const std::array<float, 256> lut = [] {
+        std::array<float, 256> a{};
+        for (int i = 0; i < 256; ++i) {
+            float c = i / 255.0f;
+            a[static_cast<std::size_t>(i)] =
+                c <= 0.04045f ? c / 12.92f
+                              : std::pow((c + 0.055f) / 1.055f, 2.4f);
+        }
+        return a;
+    }();
+    return lut;
+}
+static const std::array<std::uint8_t, 4097>& linearToSrgbLut() {
+    static const std::array<std::uint8_t, 4097> lut = [] {
+        std::array<std::uint8_t, 4097> a{};
+        for (int i = 0; i <= 4096; ++i) {
+            float l = i / 4096.0f;
+            float c = l <= 0.0031308f ? l * 12.92f
+                                      : 1.055f * std::pow(l, 1.0f / 2.4f) - 0.055f;
+            a[static_cast<std::size_t>(i)] =
+                static_cast<std::uint8_t>(std::max(0.0f, std::min(255.0f, c * 255.0f + 0.5f)));
+        }
+        return a;
+    }();
+    return lut;
+}
+
+// GRADIENT SpreadMode 作用于归一化参数 t（规范：Pad / Reflect / Repeat）。
+inline float applySpread(float t, std::uint8_t mode) {
+    if (mode == 2) return t - std::floor(t);               // Repeat
+    if (mode == 1) {                                        // Reflect
+        float u = t - 2.0f * std::floor(t * 0.5f);          // [0,2)
+        return u > 1.0f ? 2.0f - u : u;
+    }
+    return std::max(0.0f, std::min(1.0f, t));               // Pad（含保留值 3）
+}
+
+Color sampleGrad(const std::vector<GradientStop>& g, float t, bool linearRGB = false) {
     if (g.empty()) return Color(0, 0, 0, 255);
     if (t <= g[0].ratio / 255.0f) return g[0].color;
     if (t >= g.back().ratio / 255.0f) return g.back().color;
@@ -66,6 +110,18 @@ Color sampleGrad(const std::vector<GradientStop>& g, float t) {
             float r0 = g[i - 1].ratio / 255.0f, r1 = g[i].ratio / 255.0f;
             float f = (r1 - r0) > 1e-6f ? (t - r0) / (r1 - r0) : 0.0f;
             const Color& a = g[i - 1].color; const Color& b = g[i].color;
+            if (linearRGB) {
+                const auto& s2l = srgbToLinearLut();
+                const auto& l2s = linearToSrgbLut();
+                auto ch = [&](std::uint8_t x, std::uint8_t y) {
+                    float v = lerp(s2l[x], s2l[y], f);
+                    int k = static_cast<int>(v * 4096.0f + 0.5f);
+                    if (k < 0) k = 0; if (k > 4096) k = 4096;
+                    return l2s[static_cast<std::size_t>(k)];
+                };
+                return Color(ch(a.r, b.r), ch(a.g, b.g), ch(a.b, b.b),
+                             clampU8(static_cast<int>(lerp(a.a, b.a, f))));
+            }
             return Color(clampU8(static_cast<int>(lerp(a.r, b.r, f))),
                          clampU8(static_cast<int>(lerp(a.g, b.g, f))),
                          clampU8(static_cast<int>(lerp(a.b, b.b, f))),
@@ -88,11 +144,12 @@ inline Color paintColorInPaintSpace(const Paint& p, float gx, float gy) {
     // 不是可调参数。
     const float G = 16384.0f;
     Color c = p.solid;
+    const bool linearRGB = (p.interp == 1);
     if (p.kind == FillKind::LinearGradient) {
-        c = sampleGrad(p.grad, std::max(0.0f, std::min(1.0f, (gx + G) / (2.0f * G))));
+        c = sampleGrad(p.grad, applySpread((gx + G) / (2.0f * G), p.spread), linearRGB);
     } else if (p.kind == FillKind::RadialGradient) {
         float r = std::sqrt(gx * gx + gy * gy) / G;
-        c = sampleGrad(p.grad, std::max(0.0f, std::min(1.0f, r)));
+        c = sampleGrad(p.grad, applySpread(r, p.spread), linearRGB);
     } else if (p.kind == FillKind::FocalGradient) {
         gx /= G; gy /= G;                       // 归一化到半径 1
         const float fx = p.focalX, fy = p.focalY;
@@ -113,7 +170,7 @@ inline Color paintColorInPaintSpace(const Paint& p, float gx, float gy) {
                 t = (s > 1e-6f) ? (d / s) : d;
             }
         }
-        c = sampleGrad(p.grad, std::max(0.0f, std::min(1.0f, t)));
+        c = sampleGrad(p.grad, applySpread(t, p.spread), linearRGB);
     } else if (p.kind == FillKind::Bitmap && p.bmp && p.bmp->width) {
         int w = p.bmp->width, h = p.bmp->height;
         float u = gx, v = gy;
@@ -822,6 +879,7 @@ void renderShape(const Shape& shape, const Matrix& world, const ColorTransform& 
         const FillStyle& fs = shape.fillStyles[i];
         Paint p;
         p.kind = fs.kind; p.solid = fs.color; p.cx = cx; p.tiled = fs.tiled;
+        p.spread = fs.spreadMode; p.interp = fs.interpMode;
         p.winding = shape.usesWinding;
         if (fs.kind == FillKind::LinearGradient || fs.kind == FillKind::RadialGradient ||
             fs.kind == FillKind::FocalGradient) {
@@ -923,10 +981,89 @@ static Shape interpolateMorph(const MorphShape& m, float t) {
     t = (t < 0.0f) ? 0.0f : (t > 1.0f ? 1.0f : t);
     if (!m.start) { if (m.end) return *m.end; return s; }
     if (!m.end) return *m.start;
+    // 终止段几何尚未解码时退化为起始形状：Flash 中 Morph 总是可见的，
+    // 让中间帧整体消失比停在起始形状离标准更远。
+    if (m.end->fillEdges.empty() && m.end->fillPaths.empty()) return *m.start;
+    // SWF 规范保证 Morph 两段的边记录一一对应；若终止段解码不完整（边/轮廓/
+    // 点数不一致），截断插值会产生自相交的退化多边形（门户页整块黑斑即由此
+    // 而来），此时整体退化为起始形状，等价于旧行为且无回归。
+    auto contoursMatch = [](const std::vector<std::vector<Contour>>& a,
+                            const std::vector<std::vector<Contour>>& b) {
+        if (a.size() != b.size()) return false;
+        for (std::size_t fi = 0; fi < a.size(); ++fi) {
+            if (a[fi].size() != b[fi].size()) return false;
+            for (std::size_t ci = 0; ci < a[fi].size(); ++ci)
+                if (a[fi][ci].xs.size() != b[fi][ci].xs.size() ||
+                    a[fi][ci].ys.size() != b[fi][ci].ys.size()) return false;
+        }
+        return true;
+    };
+    bool edgesMatch = m.start->fillEdges.size() == m.end->fillEdges.size();
+    for (std::size_t fi = 0; edgesMatch && fi < m.start->fillEdges.size(); ++fi)
+        if (m.start->fillEdges[fi].size() != m.end->fillEdges[fi].size()) edgesMatch = false;
+    if (!edgesMatch ||
+        !contoursMatch(m.start->fillPaths, m.end->fillPaths) ||
+        !contoursMatch(m.start->strokePaths, m.end->strokePaths))
+        return *m.start;
     s.bounds = m.start->bounds;
-    s.fillStyles = m.start->fillStyles;
-    s.lineStyles = m.start->lineStyles;
+    s.usesWinding = m.start->usesWinding;
     s.drawOrder = m.start->drawOrder;
+    // MORPHFILLSTYLE / MORPHLINESTYLE 的样式本身也要插值：颜色、渐变矩阵、
+    // 渐变色停、焦点与线宽。只插值轮廓而沿用起始样式会让中间帧退化成起始
+    // 形状（进度条 Bar 就是因此被迫固定在末帧再手工缩放填充层）。
+    auto mixColor = [&](const Color& a, const Color& b) {
+        return Color(clampU8(static_cast<int>(lerp(a.r, b.r, t))),
+                     clampU8(static_cast<int>(lerp(a.g, b.g, t))),
+                     clampU8(static_cast<int>(lerp(a.b, b.b, t))),
+                     clampU8(static_cast<int>(lerp(a.a, b.a, t))));
+    };
+    auto mixMatrix = [&](const Matrix& a, const Matrix& b) {
+        Matrix r;
+        r.sx = lerp(a.sx, b.sx, t); r.r0 = lerp(a.r0, b.r0, t);
+        r.r1 = lerp(a.r1, b.r1, t); r.sy = lerp(a.sy, b.sy, t);
+        r.tx = lerp(a.tx, b.tx, t); r.ty = lerp(a.ty, b.ty, t);
+        return r;
+    };
+    s.fillStyles = m.start->fillStyles;
+    for (std::size_t i = 0; i < s.fillStyles.size(); ++i) {
+        if (i >= m.end->fillStyles.size()) break;
+        FillStyle& fs = s.fillStyles[i];
+        const FillStyle& fe = m.end->fillStyles[i];
+        if (fs.kind != fe.kind) continue;
+        if (fs.kind == FillKind::Solid) {
+            fs.color = mixColor(fs.color, fe.color);
+        } else if (fs.kind == FillKind::Bitmap) {
+            fs.gradientMatrix = mixMatrix(fs.gradientMatrix, fe.gradientMatrix);
+        } else {
+            fs.gradientMatrix = mixMatrix(fs.gradientMatrix, fe.gradientMatrix);
+            fs.focalX = lerp(fs.focalX, fe.focalX, t);
+            fs.focalY = lerp(fs.focalY, fe.focalY, t);
+            for (std::size_t k = 0; k < fs.gradient.size() && k < fe.gradient.size(); ++k) {
+                fs.gradient[k].ratio = static_cast<std::uint8_t>(
+                    clampU8(static_cast<int>(lerp(fs.gradient[k].ratio, fe.gradient[k].ratio, t))));
+                fs.gradient[k].color = mixColor(fs.gradient[k].color, fe.gradient[k].color);
+            }
+        }
+    }
+    s.lineStyles = m.start->lineStyles;
+    for (std::size_t i = 0; i < s.lineStyles.size() && i < m.end->lineStyles.size(); ++i) {
+        s.lineStyles[i].width = lerp(s.lineStyles[i].width, m.end->lineStyles[i].width, t);
+        s.lineStyles[i].color = mixColor(s.lineStyles[i].color, m.end->lineStyles[i].color);
+    }
+    // 有向边同步插值，否则 fillEdges 为空会退回轮廓启发式，丢失洞/并集的
+    // 非零环绕语义（MORPHSHAPE 的边记录是逐边一一对应的）。
+    s.fillEdges.resize(m.start->fillEdges.size());
+    for (std::size_t fi = 0; fi < s.fillEdges.size(); ++fi) {
+        const auto& a = m.start->fillEdges[fi];
+        const auto& b = (fi < m.end->fillEdges.size()) ? m.end->fillEdges[fi] : a;
+        s.fillEdges[fi].resize(std::min(a.size(), b.size()));
+        for (std::size_t k = 0; k < s.fillEdges[fi].size(); ++k) {
+            FillEdge e = a[k];
+            e.x0 = lerp(a[k].x0, b[k].x0, t); e.y0 = lerp(a[k].y0, b[k].y0, t);
+            e.x1 = lerp(a[k].x1, b[k].x1, t); e.y1 = lerp(a[k].y1, b[k].y1, t);
+            s.fillEdges[fi][k] = e;
+        }
+    }
     s.fillPaths.resize(m.start->fillPaths.size());
     for (std::size_t fi = 0; fi < s.fillPaths.size(); ++fi) {
         const auto& a = m.start->fillPaths[fi];
@@ -1965,35 +2102,374 @@ static void renderDynamicText(const fvm::DisplayObject& d, const Matrix& world,
     }
 }
 
+// 对象局部变换（parent twips -> parent twips）：显示树渲染与裁剪组共用。
+static Matrix displayLocalMatrix(const fvm::DisplayObject& d) {
+    Matrix Lt;
+    if (d.hasFull) {
+        Lt.sx = static_cast<float>(d.fullA);
+        Lt.r0 = static_cast<float>(d.fullB);
+        Lt.r1 = static_cast<float>(d.fullC);
+        Lt.sy = static_cast<float>(d.fullD);
+    } else {
+        double rad = d.rotation * 3.141592653589793 / 180.0;
+        double ca = std::cos(rad), sa = std::sin(rad);
+        Lt.sx  = static_cast<float>(d.scaleX * ca);
+        Lt.r0  = static_cast<float>(-d.scaleX * sa);
+        Lt.r1  = static_cast<float>(d.scaleY * sa);
+        Lt.sy  = static_cast<float>(d.scaleY * ca);
+    }
+    Lt.tx = static_cast<float>(d.x * 20.0);
+    Lt.ty = static_cast<float>(d.y * 20.0);
+    return Lt;
+}
+
+void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Matrix& parent,
+                         const Movie& movie, std::uint8_t* buf, int W, int H,
+                         int frameIndex, float alpha, const ColorTransform& inheritedCx);
+
+// 取出 clipDepth 层用作裁剪区域的形状（通常是文字轮廓/实心遮罩）。
+static const Shape* maskShapeOf(const fvm::DisplayObject& d, const Movie& movie) {
+    if (!d.characterId) return nullptr;
+    auto it = movie.characters.find(d.characterId);
+    if (it == movie.characters.end() || !it->second ||
+        it->second->kind != Character::Kind::Shape || !it->second->shape) return nullptr;
+    return it->second->shape.get();
+}
+
+// AVM2 运行时子显示列表：按 depth 顺序绘制，并对 clipDepth 组做与静态
+// renderItemsWithClip 相同的遮罩合成。品牌门户页的标语渐变色带就是靠
+// 白色文字轮廓遮罩裁成彩色字形，缺了这步会溢出成一整条矩形色块。
+static void renderRuntimeChildren(const std::vector<std::shared_ptr<fvm::DisplayObject>>& children,
+                                  const Matrix& parent, const Movie& movie,
+                                  std::uint8_t* buf, int W, int H, int frameIndex,
+                                  float alpha, const ColorTransform& cx) {
+    const int n = static_cast<int>(children.size());
+    const std::size_t npix = static_cast<std::size_t>(W) * H;
+    int i = 0;
+    while (i < n) {
+        const auto& c = children[static_cast<std::size_t>(i)];
+        if (c && c->clipDepth > 0) {
+            int j = i + 1;
+            while (j < n && children[static_cast<std::size_t>(j)] &&
+                   children[static_cast<std::size_t>(j)]->depth >= 0 &&
+                   children[static_cast<std::size_t>(j)]->depth <= c->clipDepth) ++j;
+            const Shape* ms = maskShapeOf(*c, movie);
+            if (!ms || ms->fillPaths.empty() || j == i + 1) {
+                // 遮罩不可用：保持旧行为（遮罩层本身不绘制，组内对象直接画）
+                for (int q = i + 1; q < j; ++q)
+                    renderDisplayObject(children[static_cast<std::size_t>(q)], parent, movie,
+                                        buf, W, H, frameIndex, alpha, cx);
+                i = j;
+                continue;
+            }
+            Matrix wm = parent.post(displayLocalMatrix(*c));
+            float fbx0 = 1e9f, fby0 = 1e9f, fbx1 = -1e9f, fby1 = -1e9f;
+            for (const auto& contours : ms->fillPaths)
+                for (const auto& ct : contours)
+                    for (int k = 0; k < static_cast<int>(ct.xs.size()); ++k) {
+                        float X, Y; wm.apply(ct.xs[k], ct.ys[k], X, Y);
+                        fbx0 = std::min(fbx0, X); fby0 = std::min(fby0, Y);
+                        fbx1 = std::max(fbx1, X); fby1 = std::max(fby1, Y);
+                    }
+            int bx0 = std::max(0, static_cast<int>(std::floor(fbx0)));
+            int by0 = std::max(0, static_cast<int>(std::floor(fby0)));
+            int bx1 = std::min(W - 1, static_cast<int>(std::ceil(fbx1)));
+            int by1 = std::min(H - 1, static_cast<int>(std::ceil(fby1)));
+            if (bx0 <= bx1 && by0 <= by1) {
+                // 与静态遮罩路径一致：离屏层只清包围盒，合成按行带并行。
+                // 整幅 4MB 零初始化 + 串行逐像素合成是运行时遮罩的主要开销。
+                std::vector<std::uint8_t> mask(npix, 0);
+                std::unique_ptr<std::uint8_t[]> layerBuf(new std::uint8_t[npix * 4]);
+                std::uint8_t* layer = layerBuf.get();
+                const int bw = bx1 - bx0 + 1;
+                for (int y = by0; y <= by1; ++y)
+                    std::memset(layer + (static_cast<std::size_t>(y) * W + bx0) * 4, 0,
+                                static_cast<std::size_t>(bw) * 4);
+                fillMask(ms->fillPaths, wm, mask.data(), W, H);
+                for (int q = i + 1; q < j; ++q) {
+                    const auto& g = children[static_cast<std::size_t>(q)];
+                    if (!g || g->clipDepth > 0) continue;
+                    renderDisplayObject(g, parent, movie, layer, W, H,
+                                        frameIndex, alpha, cx);
+                }
+                parallelBands(by0, by1, [&](int ya, int yb) {
+                    for (int y = ya; y <= yb; ++y) {
+                        std::size_t p = static_cast<std::size_t>(y) * W + bx0;
+                        for (int x = 0; x < bw; ++x, ++p) {
+                            std::uint8_t mv = mask[p];
+                            if (!mv) continue;
+                            const std::uint8_t* s = &layer[p * 4];
+                            std::uint8_t* d = &buf[p * 4];
+                            float sa = (s[3] / 255.0f) * (mv / 255.0f);
+                            if (sa <= 0.0f) continue;
+                            float da = d[3] / 255.0f;
+                            float outA = sa + da * (1.0f - sa);
+                            if (outA <= 0.0f) continue;
+                            d[0] = static_cast<std::uint8_t>((s[0] * sa + d[0] * da * (1.0f - sa)) / outA);
+                            d[1] = static_cast<std::uint8_t>((s[1] * sa + d[1] * da * (1.0f - sa)) / outA);
+                            d[2] = static_cast<std::uint8_t>((s[2] * sa + d[2] * da * (1.0f - sa)) / outA);
+                            d[3] = static_cast<std::uint8_t>(outA * 255.0f);
+                        }
+                    }
+                });
+            }
+            i = j;
+        } else {
+            renderDisplayObject(c, parent, movie, buf, W, H, frameIndex, alpha, cx);
+            ++i;
+        }
+    }
+}
+
+// 纯黑 alpha 渐变（色停 RGB 全为 0、仅靠 alpha 交替）是 SWF 常见的遮罩/闪光层：
+// Flash 用它定义透明度，而不是可见的黑色。把它当普通渐变绘制会铺出实心黑条
+// （品牌门户页标语处的黑块即由此产生），按遮罩语义跳过该对象。
+static bool isAlphaMaskShape(const fvm::DisplayObject& d, const Movie& movie) {
+    if (!d.characterId) return false;
+    auto it = movie.characters.find(d.characterId);
+    if (it == movie.characters.end() || !it->second) return false;
+    // 普通形状与变形形状都可能是纯黑 alpha 遮罩层；Morph 用起始段样式判定
+    // （门户页的闪光扫过层就是 DefineMorphShape 版本，终止段解码后才会画出）。
+    const Shape* shp = nullptr;
+    if (it->second->kind == Character::Kind::Shape && it->second->shape)
+        shp = it->second->shape.get();
+    else if (it->second->kind == Character::Kind::Morph && it->second->morph &&
+             it->second->morph->start)
+        shp = it->second->morph->start.get();
+    if (!shp) return false;
+    const auto& styles = shp->fillStyles;
+    if (styles.empty()) return false;
+    bool allBlack = true, hasTransparent = false;
+    for (const auto& fs : styles) {
+        if (fs.kind != FillKind::LinearGradient && fs.kind != FillKind::RadialGradient &&
+            fs.kind != FillKind::FocalGradient) return false;
+        if (fs.gradient.empty()) return false;
+        for (const auto& gs : fs.gradient) {
+            if (gs.color.r || gs.color.g || gs.color.b) allBlack = false;
+            if (gs.color.a < 255) hasTransparent = true;
+        }
+    }
+    return allBlack && hasTransparent;
+}
+
+// ---- AS3 Graphics 绘制命令回放（此前 VM 端整组方法为 no-op，动态绘制画不出来）----
+// 命令坐标是对象局部像素；world 把"局部 twips"映射到设备像素（与角色渲染一致），
+// 故局部像素先乘 20 转 twips 再进矩阵。填充用非零环绕（与 Flash UsesFillWindingRule
+// 语义一致，子路径方向自然表达并集/洞）；描边按段生成垂直四边形（无 join/cap，最小可用）。
+static void renderGraphicsInto(const fvm::DisplayObject& d, const Matrix& world,
+                               std::uint8_t* buf, int W, int H,
+                               float alphaMul, BlendMode bm) {
+    if (!d.graphics || d.graphics->empty()) return;
+    Matrix Minv;
+    world.invert(Minv);
+    auto toTw = [](double v) { return static_cast<float>(v * 20.0); };
+
+    std::vector<FillEdge> group;                 // 当前填充组的全部有向边（多子路径共存）
+    std::vector<std::pair<float, float>> cur;    // 进行中的子路径（局部 twips）
+    bool fillOn = false;
+    float fillAlpha = 1.0f;
+    Paint fillPaint; fillPaint.kind = FillKind::Solid; fillPaint.winding = true;
+    float strokeW = 0.0f;                        // 局部 twips；<=0/NaN = 无描边
+    float strokeAlpha = 1.0f;
+    Paint strokePaint; strokePaint.kind = FillKind::Solid; strokePaint.winding = true;
+
+    auto setPaint = [](Paint& p, std::uint32_t argb) {
+        p.solid = Color(static_cast<std::uint8_t>((argb >> 16) & 0xFF),
+                        static_cast<std::uint8_t>((argb >> 8) & 0xFF),
+                        static_cast<std::uint8_t>(argb & 0xFF),
+                        static_cast<std::uint8_t>(argb >> 24));
+    };
+    auto closeSubpath = [&]() {
+        if (cur.size() >= 3) {
+            const std::size_t n = cur.size();
+            for (std::size_t i = 0; i < n; ++i) {
+                const auto& a = cur[i];
+                const auto& b = cur[(i + 1) % n];
+                group.push_back({a.first, a.second, b.first, b.second, 1});
+            }
+        }
+        cur.clear();
+    };
+    auto flushFill = [&]() {
+        closeSubpath();
+        if (fillOn && !group.empty())
+            fillEdgesWinding(group, world, Minv, fillPaint, buf, W, H,
+                             alphaMul * fillAlpha, bm);
+        group.clear();
+        fillOn = false;
+    };
+    auto strokeSeg = [&](float x0, float y0, float x1, float y1) {
+        if (!(strokeW > 0.0f)) return;
+        const float dx = x1 - x0, dy = y1 - y0;
+        const float len = std::sqrt(dx * dx + dy * dy);
+        if (len <= 1e-6f) return;
+        const float nx = -dy / len * strokeW * 0.5f, ny = dx / len * strokeW * 0.5f;
+        const float px[4] = {x0 + nx, y0 + ny, x1 + nx, y1 + ny};
+        const float py[4] = {y0 + ny, y1 + ny, y1 - ny, y0 - ny};
+        std::vector<FillEdge> quad;
+        quad.reserve(4);
+        for (int i = 0; i < 4; ++i) {
+            const int j = (i + 1) & 3;
+            quad.push_back({px[i], py[i], px[j], py[j], 1});
+        }
+        fillEdgesWinding(quad, world, Minv, strokePaint, buf, W, H,
+                         alphaMul * strokeAlpha, bm);
+    };
+    auto lineToPt = [&](float x, float y) {
+        if (cur.empty()) { cur.emplace_back(x, y); return; }
+        const auto p = cur.back();
+        if (strokeW > 0.0f) strokeSeg(p.first, p.second, x, y);
+        cur.emplace_back(x, y);
+    };
+    auto addLoop = [&](const std::vector<std::pair<float, float>>& pts) {
+        if (pts.size() < 3) return;
+        for (std::size_t i = 0; i < pts.size(); ++i) {
+            const auto& a = pts[i];
+            const auto& b = pts[(i + 1) % pts.size()];
+            group.push_back({a.first, a.second, b.first, b.second, 1});
+        }
+    };
+    auto ellipseLoop = [&](float cx, float cy, float rx, float ry) {
+        if (rx <= 0 || ry <= 0) return;
+        std::vector<std::pair<float, float>> pts;
+        pts.reserve(40);
+        const int N = 40;
+        for (int i = 0; i < N; ++i) {
+            const float ang = static_cast<float>(i) * 6.28318530718f / N;
+            pts.emplace_back(cx + std::cos(ang) * rx, cy + std::sin(ang) * ry);
+        }
+        addLoop(pts);
+    };
+
+    for (const auto& cmd : *d.graphics) {
+        switch (cmd.op) {
+            case fvm::GraphicsCmd::Op::BeginFill:
+                closeSubpath();
+                group.clear();
+                fillOn = true;
+                setPaint(fillPaint, cmd.color);
+                fillAlpha = static_cast<float>(cmd.color >> 24) / 255.0f;
+                break;
+            case fvm::GraphicsCmd::Op::EndFill:
+                flushFill();
+                break;
+            case fvm::GraphicsCmd::Op::LineStyle:
+                strokeW = (cmd.a == cmd.a && cmd.a > 0.0) ? toTw(cmd.a) : 0.0f;
+                setPaint(strokePaint, cmd.color);
+                strokeAlpha = static_cast<float>(cmd.color >> 24) / 255.0f;
+                break;
+            case fvm::GraphicsCmd::Op::MoveTo:
+                closeSubpath();
+                cur.emplace_back(toTw(cmd.x), toTw(cmd.y));
+                break;
+            case fvm::GraphicsCmd::Op::LineTo:
+                lineToPt(toTw(cmd.x), toTw(cmd.y));
+                break;
+            case fvm::GraphicsCmd::Op::CurveTo: {
+                float x0 = 0, y0 = 0;
+                if (!cur.empty()) { x0 = cur.back().first; y0 = cur.back().second; }
+                const int N = 12;
+                for (int i = 1; i <= N; ++i) {
+                    const float t = static_cast<float>(i) / N;
+                    const float u = 1.0f - t;
+                    lineToPt(u * u * x0 + 2 * u * t * toTw(cmd.cx) + t * t * toTw(cmd.x),
+                             u * u * y0 + 2 * u * t * toTw(cmd.cy) + t * t * toTw(cmd.y));
+                }
+                break;
+            }
+            case fvm::GraphicsCmd::Op::Rect: {
+                closeSubpath();
+                const float x = toTw(cmd.x), y = toTw(cmd.y);
+                const float x1 = toTw(cmd.x + cmd.w), y1 = toTw(cmd.y + cmd.h);
+                addLoop({{x, y}, {x1, y}, {x1, y1}, {x, y1}});
+                break;
+            }
+            case fvm::GraphicsCmd::Op::RoundRect: {
+                closeSubpath();
+                const float x = toTw(cmd.x), y = toTw(cmd.y);
+                const float x1 = toTw(cmd.x + cmd.w), y1 = toTw(cmd.y + cmd.h);
+                const float r = toTw(cmd.r);
+                const float rx = std::min(r, (x1 - x) * 0.5f), ry = std::min(r, (y1 - y) * 0.5f);
+                if (rx <= 0 || ry <= 0) {
+                    addLoop({{x, y}, {x1, y}, {x1, y1}, {x, y1}});
+                    break;
+                }
+                std::vector<std::pair<float, float>> pts;
+                auto arc = [&](float acx, float acy, float a0, float a1) {
+                    const int N = 8;
+                    for (int i = 0; i <= N; ++i) {
+                        const float ang = a0 + (a1 - a0) * i / N;
+                        pts.emplace_back(acx + std::cos(ang) * rx, acy + std::sin(ang) * ry);
+                    }
+                };
+                arc(x1 - rx, y + ry, -1.57079632679f, 0.0f);
+                arc(x1 - rx, y1 - ry, 0.0f, 1.57079632679f);
+                arc(x + rx, y1 - ry, 1.57079632679f, 3.14159265359f);
+                arc(x + rx, y + ry, 3.14159265359f, 4.71238898038f);
+                addLoop(pts);
+                break;
+            }
+            case fvm::GraphicsCmd::Op::Circle:
+                closeSubpath();
+                ellipseLoop(toTw(cmd.x), toTw(cmd.y), toTw(cmd.r), toTw(cmd.r));
+                break;
+            case fvm::GraphicsCmd::Op::Ellipse:
+                closeSubpath();
+                ellipseLoop(toTw(cmd.x + cmd.w * 0.5), toTw(cmd.y + cmd.h * 0.5),
+                            toTw(cmd.w * 0.5), toTw(cmd.h * 0.5));
+                break;
+        }
+    }
+    flushFill();   // 命令流结束仍在填充中：Flash 语义会隐式提交
+}
+
+// 临时诊断：当前 renderFrameWithItems 调用序号（按输出帧计）。
+static int g_dbgRenderCall = 0;
+
 // AVM2 运行时显示列表（AS3 构建的场景）的渲染。
 // parent：父级把"角色局部 twips"映射为设备像素的仿射矩阵；
 // DisplayObject 的 x/y 单位 = 父级局部空间的像素（20 twips），scale/rotation 分解自其变换矩阵。
-void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Matrix& parent,
-                         const Movie& movie, std::uint8_t* buf, int W, int H,
-                         int frameIndex, float alpha = 1.0f,
-                         const ColorTransform& inheritedCx = ColorTransform{}) {
+static void renderDisplayObjectImpl(const std::shared_ptr<fvm::DisplayObject>& d, const Matrix& parent,
+                                    const Movie& movie, std::uint8_t* buf, int W, int H,
+                                    int frameIndex, float alpha,
+                                    const ColorTransform& inheritedCx) {
+    if (d && g_dbgRenderCall == 180 && std::getenv("SWF_RENDER_DBG") &&
+        (d->characterId == 370 || d->characterId == 372)) {
+        static int _ln = 0;
+        if (_ln < 12) {
+            std::fprintf(stderr,
+                         "[leaf] cid=%d depth=%d vis=%d clip=%u a=%.2f built=%d mask=%d filt=%d "
+                         "x=%.1f y=%.1f sx=%.3f sy=%.3f kids=%zu\n",
+                         d->characterId, d->depth, (int)d->visible, d->clipDepth, d->alpha,
+                         (int)d->timelineBuilt, (int)isAlphaMaskShape(*d, movie),
+                         (int)(d->filters && !d->filters->empty()), d->x, d->y,
+                         d->scaleX, d->scaleY, d->children.size());
+            ++_ln;
+        }
+    }
     if (!d || !d->visible) return;
+    // 带 clipDepth 的层是遮罩：Flash 只把它当作裁剪区域，自身不绘制。
+    // 运行时显示树此前丢了该字段，preloader 头像的黑色渐变遮罩会被画成实心黑块。
+    if (d->clipDepth > 0) return;
+    if (isAlphaMaskShape(*d, movie)) return;
     // 对象局部变换（parent twips -> parent twips）。
     // 时间轴放置的对象直接沿用 PlaceObject 的完整 2x2（hasFull），保留错切/旋转的
     // 非正交分量；仅 AS3 动态创建/改写 scaleX/scaleY/rotation 的对象才走分解模型。
-    Matrix Lt;
-    if (d->hasFull) {
-        Lt.sx = static_cast<float>(d->fullA);
-        Lt.r0 = static_cast<float>(d->fullB);
-        Lt.r1 = static_cast<float>(d->fullC);
-        Lt.sy = static_cast<float>(d->fullD);
-    } else {
-        double rad = d->rotation * 3.141592653589793 / 180.0;
-        double ca = std::cos(rad), sa = std::sin(rad);
-        Lt.sx  = static_cast<float>(d->scaleX * ca);
-        Lt.r0  = static_cast<float>(-d->scaleX * sa);
-        Lt.r1  = static_cast<float>(d->scaleY * sa);
-        Lt.sy  = static_cast<float>(d->scaleY * ca);
-    }
-    Lt.tx  = static_cast<float>(d->x * 20.0);
-    Lt.ty  = static_cast<float>(d->y * 20.0);
-    Matrix world = parent.post(Lt);          // 角色局部 twips -> 设备像素
+    Matrix world = parent.post(displayLocalMatrix(*d));   // 角色局部 twips -> 设备像素
     float a = alpha * static_cast<float>(d->alpha);
+    if (g_dbgRenderCall == 180 && std::getenv("SWF_RENDER_DBG") &&
+        (d->characterId == 366 || d->characterId == 369 || d->characterId == 378 ||
+         d->characterId == 381 || d->characterId == 385 || d->characterId == 386)) {
+        static int _sn = 0;
+        if (_sn < 30) {
+            std::fprintf(stderr, "[spr] cid=%d depth=%d pos=(%.1f,%.1f) scale=%.4f a=%.2f cf=%d built=%d fi=%d\n",
+                         d->characterId, d->depth, world.tx, world.ty,
+                         std::sqrt(static_cast<double>(world.sx) * world.sx +
+                                   static_cast<double>(world.r1) * world.r1), a,
+                         d->currentFrame, (int)d->timelineBuilt, frameIndex);
+            ++_sn;
+        }
+    }
     // 本对象最终 ColorTransform = 祖先累积 ∘ 自身（ma 已并入 alpha，避免重复应用）
     ColorTransform ownCx;
     ownCx.hasMult = true; ownCx.hasAdd = true;
@@ -2013,21 +2489,95 @@ void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Mat
             di.characterId = d->characterId;
             di.character = it->second;
             di.buttonState = d->buttonState;   // 按钮悬停/按下态
+            di.ratio = d->ratio;              // Morph 形状补间比例
             di.matrix = Matrix{};            // 单位矩阵：world 已含对象变换
             di.cxform = cx;                  // 祖先累积 + 自身调色
+            if (d->hasTextOverride) {        // 运行时数值覆盖时间轴 EditText 的初始文本
+                di.textOverride = d->textOverride;
+                di.hasTextOverride = true;
+            }
             // MovieClip 用自己的 currentFrame（动画），其余用外层帧号
             int fIdx = (d->kind == fvm::ObjKind::MovieClip && d->currentFrame > 0)
                            ? d->currentFrame : frameIndex;
+            if (g_dbgRenderCall == 180 && std::getenv("SWF_RENDER_DBG") &&
+                (d->characterId == 370 || d->characterId == 372)) {
+                static int _gn = 0;
+                if (_gn < 8) {
+                    const Shape* shp = nullptr;
+                    if (it->second->kind == Character::Kind::Shape && it->second->shape)
+                        shp = it->second->shape.get();
+                    else if (it->second->kind == Character::Kind::Morph && it->second->morph)
+                        shp = it->second->morph->start.get();
+                    float px = 0, py = 0;
+                    world.apply(0, 0, px, py);
+                    std::fprintf(stderr,
+                                 "[geo] cid=%d ratio=%.2f a=%.2f world=(%.4f,%.4f,%.4f,%.4f,%.1f,%.1f) "
+                                 "screen=(%.1f,%.1f) shp=%d fills=%zu paths=%zu edges=%zu strokes=%zu "
+                                 "bounds=(%.0f,%.0f)-(%.0f,%.0f)\n",
+                                 d->characterId, d->ratio, a, world.sx, world.r0, world.r1,
+                                 world.sy, world.tx, world.ty, px, py, (int)(shp != nullptr),
+                                 shp ? shp->fillStyles.size() : 0,
+                                 shp ? shp->fillPaths.size() : 0,
+                                 shp ? shp->fillEdges.size() : 0,
+                                 shp ? shp->strokePaths.size() : 0,
+                                 shp ? static_cast<double>(shp->bounds.x0) : 0.0,
+                                 shp ? static_cast<double>(shp->bounds.y0) : 0.0,
+                                 shp ? static_cast<double>(shp->bounds.x1) : 0.0,
+                                 shp ? static_cast<double>(shp->bounds.y1) : 0.0);
+                    ++_gn;
+                }
+            }
+            const bool dbgPix = g_dbgRenderCall == 180 && std::getenv("SWF_RENDER_DBG") &&
+                                (d->characterId == 370 || d->characterId == 372);
+            long long s0 = 0;
+            if (dbgPix) {
+                for (std::size_t k = 0; k < static_cast<std::size_t>(W) * H * 4; k += 97) s0 += buf[k];
+            }
             renderItemInto(di, world, movie.characters, buf, W, H, fIdx, a, d->blend);
+            if (dbgPix) {
+                long long s1 = 0;
+                for (std::size_t k = 0; k < static_cast<std::size_t>(W) * H * 4; k += 97) s1 += buf[k];
+                static int _pn = 0;
+                if (_pn < 10) { std::fprintf(stderr, "[pix] cid=%d delta=%lld\n", d->characterId, s1 - s0); ++_pn; }
+            }
         }
     }
+    // AS3 Graphics 绘制命令回放（对象自身内容，位于运行时文本与子对象之下）
+    if (d->graphics && !d->graphics->empty())
+        renderGraphicsInto(*d, world, buf, W, H, a, d->blend);
     if (d->hasText && !d->textData.empty())
         renderDynamicText(*d, world, movie, buf, W, H, a);
-    for (const auto& c : d->children)
-        renderDisplayObject(c, world, movie, buf, W, H, frameIndex, a, cx);
+    renderRuntimeChildren(d->children, world, movie, buf, W, H, frameIndex, a, cx);
+}
+
+// PlaceObject3 FilterList 在运行时显示树同样要生效：把对象（含整棵子树）画进
+// 离屏层，应用滤镜后再合成。静态 renderItemsWithClip 早已如此处理，此前只有
+// 运行时路径丢失，导致 AVM2 场景里的发光/投影/模糊全部消失。
+void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Matrix& parent,
+                         const Movie& movie, std::uint8_t* buf, int W, int H,
+                         int frameIndex, float alpha = 1.0f,
+                         const ColorTransform& inheritedCx = ColorTransform{}) {
+    if (!d) return;
+    if (d->filters && !d->filters->empty()) {
+        const std::size_t npix = static_cast<std::size_t>(W) * H;
+        std::vector<std::uint8_t> layer(npix * 4, 0);
+        renderDisplayObjectImpl(d, parent, movie, layer.data(), W, H,
+                                frameIndex, alpha, inheritedCx);
+        applyFilters(*d->filters, layer, buf, W, H, npix);
+        return;
+    }
+    renderDisplayObjectImpl(d, parent, movie, buf, W, H, frameIndex, alpha, inheritedCx);
 }
 
 }  // namespace
+
+// 渲染单个 AVM2 运行时显示对象（含其子树）到 RGBA 缓冲。公开入口（测试/内嵌使用）：
+// Graphics 命令回放、运行时文本与子树递归均在匿名命名空间的 renderDisplayObject 中完成。
+void renderRuntimeObject(const std::shared_ptr<fvm::DisplayObject>& d, const Matrix& parent,
+                         const Movie& movie, std::uint8_t* buf, int W, int H,
+                         int frameIndex, float alpha) {
+    renderDisplayObject(d, parent, movie, buf, W, H, frameIndex, alpha);
+}
 
 // 计算输出画布与根变换。targetW/H > 0 时按设备尺寸重新光栅化：根变换在
 // twips->px 的 1/20 之上再乘显示缩放，所有矢量边缘/字形轮廓都按新分辨率扫描填充，
@@ -2057,7 +2607,8 @@ bool renderMovieToBuffer(const Movie& movie, int frameIndex,
     std::size_t npix = 0;
     Matrix root;
     setupSurface(movie, targetW, targetH, W, H, root, npix);
-    out.assign(npix * 4, 0);
+    // resize 而非 assign：紧随其后的背景填充会覆盖每个像素，省掉一次整幅清零。
+    out.resize(npix * 4);
 
     // 背景
     Color bg = movie.backgroundColor;
@@ -2078,8 +2629,8 @@ bool renderMovieToBuffer(const Movie& movie, int frameIndex,
         Matrix rootM;                     // 角色局部 twips -> 设备像素
         rootM.sx = root.sx; rootM.sy = root.sy;
         rootM.tx = root.tx; rootM.ty = root.ty;
-        for (const auto& d : movie.runtimeStage)
-            renderDisplayObject(d, rootM, movie, out.data(), W, H, frameIndex);
+        renderRuntimeChildren(movie.runtimeStage, rootM, movie, out.data(), W, H,
+                              frameIndex, 1.0f, ColorTransform{});
     }
     return true;
 }
@@ -2095,10 +2646,12 @@ bool renderFrameWithItems(const Movie& movie, const std::vector<DisplayItem>& it
                           int frameIndex,
                           std::vector<std::uint8_t>& out, int& W, int& H,
                           int targetW, int targetH) {
+    ++g_dbgRenderCall;
     std::size_t npix = 0;
     Matrix root;
     setupSurface(movie, targetW, targetH, W, H, root, npix);
-    out.assign(npix * 4, 0);
+    // resize 而非 assign：紧随其后的背景填充会覆盖每个像素，省掉一次整幅清零。
+    out.resize(npix * 4);
     Color bg = movie.backgroundColor;
     for (int i = 0; i < static_cast<int>(npix); ++i) {
         out[i * 4 + 0] = bg.r; out[i * 4 + 1] = bg.g; out[i * 4 + 2] = bg.b; out[i * 4 + 3] = bg.a;
@@ -2111,8 +2664,31 @@ bool renderFrameWithItems(const Movie& movie, const std::vector<DisplayItem>& it
     if (!movie.runtimeStage.empty()) {
         Matrix rootM; rootM.sx = root.sx; rootM.sy = root.sy;
         rootM.tx = root.tx; rootM.ty = root.ty;
-        for (const auto& d : movie.runtimeStage)
-            renderDisplayObject(d, rootM, movie, out.data(), W, H, frameIndex);
+        if (std::getenv("SWF_RENDER_DBG")) {
+            if (g_dbgRenderCall == 30 || g_dbgRenderCall == 180) {
+                int n386 = 0, n378 = 0, n370 = 0, n372 = 0, nodes = 0, negDepth = 0;
+                std::map<int, int> hist;
+                std::function<void(const fvm::DisplayObject&, int)> scan =
+                    [&](const fvm::DisplayObject& o, int lv) {
+                        ++nodes;
+                        if (o.depth < 0) ++negDepth;
+                        if (o.characterId >= 360) ++hist[o.characterId];
+                        if (o.characterId == 386) ++n386;
+                        if (o.characterId == 378) ++n378;
+                        if (o.characterId == 370) ++n370;
+                        if (o.characterId == 372) ++n372;
+                        if (lv > 9) return;
+                        for (const auto& c : o.children) if (c) scan(*c, lv + 1);
+                    };
+                for (const auto& r : movie.runtimeStage) if (r) scan(*r, 0);
+                std::fprintf(stderr, "[rtree] call=%d roots=%zu nodes=%d negDepth=%d c386=%d c378=%d c370=%d c372=%d\n",
+                             g_dbgRenderCall, movie.runtimeStage.size(), nodes, negDepth, n386, n378, n370, n372);
+                for (const auto& kv : hist)
+                    std::fprintf(stderr, "[hist] cid=%d n=%d\n", kv.first, kv.second);
+            }
+        }
+        renderRuntimeChildren(movie.runtimeStage, rootM, movie, out.data(), W, H,
+                              frameIndex, 1.0f, ColorTransform{});
     }
     return true;
 }

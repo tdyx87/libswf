@@ -5,6 +5,7 @@
 
 #include "swf/BitReader.hpp"
 #include "swf/Decompress.hpp"
+#include "swf/TagReader.hpp"
 
 namespace swf {
 
@@ -26,51 +27,30 @@ std::size_t ParseResult::definitionTagCount() const {
 // 数据不足则回滚游标并返回 -1；越界返回 -2
 int Parser::readTagHeader(const std::uint8_t* data, std::size_t pos, std::size_t avail,
                           TagHeader& th) {
-    if (pos + 2 > avail) {
-        if (pos + 2 > avail && avail >= pos) return -1;  // 需要更多数据
-        return -2;
-    }
-    std::uint16_t v = static_cast<std::uint16_t>(data[pos] | (data[pos + 1] << 8));
-    std::uint32_t len = v & 0x3F;
-    std::size_t cursor = pos + 2;
-
-    if (len == 63) {
-        if (cursor + 4 > avail) return -1;  // 回滚由调用方保持 pos 不变
-        len = static_cast<std::uint32_t>(data[cursor])
-            | (static_cast<std::uint32_t>(data[cursor + 1]) << 8)
-            | (static_cast<std::uint32_t>(data[cursor + 2]) << 16)
-            | (static_cast<std::uint32_t>(data[cursor + 3]) << 24);
-        cursor += 4;
-    }
-    if (cursor + len > avail) return -1;
-
-    th.code = static_cast<std::uint16_t>(v >> 6);
-    th.length = len;
-    th.dataOffset = cursor;
-    th.dataEnd = cursor + len;
-    return 0;
+    // 唯一实现放在 swf::readTagHeader，Decoder 复用同一份，避免两套分叉。
+    return swf::readTagHeader(data, pos, avail, th) == TagStatus::Ok ? 0 : -1;
 }
 
 // sub_48BA50 的标签分派（此处做浅解析，仅还原逆向确认的字段）
 void Parser::dispatch(const std::uint8_t* data, std::size_t avail, TagInfo& info) {
     const std::size_t off = info.dataOffset;
     const std::uint32_t len = info.length;
-    if (off + len > avail) return;
+    if (off > avail || len > avail - off) return;
 
-    ByteView bv(data, off + len);
-    bv.seek(off);
+    // Strategy 化的浅解析同样只拿 tag 边界视图，越界读取自动返回 0 并留痕。
+    TagReader r(data + off, len, info.code);
 
     switch (info.code) {
         case 9: {  // SetBackgroundColor：sub_47A7A0 读 RGB
-            auto c = bv.readRGBA(false);
+            auto c = r.readRGBA(false);
             char buf[64];
             std::snprintf(buf, sizeof(buf), "RGB(#%02X%02X%02X)", c.r, c.g, c.b);
             info.note = buf;
             break;
         }
         case 2: case 22: case 32: case 83: {  // DefineShape*
-            info.shapeId = bv.readUI16();
-            BitReader br(bv);
+            info.shapeId = r.readUI16();
+            BitReader br(r.bytes());
             info.shapeBounds = readRect(br);
             br.finish();
             char buf[96];
@@ -81,25 +61,83 @@ void Parser::dispatch(const std::uint8_t* data, std::size_t avail, TagInfo& info
             break;
         }
         case 3: {  // FreeCharacter：只读 UI16 的 CharacterID
-            info.shapeId = bv.readUI16();
+            info.shapeId = r.readUI16();
             info.note = "free id=" + std::to_string(info.shapeId);
             break;
         }
         case 69: {  // FileAttributes
-            std::uint32_t flags = bv.readUI32();
+            std::uint32_t flags = r.readUI32();
             info.note = "flags=0x" + std::to_string(flags);
             break;
         }
         case 65: {  // ScriptLimits
-            std::uint16_t depth = bv.readUI16();
-            std::uint16_t timeout = bv.readUI16();
+            std::uint16_t depth = r.readUI16();
+            std::uint16_t timeout = r.readUI16();
             info.note = "depth=" + std::to_string(depth) +
                         " timeout=" + std::to_string(timeout) + "s";
             break;
         }
         case 76: {  // SymbolClass：UI16 count + (UI16 tag, 名称) 序列
-            std::uint16_t count = bv.readUI16();
+            std::uint16_t count = r.readUI16();
             info.note = "symbols=" + std::to_string(count);
+            break;
+        }
+        case 26: {  // PlaceObject2：UI8 flags + UI16 depth + [UI16 cid] + [matrix] + ... + [name]
+            // 浅解析只取 flags/depth/cid/name（SWF 规范 §13.3）；矩阵按位跳过，色变/比率不展开。
+            std::uint8_t flags = r.readUI8();
+            std::uint16_t depth = r.readUI16();
+            std::uint16_t cid = 0;
+            std::string nm;
+            if (flags & 0x02) cid = r.readUI16();
+            if (flags & 0x04) {                     // MATRIX：位域跳过
+                BitReader br(r.bytes());
+                if (br.readUB(1)) {                 // HasScale
+                    int nb = static_cast<int>(br.readUB(5));
+                    (void)br.readSB(nb); (void)br.readSB(nb);
+                }
+                if (br.readUB(1)) {                 // HasRotate
+                    int nb = static_cast<int>(br.readUB(5));
+                    (void)br.readSB(nb); (void)br.readSB(nb);
+                }
+                int nb = static_cast<int>(br.readUB(5));
+                (void)br.readSB(nb); (void)br.readSB(nb);
+                br.finish();
+            }
+            if (flags & 0x08) {                     // CXFORMWITHALPHA：bit 估算长度，直接按
+                BitReader br(r.bytes());            // 规范位域跳过
+                int hasAdd = static_cast<int>(br.readUB(1));
+                int hasMult = static_cast<int>(br.readUB(1));
+                int nb = static_cast<int>(br.readUB(4));
+                int terms = hasMult ? 4 : 0;
+                for (int k = 0; k < terms; ++k) (void)br.readSB(nb);
+                for (int k = 0; k < (hasAdd ? 4 : 0); ++k) (void)br.readSB(nb);
+                br.finish();
+            }
+            if (flags & 0x10) (void)r.readUI16();   // ratio
+            if (flags & 0x20) {                     // name：NUL 结尾字符串
+                while (r.has(1)) {
+                    char ch = static_cast<char>(r.readUI8());
+                    if (ch == '\0') break;
+                    nm.push_back(ch);
+                }
+            }
+            char buf[192];
+            std::snprintf(buf, sizeof(buf), "%s depth=%u char=%u%s%s flags=0x%02X",
+                          (flags & 0x01) ? "move" : "place", depth, cid,
+                          nm.empty() ? "" : " name=\"", nm.c_str(), flags);
+            info.note = buf;
+            break;
+        }
+        case 28: {  // RemoveObject2：UI16 depth
+            std::uint16_t depth = r.readUI16();
+            info.note = "remove depth=" + std::to_string(depth);
+            break;
+        }
+        case 39: {  // DefineSprite：UI16 id + UI16 frameCount + 控制标签序列
+            std::uint16_t id = r.readUI16();
+            std::uint16_t nf = r.readUI16();
+            info.shapeId = id;
+            info.note = "id=" + std::to_string(id) + " frames=" + std::to_string(nf);
             break;
         }
         case 82: {  // DoABC：逆向中仅登记位置，解码推迟到 ShowFrame 前
@@ -107,7 +145,7 @@ void Parser::dispatch(const std::uint8_t* data, std::size_t avail, TagInfo& info
             break;
         }
         case 93: {  // EnableTelemetry：UI16 保留 + 32 字节口令/哈希
-            bv.readUI16();
+            r.readUI16();
             info.note = "telemetry password hash (" + std::to_string(len) + " bytes)";
             break;
         }
@@ -116,11 +154,11 @@ void Parser::dispatch(const std::uint8_t* data, std::size_t avail, TagInfo& info
             break;
         }
         case 60: {  // DefineVideoStream：UI16 id + UI16 numFrames + UI16 W + UI16 H + UI8 VideoFlags
-            std::uint16_t id = bv.readUI16();
-            std::uint16_t nf = bv.readUI16();
-            std::uint16_t w = bv.readUI16();
-            std::uint16_t h = bv.readUI16();
-            std::uint8_t vf = bv.readUI8();
+            std::uint16_t id = r.readUI16();
+            std::uint16_t nf = r.readUI16();
+            std::uint16_t w = r.readUI16();
+            std::uint16_t h = r.readUI16();
+            std::uint8_t vf = r.readUI8();
             static const char* kCodec[] = {"undefined", "reserved", "H.263", "ScreenVideo",
                                            "VP6", "VP6+alpha", "ScreenVideo2", "AVC"};
             std::uint8_t cid = vf & 0x0F;
@@ -132,22 +170,26 @@ void Parser::dispatch(const std::uint8_t* data, std::size_t avail, TagInfo& info
             break;
         }
         case 61: {  // VideoFrame：UI16 StreamID + UI16 FrameNum + 压缩数据
-            std::uint16_t sid = bv.readUI16();
-            std::uint16_t fnum = bv.readUI16();
+            std::uint16_t sid = r.readUI16();
+            std::uint16_t fnum = r.readUI16();
             info.note = "stream=" + std::to_string(sid) + " frame=" + std::to_string(fnum) +
                         " (" + std::to_string(len >= 4 ? len - 4 : 0) + " bytes)";
             break;
         }
         case 14: {  // DefineSound：UI16 SoundID + UI8 flags（格式/采样率/位深/声道）
-            std::uint16_t id = bv.readUI16();
-            std::uint8_t flags = bv.readUI8();
+            std::uint16_t id = r.readUI16();
+            std::uint8_t flags = r.readUI8();
             static const char* kFmt[] = {"Uncompressed", "ADPCM", "MP3", "Nellymoser",
-                                         "PCMLError", "Speex", "", "MP3-8", "", "Nellymoser-16"};
+                                         "PCM-LE", "Speex", "reserved6", "MP3-8",
+                                         "reserved8", "Nellymoser-16"};
+            // 高 4 位可达 15，而表只有 10 项；越界时必须回落到 "unknown"。
+            const std::uint8_t fi = (flags >> 4) & 0x0Fu;
+            const char* fmtName = fi < sizeof(kFmt) / sizeof(kFmt[0]) ? kFmt[fi] : "unknown";
             // SWF 采样率表不是 5512<<n（11024≠11025），必须用精确值
             static const int kRate[4] = {5512, 11025, 22050, 44100};
             char buf[96];
             std::snprintf(buf, sizeof(buf), "id=%u %s %dHz %dbit %dch",
-                          id, kFmt[(flags >> 4) & 0x0F], kRate[(flags >> 2) & 3],
+                          id, fmtName, kRate[(flags >> 2) & 3],
                           ((flags >> 1) & 1) ? 16 : 8, (flags & 1) ? 2 : 1);
             info.note = buf;
             break;
@@ -204,7 +246,7 @@ int Parser::parse(const std::uint8_t* data, std::size_t size, ParseResult& out) 
             ok = inflateZlib(data + 8, size - 8, plain);
             if (!ok) out.error = "zlib inflate failed";
         } else {
-            ok = decodeLzmaAlone(data + 8, size - 8, plain);
+            ok = decodeZws(data + 8, size - 8, plain);
             if (!ok) out.error = "LZMA decode failed or not compiled in";
         }
         if (!ok) return -1;
@@ -240,7 +282,8 @@ int Parser::parse(const std::uint8_t* data, std::size_t size, ParseResult& out) 
 
     // --- sub_48C230：标签循环 ---
     for (;;) {
-        if (pos + 2 > avail) return out.tags.empty() ? -1 : 1;  // 1 = 数据不足待续
+        if (pos > avail || avail - pos < 2)
+            return out.tags.empty() ? -1 : 1;  // 1 = 数据不足待续
         TagHeader th;
         int rc = readTagHeader(base, pos, avail, th);
         if (rc < 0) return rc;
@@ -266,18 +309,27 @@ int Parser::parseFile(const std::string& path, ParseResult& out) {
         out.error = "cannot open file: " + path;
         return -1;
     }
-    std::fseek(f, 0, SEEK_END);
-    long n = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (n <= 0) {
+    if (std::fseek(f, 0, SEEK_END) != 0) {
         std::fclose(f);
         out = ParseResult{};
-        out.error = "empty file";
+        out.error = "seek failed: " + path;
+        return -1;
+    }
+    long n = std::ftell(f);
+    if (n <= 0 || std::fseek(f, 0, SEEK_SET) != 0) {
+        std::fclose(f);
+        out = ParseResult{};
+        out.error = "empty file or seek failed: " + path;
         return -1;
     }
     std::vector<std::uint8_t> buf(static_cast<std::size_t>(n));
     std::size_t got = std::fread(buf.data(), 1, buf.size(), f);
     std::fclose(f);
+    if (got != buf.size()) {
+        out = ParseResult{};
+        out.error = "short read: " + path;
+        return -1;
+    }
     return parse(buf.data(), got, out);
 }
 

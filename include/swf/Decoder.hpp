@@ -46,6 +46,23 @@ struct ColorTransform {
     float mr = 1, mg = 1, mb = 1, ma = 1;     // 乘项（/256）
     float ar = 0, ag = 0, ab = 0, aa = 0;     // 加项（/256）
     Color apply(const Color& c) const;
+    // 组合：this ∘ o（先应用 o 再应用 this），与 Matrix::post 语义一致。
+    // 复合公式：m' = this.m * o.m ；a' = this.m * o.a + this.a
+    //（即 c -> this.m*(o.m*c + o.a) + this.a）。
+    ColorTransform post(const ColorTransform& o) const {
+        ColorTransform r;
+        r.hasMult = hasMult || o.hasMult;
+        r.mr = mr * o.mr;
+        r.mg = mg * o.mg;
+        r.mb = mb * o.mb;
+        r.ma = ma * o.ma;
+        r.hasAdd = hasAdd || o.hasAdd;
+        r.ar = mr * o.ar + ar;
+        r.ag = mg * o.ag + ag;
+        r.ab = mb * o.ab + ab;
+        r.aa = ma * o.aa + aa;
+        return r;
+    }
 };
 
 // ---- 填充样式 ----
@@ -62,6 +79,10 @@ struct FillStyle {
     Matrix gradientMatrix;                  // 渐变/位图用（形状局部坐标 -> 渐变/纹理空间）
     std::vector<GradientStop> gradient;
     float focalX = 0.0f, focalY = 0.0f;     // 焦点渐变焦点（相对渐变中心，归一化半径）
+    // GRADIENT 头 bits 7-6 SpreadMode：0=Pad 1=Reflect 2=Repeat；
+    // bits 5-4 InterpolationMode：0=Normal(sRGB) 1=Linear RGB。
+    std::uint8_t spreadMode = 0;
+    std::uint8_t interpMode = 0;
     std::uint16_t bitmapId = 0;             // 位图填充用
     bool tiled = true;                      // 平铺 / 裁剪
 };
@@ -196,6 +217,12 @@ struct DisplayItem {
     // 只描述"最初放什么"，本字段则承载每帧重建后的实例运行态（rtFrame/按钮态/嵌套子树…），
     // 使嵌套精灵拥有独立播放头、嵌套按钮可被 keyPress 命中。
     std::vector<DisplayItem> children;
+    // ---- 运行期动态实例（AVM1 attachMovie/duplicateMovieClip/createEmptyMovieClip）----
+    // 这些实例不出现在静态帧模板里，逐帧重建显示列表时必须原样保留。
+    bool dynamic = false;
+    // setMask：本实例被同名兄弟实例遮罩（空 = 无遮罩）；遮罩实例自身不绘制。
+    std::string maskName;
+    bool maskSource = false;
 };
 
 // AVM1 ClipEventFlags 事件位（SWF 规范）
@@ -253,7 +280,10 @@ struct ButtonDef {
     std::uint16_t soundUp = 0, soundOver = 0, soundDown = 0, soundOut = 0;
 };
 
-// 字体（DefineFont2/3）：字形轮廓（按字形索引；索引 0 = .notdef）
+// SWF 规范规定 DefineFont2/3 的字形定义在 1024×1024 的 EM square 中。
+constexpr int kFontEmSquare = 1024;
+
+// 字体（DefineFont / DefineFont2/3）：字形轮廓（按字形索引；索引 0 = .notdef）
 struct FontGlyphs {
     // 字体族名（DefineFont2 的 Name 字段 / DefineFontName(88) 补充）。
     // 嵌入字体缺少某字形时，播放器按此名回退到系统（设备）字体渲染该字形。
@@ -261,8 +291,17 @@ struct FontGlyphs {
     bool italic = false;         // DefineFont2/3 FontFlagsItalic / DefineFontInfo Italic
     bool bold = false;           // DefineFont2/3 FontFlagsBold / DefineFontInfo Bold
     std::vector<std::shared_ptr<Shape>> shapes;
-    std::vector<int> advances;   // 每字形前进宽度（twips）
+    // 字形坐标系：DefineFont2/3 用 EM square（规范规定 1024 设计单位）；
+    // DefineFont(10) 直接用 twips，不需要 fontHeight/EM 缩放。
+    int unitsPerEm = kFontEmSquare;
+    bool glyphsInTwips = false;
+    // DefineFont2/3 FontFlagsHasLayout 的布局表（单位与字形 EM square 一致）。
+    bool hasLayout = false;
+    int ascent = 0, descent = 0, leading = 0;
+    std::vector<int> advances;   // 每字形前进宽度（EM 单位 / twips，随坐标系）
     std::map<int, int> codeToGlyph;   // 字符码 -> 字形索引（运行时文本渲染用）
+    // (code1<<16)|code2 -> FontKerningAdjustment（EM 单位）
+    std::map<std::uint32_t, int> kerning;
 };
 
 // 文本中的一个字形放置（DefineText/Text2 解码结果）
@@ -292,11 +331,17 @@ struct EditText {
     RectB bounds;                       // twips
     std::string text;                   // InitialText
     std::uint16_t fontId = 0;           // 使用的字体角色 id
-    std::uint16_t fontHeight = 240;     // 字号（twips）
+    std::uint16_t fontHeight = 0;       // 字号（twips），由 HasFont/HasFontClass 字段给出
     Color color{0, 0, 0, 255};
     bool wordWrap = false, multiline = false, password = false, readonly = false;
     bool border = false, autoSize = false;
     std::uint16_t maxLength = 0;
+    // DefineEditText HasLayout 布局（单位 twips；Align: 0=Left 1=Right 2=Center 3=Justify）
+    bool hasLayout = false;
+    std::uint8_t align = 0;
+    std::uint16_t leftMargin = 0, rightMargin = 0;
+    std::int16_t indent = 0, leading = 0;
+    std::string fontClass;              // HasFontClass 的设备字体类名
     // 绑定的变量名（DefineEditText 末尾的 VariableName 字符串，总是存在）。
     // AVM1 脚本 SetVariable 写入同名变量时，本字段的显示文本应随变量值更新。
     std::string variableName;

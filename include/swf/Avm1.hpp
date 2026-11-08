@@ -94,6 +94,11 @@ struct ITimeline {
     virtual int currentFrame() const = 0;       // 1-based
     virtual int totalFrames() const = 0;
     virtual int framesLoaded() const = 0;
+    // 根时间轴上的 MovieClip 扩展方法（attachMovie/duplicateMovieClip/
+    // createEmptyMovieClip/startDrag/stopDrag/getBounds/setMask）。默认无实现。
+    virtual Value callExt(const std::string& method, const std::vector<Value>& args) {
+        (void)method; (void)args; return Value();
+    }
     // ---- 命名实例查找（_root.<name> / this.<name>）----
     // 返回值为 IClip*（非拥有）；找不到返回 nullptr。
     virtual void* findChildClip(const std::string& name) { (void)name; return nullptr; }
@@ -138,6 +143,10 @@ struct IClip {
     // 缺省实现返回 false（不支持者）。
     virtual bool hitTest(const Value& target, bool shapeFlag) {
         (void)target; (void)shapeFlag; return false;
+    }
+    // 同上（实例剪辑版本）。
+    virtual Value callExt(const std::string& method, const std::vector<Value>& args) {
+        (void)method; (void)args; return Value();
     }
     // 脚本挂载的动态成员（btn.onPress = function(){...} / 剪辑作用域变量）。
     // 共享指针：使剪辑实例跨帧重建时其属性持久（ItemClip 指向 DisplayItem::clipVars）。

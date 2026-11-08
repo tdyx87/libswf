@@ -33,9 +33,13 @@ for /r %BUILD% %%F in (conan_toolchain.cmake) do set TOOLCHAIN=%%F
 if "%TOOLCHAIN%"=="" (echo 找不到 conan_toolchain.cmake & exit /b 1)
 
 rem ---- 4) 配置 + 构建（找到 FFmpeg 后 CMake 自动定义 SWF_HAVE_FFMPEG）----
+rem   显式使用 conan 推荐的 Visual Studio 生成器：conan 工具链会强制设置
+rem   CMAKE_GENERATOR_PLATFORM=x64 与 CMAKE_GENERATOR_TOOLSET=v141，二者均为
+rem   VS 生成器专有概念，Ninja 不支持；故此处用 VS 生成器与工具链精确匹配，
+rem   避免“生成器不支持平台/toolset 规格”的错误，也避免混用生成器。
 set CMAKE_FFMPEG=-DSWF_WITH_FFMPEG=OFF
 if not "%FFMPEG_ROOT%"=="" set CMAKE_FFMPEG=-DFFMPEG_ROOT="%FFMPEG_ROOT%" -DSWF_WITH_FFMPEG=ON
-cmake -B %BUILD% -S . -DCMAKE_TOOLCHAIN_FILE="%TOOLCHAIN%" -DCMAKE_BUILD_TYPE=Release %CMAKE_FFMPEG%
+cmake -B %BUILD% -S . -G "Visual Studio 15 2017" -DCMAKE_TOOLCHAIN_FILE="%TOOLCHAIN%" -DCMAKE_BUILD_TYPE=Release %CMAKE_FFMPEG%
 if errorlevel 1 exit /b 1
 cmake --build %BUILD% --config Release
 if errorlevel 1 exit /b 1

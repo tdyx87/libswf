@@ -34,13 +34,14 @@ static void rect(std::vector<std::uint8_t>& v, int x0, int y0, int x1, int y1) {
     if (bitCnt > 0) { bitBuf <<= (8 - bitCnt); v.push_back((std::uint8_t)bitBuf); bitBuf = 0; bitCnt = 0; }
 }
 
-// 构造一个完整 SWF（version=8），内含一个 DefineFont2
-static bool buildSwf(const std::vector<std::uint8_t>& f, std::vector<std::uint8_t>& swf) {
+// 构造一个完整 SWF（version=8），内含一个 DefineFont2(48) 或 DefineFont3(75)
+static bool buildSwf(const std::vector<std::uint8_t>& f, std::vector<std::uint8_t>& swf,
+                     int fontTag = 48) {
     std::vector<std::uint8_t> body;
     rect(body, 0, 0, 11000, 8000);                 // frameSize 550x400
     body.push_back(0x00); body.push_back(0x18);   // frameRate 24.0
     body.push_back(0x01); body.push_back(0x00);   // frameCount=1
-    writeTag(body, 48, f);   // DefineFont2
+    writeTag(body, fontTag, f);   // DefineFont2 / DefineFont3
     writeTag(body, 1, {});   // ShowFrame
     writeTag(body, 0, {});   // End
     swf.clear();
@@ -94,7 +95,17 @@ int main() {
     for (auto b : glyph1) f.push_back(b);   // (21-25)
     u16(f, 65);           // CodeTable[0] = 'A'          (26-27)
     u16(f, 66);           // CodeTable[1] = 'B'          (28-29)
-    check(f.size() == 30, "case1: font tag data is 30 bytes");
+    // FontFlagsHasLayout 的布局表紧跟 CodeTable（SI16/UI16 均为 EM square 设计单位）
+    u16(f, 800);          // FontAscent
+    u16(f, 200);          // FontDescent
+    u16(f, 50);           // FontLeading
+    u16(f, 500);          // FontAdvanceTable[0]
+    u16(f, 600);          // FontAdvanceTable[1]
+    f.push_back(0x00);    // FontBoundsTable[0]: RECT(NBits=0)
+    f.push_back(0x00);    // FontBoundsTable[1]: RECT(NBits=0)
+    u16(f, 1);            // KerningCount
+    u16(f, 65); u16(f, 66); u16(f, static_cast<std::uint16_t>(-40));  // 'A','B' -> -40
+    check(f.size() == 50, "case1: font tag data with layout is 50 bytes");
     check(f[26] == 65 && f[27] == 0 && f[28] == 66, "case1: code table at offset 26 = 'A','B'");
 
     // ---- 用例 2：仅 WideCodes（16 位偏移 + 16 位 CodeTableOffset）----
@@ -135,6 +146,17 @@ int main() {
             auto a = c2g.find(65), b = c2g.find(66);
             check(a != c2g.end() && a->second == 0, "case1: 'A'(65) -> glyph 0");
             check(b != c2g.end() && b->second == 1, "case1: 'B'(66) -> glyph 1");
+            const auto& font = *cit->second->font;
+            check(font.hasLayout, "case1: FontFlagsHasLayout decoded");
+            check(font.ascent == 800 && font.descent == 200 && font.leading == 50,
+                  "case1: FontAscent/Descent/Leading from layout table");
+            check(font.advances.size() == 2 && font.advances[0] == 500 && font.advances[1] == 600,
+                  "case1: FontAdvanceTable decoded");
+            auto kit = font.kerning.find((65u << 16) | 66u);
+            check(kit != font.kerning.end() && kit->second == -40,
+                  "case1: KerningTable decoded (signed adjustment)");
+            check(font.unitsPerEm == swf::kFontEmSquare && !font.glyphsInTwips,
+                  "case1: DefineFont2 uses the EM square coordinate system");
         } else {
             auto a = c2g.find(0x4E00), b = c2g.find(0x4E0B);
             check(a != c2g.end() && a->second == 0, "case2: U+4E00 -> glyph 0");
@@ -149,6 +171,24 @@ int main() {
         } else g1hasContour = false;
         check(g0empty, c == 0 ? "case1: glyph0 (space) has no contour" : "case2: glyph0 (space) has no contour");
         check(g1hasContour, c == 0 ? "case1: glyph1 outline decoded" : "case2: glyph1 outline decoded");
+    }
+
+    // ---- 用例 3：DefineFont3(75) 字形坐标为 DefineFont2 的 20 倍分辨率 ----
+    // swf2.swf 首帧的 "LOADING"/"0%" 用 DefineFont3；unitsPerEm 若仍取 1024，
+    // 嵌入字形会被放大 20 倍，铺满整个画面。
+    {
+        std::vector<std::uint8_t> swf;
+        buildSwf(g, swf, 75);
+        swf::Movie movie; std::string err;
+        bool ok = swf::decodeMovie(swf.data(), swf.size(), movie, err);
+        check(ok, "case3: decodeMovie(DefineFont3) succeeds");
+        if (ok) {
+            auto cit = movie.characters.find(2);
+            check(cit != movie.characters.end() && cit->second && cit->second->font &&
+                  cit->second->font->unitsPerEm == swf::kFontEmSquare * 20 &&
+                  !cit->second->font->glyphsInTwips,
+                  "case3: DefineFont3 uses 20x EM square coordinates");
+        }
     }
     std::printf("\nDefineFont2 code-table test: %s (%d failures)\n", g_fail ? "FAILED" : "OK", g_fail);
     return g_fail ? 1 : 0;

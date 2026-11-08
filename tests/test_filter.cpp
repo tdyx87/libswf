@@ -69,10 +69,12 @@ int main() {
     std::vector<std::uint8_t> shape = filledRect(1, 0, 0, 2000, 1000, 255, 0, 0);
 
     // PlaceObject3：HasCharacter + HasFilterList(DropShadow, 黑色, 距离200twips=10px, 45°, 模糊4)
+    // 结构顺序遵循规范：Depth → CharacterId → ... → FilterList。
     std::vector<std::uint8_t> po3;
     po3.push_back(0x02);   // PlaceFlag: HasCharacter
     po3.push_back(0x01);   // PlaceFlag2: HasFilterList
     po3.push_back(0x01); po3.push_back(0x00);  // depth=1
+    po3.push_back(0x01); po3.push_back(0x00);  // CharacterId=1
     po3.push_back(0x01);   // FilterCount=1
     po3.push_back(0x00);   // DropShadow
     po3.push_back(0x00); po3.push_back(0x00); po3.push_back(0x00); po3.push_back(0xFF);  // RGBA 黑
@@ -82,9 +84,8 @@ int main() {
     fixed(4.0);   // BlurY
     fixed(45.0);  // Angle
     fixed(200.0); // Distance (10px)
-    fixed(1.0);   // Strength
+    po3.push_back(0x00); po3.push_back(0x01);   // Strength = FIXED8(1.0) = 256
     po3.push_back(0x01);   // flags: passes=1
-    po3.push_back(0x01); po3.push_back(0x00);  // CharacterId=1
 
     std::vector<std::uint8_t> body;
     { BitWriter hdr; hdr.rect(0, 0, 16000, 12000); for (auto b : hdr.bytes) body.push_back(b); }  // 800x600

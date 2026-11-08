@@ -1,5 +1,7 @@
 #include "swf/Abc.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace swf {
@@ -55,6 +57,7 @@ public:
     }
 
     bool bad() const { return bad_; }
+    void setBad() { bad_ = true; }
 
 private:
     const uint8_t* d_;
@@ -76,13 +79,14 @@ void readTraits(Reader& r, std::vector<Traits>& out) {
                 t.slotId = r.u30();
                 t.typeName = r.u30();
                 t.functionName = r.u30();   // vindex（常量池索引）
-                if (t.functionName != 0) r.u8();  // vkind
+                if (t.functionName != 0) t.vkind = r.u8();  // vkind
                 break;
             case 0x01:  // Method
             case 0x02:  // Getter
             case 0x03:  // Setter
-                t.functionName = r.u30();
+                // 规范顺序：disp_id 在前，method_info 索引在后
                 t.dispId = static_cast<int>(r.u30());
+                t.functionName = r.u30();
                 break;
             case 0x04:  // Class
                 t.slotId = r.u30();
@@ -99,7 +103,7 @@ void readTraits(Reader& r, std::vector<Traits>& out) {
         if (kb & 0x40) {
             uint32_t mc = r.u30();
             for (uint32_t m = 0; m < mc && !r.eof(); ++m) r.u30();
-            t.metadataCount = static_cast<uint8_t>(mc);
+            t.metadataCount = mc;
         } else {
             t.metadataCount = 0;
         }
@@ -145,7 +149,7 @@ bool parseAbc(const uint8_t* data, size_t size, AbcFile& out, std::string& err) 
             if (r.pos() + len <= size) {
                 s.assign(reinterpret_cast<const char*>(data + r.pos()), len);
                 r.seek(r.pos() + len);
-            } else { r.bad(); break; }
+            } else { r.setBad(); break; }  // 此前调用的是 const getter，截断从未被记录
             out.strings[i] = std::move(s);
         }
     }
@@ -180,6 +184,7 @@ bool parseAbc(const uint8_t* data, size_t size, AbcFile& out, std::string& err) 
                     m.ns = r.u30(); m.name = r.u30(); break;
                 case Multiname::Kind::RTQName:
                 case Multiname::Kind::RTQNameA:
+                    // RTQName：name 来自常量池，只有命名空间在运行时由栈提供。
                     m.name = r.u30(); break;
                 case Multiname::Kind::RTQNameL:
                 case Multiname::Kind::RTQNameLA:
@@ -189,15 +194,19 @@ bool parseAbc(const uint8_t* data, size_t size, AbcFile& out, std::string& err) 
                     m.name = r.u30(); m.ns = r.u30(); break;
                 case Multiname::Kind::MultinameL:
                 case Multiname::Kind::MultinameLA:
-                    m.name = r.u30(); break;
+                    // 名字在运行时由栈提供，操作数是命名空间集合索引
+                    m.ns = r.u30(); break;
                 case Multiname::Kind::TypeName: {
                     m.name = r.u30();
-                    uint8_t paramCount = r.u8();
-                    for (int k = 0; k < paramCount; ++k) m.typeArgs.push_back(r.u30());
+                    uint32_t paramCount = r.u30();   // param_count 是 u30，不是 u8
+                    if (paramCount > 1024) { r.setBad(); break; }
+                    for (uint32_t k = 0; k < paramCount; ++k) m.typeArgs.push_back(r.u30());
                     break;
                 }
                 default:
-                    r.bad(); break;
+                    // 未知 multiname kind 无法推断操作数长度，必须中止解析而不是
+                    // 带着错误偏移继续（此前误调 const getter bad()，从未生效）。
+                    r.setBad(); break;
             }
         }
     }
@@ -225,14 +234,37 @@ bool parseAbc(const uint8_t* data, size_t size, AbcFile& out, std::string& err) 
         if (m.flags & 0x08) {  // HAS_OPTIONAL
             // option_detail 仅含 {val:u30(常量池索引), kind:u8(ConstantKind)}，无额外值字段
             uint32_t optCount = r.u30();
+            m.optionalDefaults.resize(optCount);
             for (uint32_t k = 0; k < optCount && !r.eof(); ++k) {
-                r.u30();   // val
-                r.u8();    // kind
+                m.optionalDefaults[k].val = r.u30();    // val
+                m.optionalDefaults[k].kind = r.u8();    // kind
             }
         }
         if (m.flags & 0x80) {  // HAS_PARAM_NAMES
             for (uint32_t k = 0; k < paramCount; ++k) r.u30();
         }
+    }
+    // 临时诊断：打印可选参数默认值候选解析与字符串池
+    if (std::getenv("SWF_AS_DEBUG")) {
+        for (size_t i = 0; i < out.methods.size(); ++i) {
+            const auto& m = out.methods[i];
+            for (size_t k = 0; k < m.optionalDefaults.size(); ++k) {
+                const auto& d = m.optionalDefaults[k];
+                std::fprintf(stderr, "[abc] opt mi=%u pc=%u j=%zu val=%u kind=%u str=\"%s\" uint=%d int=%d dbl=%g\n",
+                             (uint32_t)i, m.param_count, k, d.val, d.kind,
+                             d.val < out.strings.size() ? out.strings[d.val].c_str() : "",
+                             d.val < out.uints.size() ? (int)out.uints[d.val] : -1,
+                             d.val < out.ints.size() ? out.ints[d.val] : -1,
+                             d.val < out.doubles.size() ? out.doubles[d.val] : 0.0);
+            }
+        }
+        for (size_t i = 0; i < out.strings.size(); ++i)
+            if (out.strings[i].find("rogress") != std::string::npos ||
+                out.strings[i].find("rogressBar") != std::string::npos ||
+                out.strings[i].find("actory") != std::string::npos ||
+                out.strings[i].find("Game") != std::string::npos ||
+                out.strings[i].find("Menu") != std::string::npos)
+                std::fprintf(stderr, "[abc] str[%zu]=\"%s\"\n", i, out.strings[i].c_str());
     }
 
     // ---- metadata ----
@@ -343,6 +375,28 @@ bool parseAbc(const uint8_t* data, size_t size, AbcFile& out, std::string& err) 
     }
 
     if (r.bad()) { err = "abc truncated"; return false; }
+    if (std::getenv("SWF_AS_DEBUG")) {
+        for (size_t i = 0; i < out.instances.size(); ++i) {
+            const Multiname* inmn = out.mn(out.instances[i].name);
+            std::string iname = inmn ? out.str(inmn->name) : "?";
+            for (const auto& t : out.instances[i].traits) {
+                const Multiname* tmn = out.mn(t.name);
+                std::string tn = tmn ? out.str(tmn->name) : "?";
+                if (tn.find("progress") != std::string::npos || tn.find("Progress") != std::string::npos ||
+                    tn.find("nextGame") != std::string::npos)
+                    std::fprintf(stderr, "[abc] trait %s.%s kind=%u mi=%u body=%d\n", iname.c_str(), tn.c_str(),
+                                 t.kind, t.functionName,
+                                 t.functionName < out.methods.size() ? out.methods[t.functionName].bodyIndex : -1);
+            }
+        }
+    }
+    if (std::getenv("SWF_AS_DEBUG")) {
+        for (size_t i = 0; i < out.instances.size(); ++i) {
+            const Multiname* m = out.mn(out.instances[i].name);
+            std::fprintf(stderr, "[abc] class[%zu]=\"%s\"\n", i,
+                         m ? out.str(m->name).c_str() : "");
+        }
+    }
     return true;
 }
 

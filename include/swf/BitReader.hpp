@@ -32,6 +32,7 @@ public:
     // 位缓冲 bitBuf_ 高位为下一个待读位；bitCount_ 为有效位数。
     std::uint32_t readUB(int n) {
         if (n <= 0) return 0;
+        if (n > 32) n = 32;  // 防止 32 - n 为负导致双重移位 UB
         int cnt = bitCount_;
         std::uint32_t buf = bitBuf_;
         std::uint32_t result;
@@ -45,6 +46,11 @@ public:
             int takeNew = n - cnt;
             std::uint32_t high = (takeOld > 0) ? (buf >> (32 - takeOld)) : 0u;
             buf = refill();
+            if (takeNew >= 32) {  // 整块新缓冲：避免 buf << 32 / high << 32 的 UB
+                bitBuf_ = 0;
+                bitCount_ = 0;
+                return buf;
+            }
             std::uint32_t low = (takeNew > 0) ? (buf >> (32 - takeNew)) : 0u;
             result = (high << takeNew) | low;
             bitBuf_ = (buf << takeNew);
@@ -56,7 +62,9 @@ public:
     // sub_479240：ReadSB[n] = ReadUB[n] 后符号扩展
     std::int32_t readSB(int n) {
         if (n <= 0) return 0;
+        if (n > 32) n = 32;
         std::uint32_t raw = readUB(n);
+        if (n == 32) return static_cast<std::int32_t>(raw);
         return static_cast<std::int32_t>(raw << (32 - n)) >> (32 - n);
     }
 

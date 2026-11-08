@@ -15,8 +15,13 @@ BUILD=build
 # ---- 1) 定位预编译 FFmpeg 根目录 ----
 FFMPEG_ROOT="${2:-}"
 if [ -z "$FFMPEG_ROOT" ]; then
-  for cand in "$PWD/third_party/ffmpeg-n8.1-latest-win64-gpl-shared-8.1" \
-              /usr/local /usr; do
+  # Windows 的预编译 .lib 包不能用于 Linux/macOS：按平台过滤候选目录，
+  # 否则 Linux 会先命中 win64 包并链接失败。
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) PLATFORM_CANDS=("$PWD/third_party/ffmpeg-n8.1-latest-win64-gpl-shared-8.1" /usr/local /usr) ;;
+    *)                    PLATFORM_CANDS=(/usr/local /usr /opt/homebrew) ;;
+  esac
+  for cand in "${PLATFORM_CANDS[@]}"; do
     if [ -f "$cand/include/libavcodec/avcodec.h" ]; then FFMPEG_ROOT="$cand"; break; fi
   done
 fi

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -105,31 +106,52 @@ int main() {
         if (p.samples.size() >= 2)
             check(p.samples[0] == 0 && p.samples[1] == 1, "ADPCM: header=0 then nibble#1 -> +1");
     }
-    // 4) MP3 (format 2)：尝试从真实 swf.swf 取样本（环境无关则跳过）
+    // 4) MP3 (format 2)：样本来自 SWF_TEST_FILE 或相对路径（都不存在则跳过）
     {
-        const char* candidates[] = { "swf.swf", "../swf.swf", "../../swf.swf",
-                                     "F:/project/product/flashplayer/swf.swf" };
+        std::vector<std::string> candidates = {"swf.swf", "../swf.swf", "../../swf.swf"};
+        if (const char* env = std::getenv("SWF_TEST_FILE"))
+            candidates.insert(candidates.begin(), env);
         FILE* f = nullptr;
-        for (auto c : candidates) { f = std::fopen(c, "rb"); if (f) break; }
-        if (!f) { std::printf("  [SKIP] MP3: no swf.swf in test path\n"); }
-        else {
-            std::fseek(f, 0, SEEK_END); long n = std::ftell(f); std::fseek(f, 0, SEEK_SET);
-            std::vector<std::uint8_t> buf(n); std::fread(buf.data(), 1, n, f); std::fclose(f);
-            swf::Movie movie; std::string err;
-            if (swf::decodeMovie(buf.data(), buf.size(), movie, err)) {
-                auto it = movie.sounds.find(47);
-                if (it != movie.sounds.end()) {
-                    swf::PcmData pcm;
-                    bool ok = swf::decodeSound(it->second, pcm, err);
-                    if (!ok && err.find("FFmpeg") != std::string::npos) {
-                        // 压缩编码需 FFmpeg 后端；未启用时跳过而非失败（跨平台最小构建）
-                        std::printf("  [SKIP] MP3: FFmpeg 后端不可用（%s）\n", err.c_str());
+        for (const auto& c : candidates) {
+            f = std::fopen(c.c_str(), "rb");
+            if (f) break;
+        }
+        if (!f) {
+            std::printf("  [SKIP] MP3: no sample (set SWF_TEST_FILE to enable)\n");
+        } else {
+            std::fseek(f, 0, SEEK_END);
+            const long n = std::ftell(f);
+            std::fseek(f, 0, SEEK_SET);
+            if (n <= 0) {
+                std::printf("  [SKIP] MP3: empty sample\n");
+                std::fclose(f);
+            } else {
+                std::vector<std::uint8_t> buf(static_cast<std::size_t>(n));
+                const std::size_t got = std::fread(buf.data(), 1, buf.size(), f);
+                std::fclose(f);
+                buf.resize(got);
+                swf::Movie movie;
+                std::string err;
+                if (!swf::decodeMovie(buf.data(), buf.size(), movie, err)) {
+                    // 找到样本却解析失败是真失败，不能再用 SKIP 掩盖。
+                    check(false, "MP3: sample decode failed");
+                } else {
+                    auto it = movie.sounds.find(47);
+                    if (it != movie.sounds.end()) {
+                        swf::PcmData pcm;
+                        bool ok = swf::decodeSound(it->second, pcm, err);
+                        if (!ok && err.find("FFmpeg") != std::string::npos) {
+                            // 压缩编码需 FFmpeg 后端；未启用时跳过（跨平台最小构建）
+                            std::printf("  [SKIP] MP3: FFmpeg backend unavailable (%s)\n", err.c_str());
+                        } else {
+                            check(ok && !pcm.samples.empty(), "MP3(id47): decoded non-empty PCM");
+                            if (ok) check(pcm.rate == 11025 && pcm.channels == 1, "MP3(id47): 11025Hz mono");
+                        }
                     } else {
-                        check(ok && !pcm.samples.empty(), "MP3(id47): decoded non-empty PCM");
-                        if (ok) check(pcm.rate == 11025 && pcm.channels == 1, "MP3(id47): 11025Hz mono");
+                        std::printf("  [SKIP] MP3: sound id 47 not found\n");
                     }
-                } else std::printf("  [SKIP] MP3: sound id 47 not found\n");
-            } else std::printf("  [SKIP] MP3: decode failed %s\n", err.c_str());
+                }
+            }
         }
     }
 
