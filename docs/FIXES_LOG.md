@@ -656,14 +656,154 @@ swfparser.exe swf2.swf --play-game 620 ..\..\build\compare\our_frames ^
   `read_lints` 0；默认无环境变量 620 帧四次点击全链回放通过
   （`build\compare\framesPctFinal\`，`p_0030 = 62 %`、`p_0500` 关卡 `2/5` 正常）。
 
+## FIX-2026-013：`startDrag` 生命周期 / `stopDrag` 作用域偏离 Flash 语义（2026-11-08）
+
+- **状态**：已修复、已验证。同时**纠正上一轮误判**：「点 `hit` 不推进、
+  `startDrag` 不触发」不是引擎缺口，是回放脚本点错了交互对象。
+- **代码根因**（`src/Fvm.cpp`）：
+  1. `Vm::mouseUp()` 派发 `mouseUp` 后无条件 `dragTarget_.reset()`，注释还写成
+     「Flash 语义：松开鼠标即结束」。Flash/Ruffle 的 `startDrag()` 是**舞台级持续
+     状态**，只有 `stopDrag()` 或另一次 `startDrag()` 接管才结束；松开鼠标后对象
+     仍须跟随指针。本 SWF `frame112` 由帧脚本直接 `startDrag(true)`（没有
+     `MOUSE_DOWN` 上下文），旧实现让 `gensui` 在后续 `mouseUp` 后立刻停住。
+  2. `stopDrag()` native 原先只在 `dragTarget_ == self->display` 时清除，而 Flash
+     允许在**任意** Sprite 上调用 `stopDrag()` 结束当前拖拽。
+- **修复**：`mouseUp()` 删除自动 reset；`stopDrag()` 改为无条件清除舞台拖拽状态。
+  另清理提交后新增的 `SWF_AS_STEPDBG` 临时诊断（帧坐标表已存
+  `build\compare\stepdbg_err.txt`）。
+- **字节码链（避免重复排查）**：
+  - `mi=915` = `onGoToTimeline(name)`：`stop()` → `this[name].buttonMode=true` →
+    `addEventListener(MOUSE_DOWN,onPlay1)` → `if (this["gensui"])` 才执行
+    `mouseChildren/mouseEnabled=false`、`startDrag(true)`、
+    `ShakeHelp.setShakeData(...)`。
+  - `frame37`(mi=938) `onOneTargetDownUp("btn1","gensui2")`；`mi=917` 注册
+    `MOUSE_DOWN → ond2`(mi=920)，`ond2` 里 `startDrag` 并给 `stage` 注册
+    `ENTER_FRAME → onE`(mi=918) / `MOUSE_UP → onu2`(mi=919)。
+    `onE` 用 `this["hit"].hitTestPoint(stage.mouseX, stage.mouseY, true)` 判定，
+    命中才 `stopDrag()` + `play()` / `gotoAndPlay(currentFrame+1)`；所以**必须拖拽
+    到 `hit` 区域**，单纯点击 `hit` 或点 `btn1` 不松手移动都不会推进。
+  - `frame111`(mi=941) `onGoToTimeline("btn0")`；`frame112`(mi=942)
+    `onAlphaMove("gensui","hit",onMM,"Ca2")`；`mi=689 onMM` 要求
+    `event.target.name == curHitName` 才递减 alpha，需要鼠标在 `hit` 上来回移动。
+  - `MouseManager.OnMouseDown`(mi=103) 只是 Stage 全局管理器（遍历
+    `m_fun[MOUSE_DOWN]`），**不是**关卡拖拽入口；此前据此怀疑全局回调链是误判。
+- **正确的分段交互序列**（时间轴帧坐标 → 舞台坐标：x 不变、`y_stage = y_frame - 336`）：
+
+  | step | 输入 | 结果 |
+  |---|---|---|
+  | 310 / 390 / 430 | `--click 310:593:574` / `390:473:698` / `430:150:300` | 门户 Play → 标题 PLAY → 选角色 pp1 |
+  | 440 | `--click 440:199:440` | `aa` → `onPlay1`(916) → frame 0/1/34/36 |
+  | 480-492 | `--drag 480:492:294:122:534:461` | `btn1`→`hit`；`ond2`/`startDrag(gensui2)`/`onE` → frame 52 |
+  | 565-577 | `--drag 565:577:1044:464:542:468` | `ren`→`hit` → frame 106 |
+  | 580 | `--click 580:159:291` | `btn0` → frame 111，`gensui` 已放置 → `[as] startDrag ... name=gensui cid=716` |
+  | 585-621 | 7 个 `--hover` 在 `(450,421)` 附近来回 | `onMM` 递减 alpha → frame 112/113/145/147 |
+
+  实测：tick 581 触发 `this["gensui"].startDrag`，tick 630 `frame113` 再次
+  `startDrag(cid729)`，tick 655 `frame147` 执行 `frame147`(mi=945)
+  `onOneTargetDownUp("btn2","gensui2")`，等待下一次拖拽。
+- **验证**：全量构建成功；ctest **21/21 通过**；`read_lints` 0；
+  分步 760 帧带渲染回放 `build\compare\framesStepDrag\`（日志
+  `framesStepDrag_err.txt`）推进到 frame 147；默认无环境变量 620 帧四次点击全链
+  `build\compare\framesDragFix\` 的 `p_0030`/`p_0500` 与 `framesPctFinal\`
+  **逐像素一致**（无回归）。
+- **遗留**：frame 147 之后的 `btn2 → aa → hita..hitd` 等待帧序列、以及 frame 309
+  `end` / 关卡 `2/5` 尚未构造完整；`lockCenter=true` 目前仍把对象原点锁到指针
+  （Flash 应锁 bounds 中心），需要几何包围盒支持后再纠。
+
+## FIX-2026-014：打通关卡内完整交互链 + 游戏内进度条逐条定位（2026-11-08）
+
+- **状态**：FIX-2026-013 的分段链遗留已跑通；进度条的三条路径全部定位，**未发现
+  引擎缺陷**。代码改动仅保留 013 的 `startDrag`/`stopDrag` 语义修复，另把硬编码的
+  动态属性诊断改为通用开关 `SWF_AS_DYNGET=<属性名子串>`（打印 `r`/`props`/`kids`）。
+- **完整的第二关交互序列**（`第二关_253` cid=750；舞台坐标 = 帧内 x、y-336）：
+
+  | step | 输入 | 推进结果 |
+  |---|---|---|
+  | 310 / 390 / 430 / 440 | 门户 Play / 标题 PLAY / 选角色 pp1 / `aa`(199,440) | frame 0→1→34→36 |
+  | 480-492 / 565-577 | `btn1`→`hit` / `ren`→`hit` 拖拽 | frame 52 / 106 |
+  | 580 | `btn0`(159,291) | frame 111 `gensui` + `startDrag` |
+  | 585-621 / 630 | 7 个 hover 在 `hit` 附近 / 移到角落 | `onMM` 把 `hit.alpha` 递增到 1 → frame 112/145/147 |
+  | 660-672 / 710-722 | `btn2`→`hit` / `aa`→`hit` 拖拽 | frame 148/185/187/233 |
+  | 770 / 780-810 / 913 | `btn3`(888,278)、`hita..hitd` 四点、`(380,440)` | `lv6`(mi=932) 的 4 次 `onClick`(933)/`onCallBack`(934) 集齐 → `arree.length==0` → `setTimeout(play,300)` |
+  | 950-962 | `btn2`→`hit`(526,451) | frame 270/271/272/310 |
+  | 1000 | `nextBtn`(1190,638) | frame 314 `end`(mi=402) → `send(nextGame,3)` → `第三关副本_310` |
+
+  关键：`lv6` 注册的是 `MOUSE_MOVE → onClick`（`mi=951` 第 5 参 `pushtrue`），
+  目标名 `"hit"+arree[i]` = `hita/hitb/hitc/hitd`；**必须让鼠标扫过 4 个不同目标**，
+  重复点已移除监听的目标无效。第 4 个由 `(380,440)` 触发。
+- **游戏内进度条排查结论**：
+  1. **右上时钟 `1/5 → 2/5 → 3/5`**：由 `main.gotoAndStop(step)` / `m_main.play(step)`
+     驱动。正常完成第二关后 `p_0996` 显示 NEXT 按钮 + `2/5`，点 NEXT 后 `p_1050`
+     进入第三关并显示 `3/5`，与关卡切换同步，无需修复。
+  2. **关卡内动作条 `loading`(cid724 / `进度条_283`)**：擦洗阶段 `onMM`(mi=924)
+     逐帧驱动 `Tool.on_scale_Change(loading,cur,tot)`，日志
+     `[gotoStop] name=loading` 共 307 次、从 0 递增到 99（走满）。`lv6`(mi=932) 与
+     `onCallBack`(mi=934) 里也有 `if (this["loading"])` 保护：cid=750 的 f111/f112/f234
+     放置了 `loading`，f233 没有（SWF 的 RemoveObject），所以 frame 233 期间这一段
+     不更新是**数据事实**，FlashPlayer 同样如此。
+  3. **`gameProgressBar`(mi=74) 恒 null**：`readyGame`(mi=969) 调 `setGameDate` 只传
+     4 个参数，第 5 参 `m_factoryName` 取默认 `"progressBar"`；`main`(cid1280)
+     没有该具名子实例（`getChildByName MISS want='progressBar'`）。`__progressChange`
+     (mi=73) 全文只有 `if (gameProgressBar) gameProgressBar.currentStep++`，是通用
+     模板在本 SWF 中的死分支。`PROGRESS_STEP` 由 `FetchGoodHelp1.__stageUp`(mi=129)
+     在第三关道具拖放命中时 `send`，本轮序列未进入第三关拖放。
+- **已实验并回退的错误假设**：把「已脱离显示列表的具名实例」保留为 `props[name]`
+  可以让 `this["loading"]` 在 f233 返回旧对象，但会让 `Tool.on_scale_Change` 作用在
+  不可见的旧实例上（`[gotoStop]` 307→312、所有帧逐像素一致），且会破坏
+  `if (this["gensui"])` 这类「当前帧是否存在该实例」的判断，偏离 Flash 时间轴字段
+  语义，故回退；FIX-2026-013 的 5548 行注释所说的「引用仍可继续使用」指脚本已保存到
+  局部变量的 shared_ptr，不是 `clip["name"]` 动态查找。
+- **验证**：全量构建成功；ctest **21/21 通过**；`read_lints` 0；默认无环境变量
+  620 帧四次点击全链 `build\compare\framesFinal\` 的 `p_0030`/`p_0500` 与
+  `framesDragFix\` **逐像素一致**；完整关卡链 1060 帧带渲染
+  `build\compare\framesFullChain\`（日志 `stepEnd10_err.txt`）到 frame 314 / 第三关。
+- **遗留**：`lockCenter=true` 是否应锁 bounds 中心仍需按 Ruffle / 官方实现核实后再改；
+  第三关的 `PROGRESS_STEP` 拖放链尚未构造。
+
+## FIX-2026-015：擦洗进度条遮罩失效（精灵型遮罩不生效）修复（2026-11-08）
+
+- **现象**：用户确认的「游戏内进度条问题」——第二关擦洗阶段画面顶部的红黄条纹
+  动作条长度不变（恒为满条），只在擦洗完成时整条消失。
+- **根因**：`loading`(cid724) 是 100 帧精灵，其红黄条长度由 depth 2 的遮罩层
+  cid721 逐帧平移控制（`--inspect`：`[721] Sprite frames=1`、`[724] Sprite frames=100`）。
+  用独立脚本解析 DefineSprite 724 的 PlaceObject2 证实：depth2 = cid721、
+  clipDepth=5，其 matrix tx 每帧递增约 28.5 twips（f1 tx=-2360 → f100 ≈ +460）。
+  而静态 `renderItemsWithClip` 与运行时 `renderRuntimeChildren` 的遮罩提取
+  （`maskShapeOf`）只认 `Kind::Shape`，cid721 是 **Sprite** → 遮罩被判定
+  「不可用」，代码走进"组内对象直接画、不裁剪"分支 → 条恒为满长。
+- **修复**：新增 `collectMaskShapes(const Character*, Matrix, out)`——遮罩本体
+  可以是形状，也可以是"单帧精灵包着的形状"（取 `spriteFrames.front().items`
+  中的所有 Shape，并复合各自 `sub.matrix`）。静态路径与运行时路径的
+  包围盒计算与 `fillMask` 都改为遍历形状集合；删除只认 Shape 的 `maskShapeOf`。
+- **效果**：修复前 p_0585/p_0620/p_0650 顶部条区域逐像素完全相同；修复后
+  `p_0585`（progress 0）只剩空的金色槽、`p_0620`（progress≈40）红黄条纹填充至
+  中段，随 `Tool.on_scale_Change → loading.gotoAndStop(0..99)` 从空到满渐变。
+- **验证**：全量构建成功；ctest **21/21 通过**；`read_lints` 0；默认 620 帧四次
+  点击全链 `framesMaskFull\` 的 `p_0030`/`p_0500` 与修复前 `framesFinal\`
+  **逐像素一致**（无回归）；完整关卡链 1100 帧 `stepMaskFix_err.txt` 仍为
+  tick 996 frame314 `end` → tick 1002 `send(nextGame,3)` → tick 1003 第三关。
+- **遗留**：`lockCenter=true` 语义待核实；第三关 `PROGRESS_STEP` 拖放链未构造；
+  遮罩精灵若内部还有嵌套精灵只展平一层（本 SWF 的遮罩均为一层形状）。
+
 ---
 
-最近一次全量验证：**2026-11-08**（FIX-2026-012）——全量构建成功；ctest **21/21 通过**；
-默认无环境变量 `--play-game 620` 四次点击全链回放通过
-（开场百分比 20%→62% 且数字与 `%` 排版对齐官方 → 门户 Play → 标题屏 PLAY →
-选角色 → SKIP/next → 第三关 `steps.GameStep3`，产物 `build\compare\framesPctFinal\`）。
-上一条基线：FIX-2026-011 的 620 帧四次点击全链（产物 `build\compare\framesFixText\`）。
-上上条基线：FIX-2026-010 的 620 帧四次点击全链（产物 `build\compare\framesFixNext\`）。
+最近一次全量验证：**2026-11-08**（FIX-2026-015）——全量构建成功；ctest **21/21 通过**；
+`read_lints` 0；默认 620 帧全链 `build\compare\framesMaskFull\`（`p_0030`/`p_0500`
+与修复前逐像素一致）；擦洗进度条 `build\compare\framesMaskFix\`（p_0585 空槽 →
+p_0620 半条）；完整关卡链 `build\compare\stepMaskFix_err.txt` 推进至第三关。
+上一次（FIX-2026-014）：全量构建成功；ctest **21/21 通过**；
+`read_lints` 0；默认 620 帧四次点击全链 `build\compare\framesFinal\`
+（`p_0030`/`p_0500` 与 `framesDragFix\` 逐像素一致）；完整关卡链 1060 帧带渲染
+`build\compare\framesFullChain\` 推进至 frame 314 `end` → 第三关。
+上一次（FIX-2026-013）：全量构建成功；ctest **21/21 通过**；
+`read_lints` 0；默认 620 帧四次点击全链 `build\compare\framesDragFix\`
+（`p_0030`/`p_0500` 与 `framesPctFinal\` 逐像素一致）；分步交互 760 帧
+`build\compare\framesStepDrag\` 推进至 frame 147。
+上一条基线：FIX-2026-012 的 620 帧四次点击全链（产物 `build\compare\framesPctFinal\`，
+开场百分比 20%→62% 且数字与 `%` 排版对齐官方 → 门户 Play → 标题屏 PLAY →
+选角色 → SKIP/next → 第三关 `steps.GameStep3`）。
+上上条基线：FIX-2026-011 的 620 帧四次点击全链（产物 `build\compare\framesFixText\`）。
+历史基线：FIX-2026-010 的 620 帧四次点击全链（产物 `build\compare\framesFixNext\`）。
 历史基线：FIX-2026-009 的 `--play-game 460 --click 310:593:574 --click 390:473:698`
 （进度条 → 门户 Play → 标题屏 PLAY → 第一关 `steps.GameStep1`，
 产物 `build\compare\framesFinalPlay\`）。

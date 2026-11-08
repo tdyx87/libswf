@@ -341,19 +341,22 @@ inline void registerFvmOps() {
             if (cc < 20) { ++cc; std::fprintf(stderr, "[arrget] name='%s' r='%s'\n",
                                              name.c_str(), r.toString().c_str()); }
         }
-        if (std::getenv("SWF_AS_DEBUG") &&
-            (name == "gensui" || name == "a7" || name == "a8" || name == "aa" ||
-             name == "progressBar")) {
-            static int dc = 0;
-            if (dc++ < 12) {
-                std::string kids;
-                if (obj.kind == VKind::Object && obj.obj && obj.obj->display)
-                    for (const auto& ch : obj.obj->display->children)
-                        if (ch) kids += ch->name + "(cid" + std::to_string(ch->characterId) + ") ";
-                std::fprintf(stderr, "[dynget] self=%s disp=%d want='%s' r='%s' kids=[%s]\n",
-                             (obj.kind == VKind::Object && obj.obj) ? obj.obj->className.c_str() : "-",
-                             (obj.kind == VKind::Object && obj.obj && obj.obj->display) ? 1 : 0,
-                             name.c_str(), r.toString().c_str(), kids.c_str());
+        // SWF_AS_DYNGET=<子串>：按属性名跟踪动态 getproperty（含解析结果与具名子实例清单）。
+        if (const char* dg = std::getenv("SWF_AS_DYNGET")) {
+            if (name.find(dg) != std::string::npos) {
+                static int dc = 0;
+                if (dc++ < 400) {
+                    std::string kids;
+                    if (obj.kind == VKind::Object && obj.obj && obj.obj->display)
+                        for (const auto& ch : obj.obj->display->children)
+                            if (ch) kids += ch->name + "(cid" + std::to_string(ch->characterId) + ") ";
+                    std::fprintf(stderr, "[dynget] self=%s disp=%d want='%s' r='%s' props=%d kids=[%s]\n",
+                                 (obj.kind == VKind::Object && obj.obj) ? obj.obj->className.c_str() : "-",
+                                 (obj.kind == VKind::Object && obj.obj && obj.obj->display) ? 1 : 0,
+                                 name.c_str(), r.toString().c_str(),
+                                 (obj.kind == VKind::Object && obj.obj) ? (int)obj.obj->props.count(name) : -1,
+                                 kids.c_str());
+                }
             }
         }
         c.push(r); });
@@ -4758,9 +4761,11 @@ void Vm::registerFlashApi() {
             return Value::undefined();
         };
         c->classDef->instanceMembers.push_back(sdm);
+        // stopDrag() 结束的是舞台级拖动状态：Flash 允许在任意 Sprite 上调用，
+        // 不要求调用者就是 startDrag() 的那个对象。
         Member sdm2; sdm2.kind = Member::Method; sdm2.name = "stopDrag";
-        sdm2.native = [this](std::shared_ptr<Object> self, const std::vector<Value>&) -> Value {
-            if (!self || !self->display || dragTarget_ == self->display) dragTarget_.reset();
+        sdm2.native = [this](std::shared_ptr<Object>, const std::vector<Value>&) -> Value {
+            dragTarget_.reset();
             return Value::undefined();
         };
         c->classDef->instanceMembers.push_back(sdm2);
@@ -6301,8 +6306,8 @@ void Vm::mouseUp(double x, double y) {
     setMousePosition(x, y);
     auto chain = hitChain(x, y);
     dispatchMouseEvent("mouseUp", chain, true);
-    // Flash 语义：startDrag 的拖动在松开鼠标按钮时结束（无需显式 stopDrag）。
-    dragTarget_.reset();
+    // Flash 语义：startDrag 是舞台级持续状态，松开鼠标不会自动结束；
+    // 只有脚本调用 stopDrag()（或另一个 startDrag 接管）才停止跟随。
     if (mouseDown_) {
         auto isAncestor = [](const std::shared_ptr<DisplayObject>& a,
                              const std::shared_ptr<DisplayObject>& b) {

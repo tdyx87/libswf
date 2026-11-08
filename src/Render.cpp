@@ -1566,6 +1566,21 @@ static void renderEditText(const EditText& et, const Matrix& world,
     }
 }
 
+// 取出 clipDepth 层用作裁剪区域的形状集合（第二个分量是相对遮罩对象的局部矩阵）。
+// 遮罩本体可以是形状，也可以是"单帧精灵包着的形状"——Loading 进度条的遮罩
+//（cid721）就是逐帧平移的精灵，只认 Shape 会让整条遮罩失效、进度条恒为满条。
+static void collectMaskShapes(const Character* ch, const Matrix& m,
+                              std::vector<std::pair<const Shape*, Matrix>>& out) {
+    if (!ch) return;
+    if (ch->kind == Character::Kind::Shape && ch->shape)
+        out.push_back({ch->shape.get(), m});
+    else if (ch->kind == Character::Kind::Sprite && !ch->spriteFrames.empty())
+        for (const auto& sub : ch->spriteFrames.front().items)
+            if (sub.character && sub.character->kind == Character::Kind::Shape &&
+                sub.character->shape)
+                out.push_back({sub.character->shape.get(), m.post(sub.matrix)});
+}
+
 // 渲染一组显示列表项并处理 clipDepth 裁剪组（主时间轴与精灵内部时间轴通用）。
 // inheritedCx：祖先累积的颜色变换（Flash 中 ColorTransform 作用于整个子树），
 // 逐层与每个对象自身 cxform 组合。
@@ -1974,22 +1989,25 @@ void renderItemsWithClip(const std::vector<DisplayItem>& items, const Matrix& ro
             // SWF 语义：clipDepth 对象本身仍正常绘制（无填充的"隐形遮罩"自然不画任何像素），
             // 同时它定义了后续 depth+1..clipDepth 层的裁剪区域。
             if (it.character) renderItemInto(it, root, dict, buf, W, H, frameIndex, alpha, it.blend, inheritedCx);
-            const Shape* ms = (it.character && it.character->kind == Character::Kind::Shape &&
-                               it.character->shape) ? it.character->shape.get() : nullptr;
+            std::vector<std::pair<const Shape*, Matrix>> maskShapes;
+            collectMaskShapes(it.character.get(), Matrix{}, maskShapes);
             int j = i + 1;
             while (j < n && items[j].depth <= it.clipDepth) ++j;
-            if (ms) {
+            if (!maskShapes.empty()) {
                 // 遮罩设备包围盒：缓冲清零与合成只在盒内进行。
                 // 全屏遮罩组若按整幅分配/清零/合成，是慢场景的主要固定开销。
                 Matrix wm = root.post(it.matrix);
                 float fbx0 = 1e9f, fby0 = 1e9f, fbx1 = -1e9f, fby1 = -1e9f;
-                for (const auto& contours : ms->fillPaths)
-                    for (const auto& ct : contours)
-                        for (int k = 0; k < static_cast<int>(ct.xs.size()); ++k) {
-                            float X, Y; wm.apply(ct.xs[k], ct.ys[k], X, Y);
-                            fbx0 = std::min(fbx0, X); fby0 = std::min(fby0, Y);
-                            fbx1 = std::max(fbx1, X); fby1 = std::max(fby1, Y);
-                        }
+                for (const auto& mk : maskShapes) {
+                    Matrix mm = wm.post(mk.second);
+                    for (const auto& contours : mk.first->fillPaths)
+                        for (const auto& ct : contours)
+                            for (int k = 0; k < static_cast<int>(ct.xs.size()); ++k) {
+                                float X, Y; mm.apply(ct.xs[k], ct.ys[k], X, Y);
+                                fbx0 = std::min(fbx0, X); fby0 = std::min(fby0, Y);
+                                fbx1 = std::max(fbx1, X); fby1 = std::max(fby1, Y);
+                            }
+                }
                 int bx0 = std::max(0, static_cast<int>(std::floor(fbx0)));
                 int by0 = std::max(0, static_cast<int>(std::floor(fby0)));
                 int bx1 = std::min(W - 1, static_cast<int>(std::ceil(fbx1)));
@@ -2006,7 +2024,8 @@ void renderItemsWithClip(const std::vector<DisplayItem>& items, const Matrix& ro
                         std::memset(layer + (static_cast<std::size_t>(y) * W + bx0) * 4, 0,
                                     static_cast<std::size_t>(bw) * 4);
                     }
-                    fillMask(ms->fillPaths, wm, mask, W, H);
+                    for (const auto& mk : maskShapes)
+                        fillMask(mk.first->fillPaths, wm.post(mk.second), mask, W, H);
                     for (int q = i + 1; q < j; ++q)
                         if (items[q].clipDepth == 0 && items[q].character)
                             renderItemInto(items[q], root, dict, layer, W, H, frameIndex, alpha, items[q].blend, inheritedCx);
@@ -2136,15 +2155,6 @@ void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Mat
                          const Movie& movie, std::uint8_t* buf, int W, int H,
                          int frameIndex, float alpha, const ColorTransform& inheritedCx);
 
-// 取出 clipDepth 层用作裁剪区域的形状（通常是文字轮廓/实心遮罩）。
-static const Shape* maskShapeOf(const fvm::DisplayObject& d, const Movie& movie) {
-    if (!d.characterId) return nullptr;
-    auto it = movie.characters.find(d.characterId);
-    if (it == movie.characters.end() || !it->second ||
-        it->second->kind != Character::Kind::Shape || !it->second->shape) return nullptr;
-    return it->second->shape.get();
-}
-
 // AVM2 运行时子显示列表：按 depth 顺序绘制，并对 clipDepth 组做与静态
 // renderItemsWithClip 相同的遮罩合成。品牌门户页的标语渐变色带就是靠
 // 白色文字轮廓遮罩裁成彩色字形，缺了这步会溢出成一整条矩形色块。
@@ -2162,8 +2172,13 @@ static void renderRuntimeChildren(const std::vector<std::shared_ptr<fvm::Display
             while (j < n && children[static_cast<std::size_t>(j)] &&
                    children[static_cast<std::size_t>(j)]->depth >= 0 &&
                    children[static_cast<std::size_t>(j)]->depth <= c->clipDepth) ++j;
-            const Shape* ms = maskShapeOf(*c, movie);
-            if (!ms || ms->fillPaths.empty() || j == i + 1) {
+            std::vector<std::pair<const Shape*, Matrix>> maskShapes;
+            if (c->characterId) {
+                auto mi = movie.characters.find(c->characterId);
+                if (mi != movie.characters.end())
+                    collectMaskShapes(mi->second.get(), Matrix{}, maskShapes);
+            }
+            if (maskShapes.empty() || j == i + 1) {
                 // 遮罩不可用：保持旧行为（遮罩层本身不绘制，组内对象直接画）
                 for (int q = i + 1; q < j; ++q)
                     renderDisplayObject(children[static_cast<std::size_t>(q)], parent, movie,
@@ -2173,13 +2188,16 @@ static void renderRuntimeChildren(const std::vector<std::shared_ptr<fvm::Display
             }
             Matrix wm = parent.post(displayLocalMatrix(*c));
             float fbx0 = 1e9f, fby0 = 1e9f, fbx1 = -1e9f, fby1 = -1e9f;
-            for (const auto& contours : ms->fillPaths)
-                for (const auto& ct : contours)
-                    for (int k = 0; k < static_cast<int>(ct.xs.size()); ++k) {
-                        float X, Y; wm.apply(ct.xs[k], ct.ys[k], X, Y);
-                        fbx0 = std::min(fbx0, X); fby0 = std::min(fby0, Y);
-                        fbx1 = std::max(fbx1, X); fby1 = std::max(fby1, Y);
-                    }
+            for (const auto& mk : maskShapes) {
+                Matrix mm = wm.post(mk.second);
+                for (const auto& contours : mk.first->fillPaths)
+                    for (const auto& ct : contours)
+                        for (int k = 0; k < static_cast<int>(ct.xs.size()); ++k) {
+                            float X, Y; mm.apply(ct.xs[k], ct.ys[k], X, Y);
+                            fbx0 = std::min(fbx0, X); fby0 = std::min(fby0, Y);
+                            fbx1 = std::max(fbx1, X); fby1 = std::max(fby1, Y);
+                        }
+            }
             int bx0 = std::max(0, static_cast<int>(std::floor(fbx0)));
             int by0 = std::max(0, static_cast<int>(std::floor(fby0)));
             int bx1 = std::min(W - 1, static_cast<int>(std::ceil(fbx1)));
@@ -2194,7 +2212,8 @@ static void renderRuntimeChildren(const std::vector<std::shared_ptr<fvm::Display
                 for (int y = by0; y <= by1; ++y)
                     std::memset(layer + (static_cast<std::size_t>(y) * W + bx0) * 4, 0,
                                 static_cast<std::size_t>(bw) * 4);
-                fillMask(ms->fillPaths, wm, mask.data(), W, H);
+                for (const auto& mk : maskShapes)
+                    fillMask(mk.first->fillPaths, wm.post(mk.second), mask.data(), W, H);
                 for (int q = i + 1; q < j; ++q) {
                     const auto& g = children[static_cast<std::size_t>(q)];
                     if (!g || g->clipDepth > 0) continue;
