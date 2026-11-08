@@ -1457,9 +1457,14 @@ static void renderEditText(const EditText& et, const Matrix& world,
 
     const TextMetrics tm = textMetrics(fg, static_cast<float>(et.fontHeight));
     const float lineH  = tm.lineH + static_cast<float>(et.leading);
-    const float left   = static_cast<float>(et.bounds.x0) + static_cast<float>(et.leftMargin);
+    // Flash TextField 的文本区域相对 Bounds 内缩 2px（40 twips）；右对齐时缺失
+    // 这个内边距会让动态数字比同排的静态 DefineText（如 "%"）右移 2px、贴得过近。
+    const float kPad   = 40.0f;
+    const float left   = static_cast<float>(et.bounds.x0) + kPad
+                         + static_cast<float>(et.leftMargin);
     const float availW = static_cast<float>(et.bounds.x1 - et.bounds.x0)
-                         - static_cast<float>(et.leftMargin) - static_cast<float>(et.rightMargin);
+                         - 2.0f * kPad - static_cast<float>(et.leftMargin)
+                         - static_cast<float>(et.rightMargin);
     const bool wrap      = et.wordWrap && availW > 0.0f;
     const bool multiline = et.multiline || et.wordWrap;
     Paint p; p.kind = FillKind::Solid; p.solid = et.color;
@@ -1530,8 +1535,12 @@ static void renderEditText(const EditText& et, const Matrix& world,
         else if (align == 2) x += (availW - width) * 0.5f;            // Center
         else if (align == 3 && li + 1 < lines.size() && spaces > 0)   // Justify
             extra = (availW - width) / static_cast<float>(spaces);
-        const float y = static_cast<float>(et.bounds.y0)
-                        + static_cast<float>(li) * lineH + tm.ascent;
+        // 首行基线按 SWF 的 FontHeight 落位，后续行以 lineH 递增。用字体 ascent
+        // 会把首行抬高（本例 fontHeight=200 / ascent=148，约 2.6px），与同排静态
+        // DefineText 的百分号基线错开。
+        const float y = static_cast<float>(et.bounds.y0) + kPad
+                        + static_cast<float>(li) * lineH
+                        + static_cast<float>(et.fontHeight);
         for (const auto& c : line) {
             if (c.shape) {
                 Matrix st; st.sx = tm.scale; st.sy = tm.scale; st.tx = x; st.ty = y;
@@ -2478,6 +2487,7 @@ static void renderDisplayObjectImpl(const std::shared_ptr<fvm::DisplayObject>& d
     ownCx.ar = static_cast<float>(d->cxAr); ownCx.ag = static_cast<float>(d->cxAg);
     ownCx.ab = static_cast<float>(d->cxAb); ownCx.aa = 0.0f;
     const ColorTransform cx = inheritedCx.post(ownCx);
+    bool staticTextReplaced = false;
 
 
     // 时间轴帧内容已由 AVM2 重建为子显示对象（timelineBuilt）时，不再重复绘制整段精灵
@@ -2495,6 +2505,13 @@ static void renderDisplayObjectImpl(const std::shared_ptr<fvm::DisplayObject>& d
             if (d->hasTextOverride) {        // 运行时数值覆盖时间轴 EditText 的初始文本
                 di.textOverride = d->textOverride;
                 di.hasTextOverride = true;
+            } else if (d->hasText && !d->textData.empty() &&
+                       it->second->kind == Character::Kind::EditText) {
+                // AS3 的 tf.text 必须替换 DefineEditText 的 InitialText；此前只额外叠加
+                // 一层动态文本，静态初始文本（如进度条 "0%"）仍留在画面上，百分比不更新。
+                di.textOverride = d->textData;
+                di.hasTextOverride = true;
+                staticTextReplaced = true;
             }
             // MovieClip 用自己的 currentFrame（动画），其余用外层帧号
             int fIdx = (d->kind == fvm::ObjKind::MovieClip && d->currentFrame > 0)
@@ -2545,7 +2562,7 @@ static void renderDisplayObjectImpl(const std::shared_ptr<fvm::DisplayObject>& d
     // AS3 Graphics 绘制命令回放（对象自身内容，位于运行时文本与子对象之下）
     if (d->graphics && !d->graphics->empty())
         renderGraphicsInto(*d, world, buf, W, H, a, d->blend);
-    if (d->hasText && !d->textData.empty())
+    if (d->hasText && !d->textData.empty() && !staticTextReplaced)
         renderDynamicText(*d, world, movie, buf, W, H, a);
     renderRuntimeChildren(d->children, world, movie, buf, W, H, frameIndex, a, cx);
 }

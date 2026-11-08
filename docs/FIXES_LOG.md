@@ -549,13 +549,122 @@ swfparser.exe swf2.swf --play-game 620 ..\..\build\compare\our_frames ^
   产物 `build\compare\framesFixNext\`（620 帧）、`tr5_full.txt` /
   `tr5_stdout.txt`、`disGs2_full.txt`、`hoverBtns_full.txt` 等。
 
+## FIX-2026-011：开场加载百分比不更新 + 具名实例 AS3 包装不唯一（2026-11-08）
+
+- **状态**：开场加载进度（用户选 A）**已修复**；关卡内进度（C）与肥皂拖拽完成
+  字节码级定位，另修掉一处会影响拖拽事件链的语义缺口；分段动画推进仍需后续处理。
+
+### A：开场加载百分比恒为 `0 %`（已修复）
+
+- **现象**：条填充随 `Bar.gotoAndStop(porcentaje)` 正常增长，但条上方的数字始终
+  显示 `0 %`（`framesFixNext/p_0005`、`p_0030`、`p_0055`）。`mi=575 progreso`
+  的 opcode 跟踪（`SWF_AS_MI=575`）确认每帧 `getproperty [Loader_txt]`(pc=105/121)
+  与两次 `setproperty [text]`(pc=117/133) 都执行了，脚本侧无断点。
+- **根因**：`Vm::setProperty` 对 `text/htmlText` 只写 `DisplayObject::textData/hasText`；
+  `Render.cpp::renderDisplayObjectImpl` 一边照旧用 `DefineEditText` 的 InitialText
+  绘制静态 `"0%"`，一边再叠加 `renderDynamicText`。Flash 语义里 `tf.text` 应该
+  **替换** InitialText，而不是叠一层，所以初始文本一直留在画面上。
+- **修复**：构造 `DisplayItem di` 时，若 `d->hasText` 且角色为 `EditText`，用
+  `d->textData` 设置 `di.textOverride`（复用 `renderItemInto` 已有的
+  `hasTextOverride` 路径）；同时置 `staticTextReplaced` 跳过 `renderDynamicText`，
+  避免同一份文字画两遍。`d->hasTextOverride`（`Player.cpp` 假启动模拟）优先保留。
+- **验证**：`framesPbA/p_0010 = 20 %`、`p_0030 = 62 %`，与条填充同步；
+  默认 620 帧全链回放 `framesFixText/p_0030 = 62 %`。
+
+### 语义缺口：同一显示对象可能产生多个 AS3 包装（已修复）
+
+- `getPropertyImpl` 的 2.5 分支与 `DisplayObjectContainer.getChildByName` 原先在
+  `c->owner` 失效时直接 `newObject(...); o->display = c;`，**没有回写 `c->owner`**。
+  于是每次 `clip["gensui"]` / `getChildByName(...)` 都可能产生新包装；帧脚本在
+  包装 A 上注册的监听，事件派发走 `objectForDisplay`（会回写 owner 得到包装 B）
+  时会整体丢失。统一改为 `objectForDisplay(c)`，保证一个 display 只有一个 AS3 实例。
+- 回归：`ownerCheck_full.txt` 中 `[mouse] mouseDown (199,440) target=aa ...
+  listeners=2` → `invokeValue method=916 ... class=onPlay1`，`[miss]` 计数 0。
+
+### C / 肥皂：字节码结论（避免重复排查）
+
+- `gameProgressBar`(mi=74) = `m_main.getChildByName(m_factoryName) as ProgressBar`。
+  `m_factoryName` 是 `GameMainController` 构造(mi=69)第 5 个**可选参数**，默认值
+  `str[28]="progressBar"` 存在 method option 里（不是 `pushstring` 指令，所以
+  `SWF_AS_FIND='progressBar'` 全量扫描 0 命中）。
+- **SWF 数据里没有 `progressBar` 这个实例名**：`[as] named cid=...` 覆盖所有
+  Sprite 的所有帧，主时间轴与 `cid=1280`（`m_main` = `元件137_112`，由 mi=969
+  的 `getChildByName("main")` 得到）的具名清单中都没有它，`symbolClass` 也没有
+  `ProgressBar` 绑定。当前帧 kids 为 1 个 Shape + 约 60 个无名 `cid391` +
+  `stepMC(cid577)` + `btnSound(cid33)`。因此 `getChildByName MISS` 不是解码丢名，
+  `gameProgressBar` 为 null 是这段通用模板代码在本 SWF 里的可选分支。
+- 右上的关卡指示 `1/5 → 2/5` 由 `m_main.play(step)`（mi=72 `pc=123-125`）的
+  帧切换驱动，实测 `p_0475 → p_0500` 正常推进，**不是** `gameProgressBar`。
+- 肥皂：`第二关_253`(cid=750) 共 315 帧，`gensui` **从 frame 111 起**才被放置
+  （另 cid=932 在 f0/32/81、cid=1042 在 f1..27、cid=1108 在 f234/308/311）。
+  frame1 脚本 `mi=935` 调 `onGoToTimeline("aa")`；`mi=915` 的 `pc=40 iffalse`
+  检查 `this["gensui"]`，frame0 为 undefined 属 SWF 数据决定的正常行为，
+  **不是引擎漏建实例**，`pc=44..91` 的 `mouseChildren/mouseEnabled=false`、
+  `startDrag(true)`、`ShakeHelp.setShakeData(...)` 要等 gensui 存在才执行。
+- `aa` 实例 world=(198.7,440.1)、depth=509、cid=697。此前网格扫描点
+  (280,280)/(720,580) 等都不在它上面，命中 `depth=347/488` 的无名对象，
+  由此产生的「被无名覆盖层拦截」判断是**误判**。实测点击 `(199,440)`：
+  `target=aa listeners=2` → `onPlay1`(mi=916) → stepMC 推进并执行
+  frame 0/1/34/36 帧脚本。
+- `addFrameScript` 在 stepMC 上注册于 0,1,34,36,52,106,110,111,112,144,146,
+  147,184,186,187,232,233,234,269,270,... 关卡是「点道具 → 播一小段 → `stop()`
+  等待下一次点击」的分段节奏；要走到含 `gensui` 的 frame 111，需要按帧脚本
+  顺序构造完整点击序列。与 FIX-2026-010 的 `nextBtn`（frame 314 才显示）同属
+  玩法动画推进链，本轮未改。
+
+- **遗留**：①构造完整的 GameStep2 分步点击序列，验证 frame 111 之后
+  `this["gensui"].startDrag` / `ShakeHelp.setShakeData` 实际执行与道具跟随渲染；
+  ②C 若指关卡内圆点进度（`PROGRESS_STEP` → `__progressChange`(mi=73) →
+  `gameProgressBar.currentStep++`），需先确认官方该分支是否有 UI 表现，
+  按用户方针暂不与官方 Flash 对比。
+- **验证**：全量构建成功；ctest **21/21 通过**；`read_lints` 0；
+  默认无环境变量 `--play-game 620` 四次点击全链回放通过
+  （`build\compare\framesFixText\`，620 帧）；产物另有 `framesPbA\`(60 帧)、
+  `clickAa_full.txt`、`hoverScan_full.txt`、`disAll_full.txt`、`ownerCheck_full.txt`。
+
+## FIX-2026-012：开场百分比数字与 `%` 的间距/基线与官方不一致（2026-11-08）
+
+- **状态**：已修复。用户确认差异点是「数字与百分号的空格、上下基线、水平位置」，
+  不是百分号字形也不是数值曲线。
+- **定量证据**（同为 83%，在官方 GIF 的 640x384 舞台像素空间测量，裁剪原点 x=270/y=205））：
+
+  | 对象 | 官方 `swf2_official_full.gif` frame 10 | 修复前本地 `p_0040` |
+  |---|---|---|
+  | 数字 | `rows 14-18, cols 49-56` | `rows 11-15, cols 50-58` |
+  | `%` | `rows 14-18, cols 60-67` | `rows 14-18, cols 60-67` |
+
+  即 `%` 位置完全一致（它是独立 `DefineText`，按 SWF 笔位绘制），而数字
+  **上移 3px、右移 2px**，与 `%` 的间距从 3px 缩到 1px。对比
+  `framesFixNext/p_0030`（A 修复前，恒为 `0`）数字也是 `rows 11-15`，
+  说明偏移是 `renderEditText` 固有问题，不是 FIX-2026-011 引入。
+- **SWF 字段**（`SWF_ET_DBG` dump `Loader_txt` 的 `DefineEditText(37)`）：
+  `fontId=81, fontHeight=200tw, bounds=(-40,-40,820,478), align=1(Right),
+  autoSize=0, hasLayout=1, L/R/indent=0, leading=40tw`；
+  `textMetrics`: `ascent=148.2tw, descent=3.0tw, lineH=151.3tw`。
+- **根因**：`Render.cpp::renderEditText` 两处偏离 Flash TextField 语义：
+  1. 缺 2px（40 twips）文本框内边距 → 右对齐时数字右边界落在 `bounds.x1`
+     而不是 `bounds.x1-40`，比官方右移 2px；
+  2. 首行基线用字体 `tm.ascent`（148.2tw）落位，而 Flash 按 `FontHeight`
+     （200tw）落位，差 `51.8tw ≈ 2.6px`，数字被抬高、`%` 却在下方 → 基线错开。
+- **修复**：文本区域四边各内缩 `kPad=40tw`（`left`/`availW` 同步），
+  首行基线改为 `bounds.y0 + kPad + li*lineH + et.fontHeight`；
+  `leading`、对齐、换行逻辑不变。影响所有 `DefineEditText`，属语义纠正。
+- **验证**：修正后同帧测量数字 `rows 14-18, cols 49-56`、`%`
+  `rows 14-18, cols 60-67`，**与官方逐像素一致**；视觉对比
+  `build\compare\pct_final_cmp.png`（上=官方、下=本地）。
+  全量构建成功；ctest **21/21 通过**（含 `swfparser_edittext`）；
+  `read_lints` 0；默认无环境变量 620 帧四次点击全链回放通过
+  （`build\compare\framesPctFinal\`，`p_0030 = 62 %`、`p_0500` 关卡 `2/5` 正常）。
+
 ---
 
-最近一次全量验证：**2026-11-08**（FIX-2026-010）——全量构建成功；ctest **21/21 通过**；
+最近一次全量验证：**2026-11-08**（FIX-2026-012）——全量构建成功；ctest **21/21 通过**；
 默认无环境变量 `--play-game 620` 四次点击全链回放通过
-（进度条 → 门户 Play → 标题屏 PLAY → 选角色 → SKIP/next → 第三关 `steps.GameStep3`，
-产物 `build\compare\framesFixNext\`）。
-上一条基线：FIX-2026-009 的 `--play-game 460 --click 310:593:574 --click 390:473:698`
+（开场百分比 20%→62% 且数字与 `%` 排版对齐官方 → 门户 Play → 标题屏 PLAY →
+选角色 → SKIP/next → 第三关 `steps.GameStep3`，产物 `build\compare\framesPctFinal\`）。
+上一条基线：FIX-2026-011 的 620 帧四次点击全链（产物 `build\compare\framesFixText\`）。
+上上条基线：FIX-2026-010 的 620 帧四次点击全链（产物 `build\compare\framesFixNext\`）。
+历史基线：FIX-2026-009 的 `--play-game 460 --click 310:593:574 --click 390:473:698`
 （进度条 → 门户 Play → 标题屏 PLAY → 第一关 `steps.GameStep1`，
 产物 `build\compare\framesFinalPlay\`）。
 历史基线：FIX-2026-006 的 `--play-game 345 --click 310:593:574`

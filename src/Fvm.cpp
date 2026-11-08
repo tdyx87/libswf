@@ -2092,14 +2092,14 @@ Value Vm::getPropertyImpl(std::shared_ptr<Object> obj, const std::string& name) 
     // 2.1) 时间轴实例名：由 applyTimelineFrame 写入 display->name，未同步到动态属性，
     //      而 AS3 代码常用 clip.name（如 int(name.charAt(2))）区分同名元件实例。
     if (obj->display && name == "name") return Value::str(obj->display->name);
-    // 2.5) 时间轴具名子实例（AS3 中 clip.instanceName 即属性访问）
+    // 2.5) 时间轴具名子实例（AS3 中 clip.instanceName 即属性访问）。
+    //      统一走 objectForDisplay：它会把新建的包装回写 d->owner，保证同一显示对象
+    //      只有一个 AS3 实例。否则帧脚本对 clip["gensui"] 注册的监听会在事件派发时
+    //      落到另一个包装对象上而丢失（道具拖拽链失效）。
     if (obj->display) {
         for (auto& c : obj->display->children) {
             if (!c || c->name != name) continue;
-            if (auto ow = c->owner.lock()) return Value::object(ow);
-            auto o = newObject(c->kind == ObjKind::DisplayObject ? ObjKind::MovieClip : c->kind, name);
-            o->display = c;
-            return Value::object(o);
+            return Value::object(objectForDisplay(c));
         }
     }
     // 2.6) E4X：XML 对象上未显式定义的点号属性解析为同名子元素；
@@ -4417,12 +4417,7 @@ void Vm::registerFlashApi() {
             if (!self || !self->display || a.empty()) return Value::nullv();
             std::string n = a[0].toString();
             for (auto& c : self->display->children) {
-                if (c->name == n) {
-                    if (auto ow = c->owner.lock()) return Value::object(ow);
-                    auto o = newObject(ObjKind::MovieClip, n);
-                    o->display = c;
-                    return Value::object(o);
-                }
+                if (c && c->name == n) return Value::object(objectForDisplay(c));
             }
             if (std::getenv("SWF_AS_DEBUG")) {
                 std::string kids;
