@@ -175,9 +175,12 @@
   帧脚本（AVM1）→ ClipActions（Load/EnterFrame，`fireClipEvents`）→ AVM2 `vm->tick()`
   （enterFrame/补间/定时器）→ 流式音频”。这是**按每个 MovieClip 独立时间轴驱动**的，
   比“全局统一 5 阶段”更贴近 Flash 真实语义（Flash 中每个 MovieClip 自带播放头）。
-- **启动时序已正确实现**：`Player.cpp:16-19` 注释描述的是**已废弃的旧路径**（伪造 1.5s+12.5s
-  启动时序、冻结主 Vm），仅 `SWF_STARTUP_SIM=1` 才启用、用于 A/B 对照；**默认按真实语义播放**，
-  并按官方“加载页→门户页→游戏”复现 preloader 进度（`updateLoadingProgress`）。
+- **启动时序完全由 SWF 自身 AS3 驱动（FIX-2026-028）**：`Player.cpp` 不含任何
+  "迁就 swf" 的阶段模拟——无配置开关、影片副本、冻结 Vm、伪造进度或门户计时器；
+  只做解码资源、按时间轴播放、执行 AVM1/AVM2 脚本。`Fvm.cpp` 修正通用首帧语义
+  （根时间轴 `cid=0` 同样在第 0 帧持有，使 `addFrameScript(0, ...)` 得以执行），
+  于是 preloader 首页 → 进度条（`progreso` 的 ENTER_FRAME）→ 门户页 → 标题屏
+  全部按 SWF 字节码顺序出现，播放器不插入任何等待。默认无环境变量回放 120 帧已验证。
 - **事件系统已完整**：`Vm::dispatchEvent`（`Fvm.cpp:4104-4167`）实现捕获→目标→冒泡三段流 +
   `stopPropagation/stopImmediatePropagation/preventDefault`/优先级/`useCapture`；
   `addEventListener/removeEventListener/hasEventListener/willTrigger` 亦已实现（`4048-4200`）。

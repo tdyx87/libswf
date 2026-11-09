@@ -33,18 +33,26 @@
 
 ### 2.1 通用性 / 内容覆盖
 - **Ruffle/Lightspark 的目标是“任何 SWF 都能播”**，覆盖 SWF v1–v20+、AVM1+AVM2、海量 `flash.*` 类。
-- 本项目**围绕有限几个真实游戏打磨**（代码中 `swf2.swf`/`service_error_mc`/`bonus`/`/:busy` 等
-  命名反复出现），对未覆盖的 tag / 类 / AVM1 边缘行为可能直接缺失。
+- 本项目**曾用有限几个真实游戏打磨**（部分历史注释仍可见 `swf2.swf`/`service_error_mc` 等名字），
+  对未覆盖的 tag / 类 / AVM1 边缘行为可能直接缺失。但播放主流程（`Player.cpp` / `Fvm.cpp`）
+  已不含针对具体 SWF 的分支或时序迁就（FIX-2026-028）。
 - **结论**：若目标是“通用播放器”，本项目广度远不及 Ruffle；若目标是“把某几个游戏播得像”，
   这反而是专注优势（见第 3 节）。
 
-### 2.2 启动 / 帧时序（初版误判，已证伪——非差距）
-- **修正**：`Player.cpp:16-19` 的“前数百帧静止”注释描述的是**已废弃的旧路径**（伪造 1.5s+12.5s
-  启动时序、冻结主 Vm），仅 `SWF_STARTUP_SIM=1` 才启用、用于 A/B 对照；**默认按真实语义播放**。
+### 2.2 启动 / 帧时序（FIX-2026-028 后完全由 AS3 驱动）
+- 曾存在伪造 1.5s+12.5s 启动时序、冻结主 Vm 的旧路径（`updateLoadingProgress`
+  伪造 41→99% 进度），FIX-2026-020 把它默认自动启用，导致开局 336 帧人为停留；
+  FIX-2026-027 先把它降为可选开关，**FIX-2026-028 已把整套子系统从代码中彻底删除**
+  （含 `SWF_STARTUP_SIM` / `SWF_SIM_DBG` / 影片副本 / 冻结 Vm / 门户计时器 /
+  会改变语义的 `SWF_NO_HOLDFRAME`、`SWF_LEGACY_ROOT_FRAME` 开关）。
+- **默认按 AS3 字节码顺序播放**：`Fvm.cpp` 的根时间轴首帧持有让第 0 帧
+  `addFrameScript(0, ...)` 正常执行，preloader 首页 → 进度条（`progreso` ENTER_FRAME）
+  → 门户页 → 标题屏 → 关卡页全部由 SWF 自身脚本驱动。默认无环境变量 120 帧回放已验证
+  （`build/compare/pure2_strip.png`）；点击链 `--click 80:593:574 --click 140:473:698`
+  仍完整（`build/compare/pure2_click_strip.png`），帧号比模拟时代提前是因为不再有人为停留。
 - 实际的帧循环 `Player::tick`（`Player.cpp:594-677`）真实存在且精细：每帧“推进播放头 → 快照静态帧 →
   重建精灵运行态子树 → 各 MovieClip 独立推进并执行内部帧脚本 → 新精灵首帧脚本 → 帧脚本（AVM1）→
-  ClipActions（Load/EnterFrame）→ AVM2 `vm->tick()`（enterFrame/补间/定时器）→ 流式音频”，
-  并按官方“加载页→门户页→游戏”复现 preloader 时序（`updateLoadingProgress`）。
+  ClipActions（Load/EnterFrame）→ AVM2 `vm->tick()`（enterFrame/补间/定时器）→ 流式音频”。
 - **结论**：本项目按**每个 MovieClip 独立时间轴**驱动，比“全局统一 5 阶段”更贴近 Flash 语义
   （Flash 中每个 MovieClip 自带播放头）。此项**不是差距**，在针对性上反而优于简单全局循环。
 

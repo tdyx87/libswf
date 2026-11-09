@@ -96,28 +96,6 @@ private:
     // 在下一个 tick 生效（与 Flash 一致：跳转从下一帧开始，且会执行目标帧脚本）。
     struct PendingGoto { bool active = false; int frame = 1; bool play = true; };
     PendingGoto pendingGoto_;
-    // AVM2 影片的模拟加载阶段。官方 Flash Player 流式加载时 preloader 会持续显示约
-    // 1.5 秒并让进度条递增；本地一次解码完没有加载过程，播放器第一次 tick 就把主
-    // 时间轴推到第 2 帧，加载画面只会一闪而过。这里用独立的影片副本 + Vm 维持一段
-    // preloader 播放，期间不推进游戏 Vm（其具名实例 main 只在第 2 帧，改动初始帧
-    // 会让 AS3 初始化失败、游戏卡在内部 loading）。
-    Movie loadingMovie_;
-    std::vector<std::shared_ptr<fvm::DisplayObject>> firstFrameStage_;
-    std::vector<std::shared_ptr<fvm::Vm>> loadingVms_;
-    int loadingTotal_ = 0;
-    int loadingElapsed_ = 0;
-    // 加载完成后的品牌门户阶段：preloader 主容器的第 2 帧（intro_mc）。
-    int portalTotal_ = 0;
-    int portalElapsed_ = 0;
-    bool portalStarted_ = false;
-    std::shared_ptr<fvm::DisplayObject> preloaderRoot_;
-    void updateLoadingProgress();
-
-    // 当前阶段应接收鼠标事件的 Vm 集合：加载/门户阶段渲染的是启动副本
-    // （loadingVms_ 的 firstFrameStage_），AVM2 点击必须派发给该副本，否则会落到
-    // 仍冻结在第 0 帧的真实游戏 Vm（vms_），导致门户 Play 等按钮点不中（FIX-2026-022）。
-    std::vector<std::shared_ptr<fvm::Vm>>& activeVms();
-
     void snapshotItems(int frameIndex);
     // 递归为显示列表中的每个精灵实例重建其内部帧运行态子树（children）：以静态帧快照
     // 为模板，按 (depth, characterId) 从旧子树继承运行态（rtFrame/按钮态/是否初始化）。

@@ -1804,17 +1804,6 @@ static bool declaresProperty(const std::shared_ptr<Object>& o, const std::string
 }
 
 // ---------- Vm ----------
-// 根时间轴语义（FIX-2026-006 转正）：默认按 Flash 从第 1 帧建根，并允许根逐帧推进。
-// SWF_LEGACY_ROOT_FRAME=1 可复现旧的"最后具名帧 + 冻结根"行为，用于 A/B 对照。
-// static-local 只求值一次，避免 advanceTimeline 每帧对每个显示对象调用 getenv。
-static bool legacyRootFrame() {
-    static const bool v = [] {
-        const char* e = std::getenv("SWF_LEGACY_ROOT_FRAME");
-        return e && e[0] == '1';
-    }();
-    return v;
-}
-
 Vm::Vm(const abc::AbcFile& abc, Movie& movie) : abc_(abc), movie_(movie) {}
 
 std::shared_ptr<Object> Vm::newObject(ObjKind kind, const std::string& cls) {
@@ -3480,17 +3469,16 @@ void Vm::registerNativeClasses() {
         }
     }
 
-    // ---- Security：本地整片加载（projector）语义 ----
-    // 游戏 Service.init 等以 Security.sandboxType 判定运行环境并决定是否发起网络请求、
-    // allowDomain 常在启动期调用。缺该类时 getlex Security 返回 undefined，
-    // 初始化流程会走错分支直接 return（preloader 的假进度驱动因此永不启动）。
+    // ---- flash.system.Security（AVM2 内建类）----
+    // 运行时没有 URL 来源信息，按"具备网络加载能力"统一报告 remote 沙箱：
+    // URLLoader.load() 会派发 COMPLETE，SWF 的网络分支因而可正常执行。
+    // allowDomain / allowInsecureDomain 在本地沙箱下为 no-op。
     {
         auto c = mkClass("Security", ObjKind::Generic);
         globals_->props["flash.system.Security"] = Value::object(c);
         auto cd = c->classDef;
-        // 本地 SWF（projector/文件加载）= "application" 沙箱，非 REMOTE
         Member st; st.kind = Member::Method; st.name = "sandboxType"; st.isStatic = true;
-        st.defaultValue = Value::str("application");
+        st.defaultValue = Value::str("remote");
         cd->staticMembers.push_back(st);
         Member ad; ad.kind = Member::Method; ad.name = "allowDomain"; ad.isStatic = true;
         ad.native = [](std::shared_ptr<Object>, const std::vector<Value>&) -> Value {
@@ -5296,21 +5284,10 @@ void Vm::instantiateDocumentClasses() {
             // 这样 getChildByName("main"/"menu"...) 才能命中时间轴上的实例。
             if (inst->display && !movie_.frames.empty()) {
                 auto parent = inst->display;
-                // 根时间轴的具名实例（如 "main"）只出现在后续关键帧中；
-                // 取最后一个含具名实例的帧作为初始放置列表来源。
-                // 静态渲染首帧时（setInitialFrame(0)）改用第 0 帧，才能显示
-                // preloader 而不是把第 2 帧的游戏内容提前画出来。
-                // 默认按 Flash 语义从第 1 帧（索引 0）开始建根：preloader/门户内容
-                // 在第 1 帧，后续由根时间轴推进 + gotoAndStop 驱动。
+                // 按 Flash 语义从第 1 帧（索引 0）开始建根：静态渲染首帧时
+                // （setInitialFrame(0)）同样取第 0 帧，不把后续帧的游戏内容提前画出来。
+                // 后续内容由根时间轴推进 + gotoAndStop 驱动。
                 size_t rootFrame = initialFrame_ >= 0 ? static_cast<size_t>(initialFrame_) : 0;
-                if (initialFrame_ < 0 && legacyRootFrame()) {
-                    // 旧行为（A/B 对照）：取最后一个含具名实例的帧作为初始放置列表，
-                    // 保证文档类构造时能拿到 main；默认路径不再提前画出游戏内容。
-                    for (size_t fi = 0; fi < movie_.frames.size(); ++fi) {
-                        for (const auto& di : movie_.frames[fi].items)
-                            if (!di.name.empty()) { rootFrame = fi; break; }
-                    }
-                }
                 // 主时间轴仍从第 1 帧（索引 0）开始播放，保证 addFrameScript(0) 的入口逻辑执行
                 if (dbg) std::fprintf(stderr, "[as] root frame=%zu items=%zu\n", rootFrame,
                                       movie_.frames[rootFrame].items.size());
@@ -5804,10 +5781,10 @@ void Vm::advanceTimeline(const std::shared_ptr<DisplayObject>& d) {
     // Flash 语义上"可播放的精灵"由"characterId 指向 DefineSprite"决定，
     // 与运行时包装对象的 ObjKind 无关；只认 MovieClip 会漏掉一部分
     // 带时间轴补间/帧脚本的精灵（它们的 currentFrame 停在 0，帧脚本不触发）。
-    // 根时间轴（stage 根，characterId==0，parent==null）默认也按 movie_.frames
-    // 逐帧推进——这是 preloader/门户屏（根第 1 帧内容）得以显示与等待点击的前提；
-    // stop()/play() 原生已作用于根的 playing 标志。FIX-2026-006 转为默认行为。
-    const bool isStageRoot = !d->parent && !legacyRootFrame();
+    // 根时间轴（stage 根，characterId==0，parent==null）同样按 movie_.frames
+    // 逐帧推进——这是根第 1 帧内容得以显示与等待点击的前提；
+    // stop()/play() 原生已作用于根的 playing 标志。
+    const bool isStageRoot = !d->parent;
     if (std::getenv("SWF_AS_DEBUG") && (isStageRoot || d->characterId == 0))
         std::fprintf(stderr, "[as] adv cls=%s cid=%d parent=%s playing=%d frame=%d lastScript=%d\n",
                      d->name.c_str(), d->characterId, d->parent ? "Y" : "N",
@@ -5838,9 +5815,16 @@ void Vm::advanceTimeline(const std::shared_ptr<DisplayObject>& d) {
                 // "很多都没有 stop"）。首帧持有是正确的 AS3 语义，必须保留。
                 // 加载转盘的旋转应走脚本驱动路径（enterFrame/_rotation），
                 // 见 FIX-2026-025。
-                if (d->currentFrame == 0 && d->lastScriptFrame < 0 &&
-                    d->characterId && d->frameScripts.count(0) &&
-                    !std::getenv("SWF_NO_HOLDFRAME")) {
+                // 根时间轴（cid==0）同样必须首帧持有：主时间轴第 1 帧上的子剪辑
+                // （如 preloader）注册的 addFrameScript(0,..) 中含 stop()/parent.stop()，
+                // 若根在第一次 tick 就推进到第 2 帧，这些首帧脚本永远不执行、首页被跳过。
+                // 持有只持续一拍：runFrameScripts 随后把 lastScriptFrame 置 0，下一 tick
+                // 条件失效；若脚本调用了 parent.stop()，根的 playing 已为 false 不再推进。
+                const bool holdFirst =
+                    (isStageRoot && d->currentFrame == 0 && d->lastScriptFrame < 0) ||
+                    (d->currentFrame == 0 && d->lastScriptFrame < 0 &&
+                     d->characterId && d->frameScripts.count(0));
+                if (holdFirst) {
                     // 保持第 0 帧，脚本由本帧稍后的 runFrameScripts 执行
                 } else {
                     ++d->currentFrame;

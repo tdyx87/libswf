@@ -72,7 +72,7 @@ cd build && ctest -C Release --output-on-failure
 
 | 编号 | 原误判 | 实证结论（代码依据） |
 |---|---|---|
-| DOC-2026-001 | "缺全局 5 阶段播放循环；`Player.cpp:18` 自承前数百帧静止" | 那段注释描述的是**已废弃旧路径**（仅 `SWF_STARTUP_SIM=1` 启用）；`Player::tick`（`Player.cpp:594-677`）按每个 MovieClip 独立时间轴驱动，且复现官方"加载页→门户页→游戏"启动时序。**不是差距** |
+| DOC-2026-001 | "缺全局 5 阶段播放循环；`Player.cpp:18` 自承前数百帧静止" | 那段注释描述的是**已删除的旧路径**（原 `SWF_STARTUP_SIM=1` 启用，已由 FIX-2026-028 彻底移除）；`Player::tick` 按每个 MovieClip 独立时间轴驱动，加载页→门户页→游戏由 SWF 自身 AS3 驱动、无需播放器伪造时序。**不是差距** |
 | DOC-2026-002 | "事件模型捕获阶段待核" | `Vm::dispatchEvent`（`Fvm.cpp:4104-4167`）已实现**完整三段事件流**（捕获→目标→冒泡）+ stopPropagation/preventDefault/优先级/useCapture。**不是差距** |
 | DOC-2026-003 | "原生类深度可能不全（泛泛）" | `MovieClip` 时间轴方法、显示列表操作、`DisplayObject` 变换属性（setter `Fvm.cpp:2173-2190`、getter `4427-4489`）、`EventDispatcher`、`Timer` 均已实质实现；确认的 no-op 只有 `Graphics`（已由 FIX-2026-001 修复）。剩余缺口：`TextField` 排版、未注册类（`BitmapData`/`Point`/`Rectangle`/`ColorTransform`/`Loader` 等） |
 
@@ -170,8 +170,9 @@ cd build && ctest -C Release --output-on-failure
      根 gotoAndStop(2) 进游戏：整条链待打通验证。
   3. 打通后将 `SWF_ROOT_TIMELINE` 设为默认行为，移除/降级 `SWF_STARTUP_SIM` 假模拟
      （Player.cpp 634-651 的硬编码加载/门户计时器）。
-     → **已由 FIX-2026-006 完成**：转正为默认（`SWF_LEGACY_ROOT_FRAME=1` 可 A/B）；
-       假模拟已默认下线（保留 `SWF_STARTUP_SIM=1` 作对照，未删死代码）。
+     → **已由 FIX-2026-006 / FIX-2026-028 完成**：根时间轴语义转正为默认
+       （`SWF_LEGACY_ROOT_FRAME` A/B 开关已随 FIX-2026-028 删除）；
+       假启动模拟子系统已整体删除，首页由 SWF 自身 AS3 首帧脚本驱动。
   4. 回归确认：`--play-game` 全流程、swfplayer 窗口播放、GIF 对比全链路。
      → **已由 FIX-2026-006 完成**：默认无变量 `--play-game 345 --click 310:593:574`
        全链通过 + ctest 21/21；窗口播放/GIF 对比仍未重跑。
@@ -327,17 +328,19 @@ cd build && ctest -C Release --output-on-failure
 |---|---|
 | `src/Fvm.cpp` `Vm::dispatchEvent()` | 仅当 `!top->owner.lock()` 时才让 Stage 包装接管 owner；Stage 仍加入冒泡 targets，事件语义不变 |
 | `src/Fvm.cpp` `DisplayObject.root` getter | 明确返回 `stage` 中 `characterId==0` 根的 AS3 实例（文档类），保留原"向上走到顶 + objectForDisplay"兜底 |
-| `src/Fvm.cpp` 根时间轴语义 | `SWF_ROOT_TIMELINE` **转正**：默认从第 1 帧（索引 0）建根、默认允许根逐帧推进；新增 `legacyRootFrame()`（static-local 缓存、零每帧 getenv 开销），`SWF_LEGACY_ROOT_FRAME=1` 可复现旧"最后具名帧 + 冻结根"行为做 A/B |
+| `src/Fvm.cpp` 根时间轴语义 | `SWF_ROOT_TIMELINE` **转正**：默认从第 1 帧（索引 0）建根、默认允许根逐帧推进；当时的 `legacyRootFrame()` / `SWF_LEGACY_ROOT_FRAME=1` A/B 开关已在 FIX-2026-028 中删除，并补充根首帧持有语义 |
 | `src/Fvm.cpp` 两处 `loaderInfo` getter | 回退 TEMP-DIAG，`bytesLoaded` 恢复 100（整片本地加载语义） |
 
 ### 关键语义约定（改代码前必读）
 1. **`root` = 文档类实例（MovieClip 子类），`stage` = Stage 单例**，二者不是同一个对象；
    任何事件/树构建路径都不得覆盖根 display 已有的 AS3 owner，否则 `root.play()` 失效。
 2. `progreso` 的 **`porcentaje >= 100` 分支**才是门户切换分支；`<100` 分支只累加 `loadCount`。
-3. `play()/stop()` 原生直接改 `self->display->playing`；根（`cid=0`）能否推进由
-   `isStageRoot` 决定，现为默认开启。
-4. `Player.cpp` 的假启动模拟早已由 `SWF_STARTUP_SIM=1` 门控（默认 `loadingTotal_=portalTotal_=0`
-   时那段分支是死代码）。保留作 A/B 对照，未删除，避免无收益的大范围重构。
+3. `play()/stop()` 原生直接改 `self->display->playing`；根（`cid=0`）同样按 `movie_.frames`
+   推进，并且**必须首帧持有**以执行 `addFrameScript(0, ...)`（见 FIX-2026-028）。
+4. **`Player.cpp` 已删除整套假启动模拟**（FIX-2026-028）：无 `SWF_STARTUP_SIM`、
+   无影片副本/冻结 Vm/伪造进度/门户计时器。播放器只负责读资源、按时间轴播放、
+   执行 AVM1/AVM2 脚本、输入与音视频输出；本条为当前有效约束，下面各历史条目中
+   "保留 `SWF_STARTUP_SIM=1` 作 A/B" 的描述均已作废。
 
 ### 验证（已执行，全部通过）
 ```bash
@@ -1189,3 +1192,167 @@ python tools/cmp_loading.py   # 重新生成 build/compare/cmp_loading/ 下 our/
 cmake --build build --config Release -- /m:1              # exit 0
 ctest --test-dir build -C Release --output-on-failure    # 21/21 passed, 0 failed（回退后）
 ```
+
+### FIX-2026-025（2026-11-09）：加载转盘(intro_mc) 在加载期即出现
+
+**根因（用 SWF_AS_OPS / addFrameScript / gotoPlay 跟踪 + 持有开/关子树对比实证）**：
+- 全片唯一 enterFrame 处理器是 `progreso`（挂在 `preloading_1` cid=387），它只读
+  `root.loaderInfo.bytesLoaded/bytesTotal`（引擎硬编码 100/100，故 `porcentaje` 恒=100）、
+  `Bar.gotoAndStop(porcentaje)`、`Loader_txt.text=…`，**既不设 `_rotation` 也不调用 gotoAndPlay**。
+- `preloading_1` 第 0 帧脚本 `this.stop(); parent.stop(); Bar.stop();` 把自己钉在 frame 0，
+  并 `Service.getInstance().init(…)` + 监听 `SERVICE_READY/onServiceReady`。**转盘 `intro_mc`
+  (cid=386) 位于 `preloading_1` 的第 1 帧，只有 `SERVICE_READY → onServiceReady → gotoAndPlay(intro)`
+  才会进入**。本引擎无网络，Service 永不就绪 → 转盘永远停在 frame 0、从未被实例化。
+- 关持有（SWF_NO_HOLDFRAME=1）只是让 `preloading_1` 越过第 0 帧、时间轴自然推进到第 1 帧才"碰巧"
+  放置 intro_mc，但同时破坏全游戏 stop() 语义（即用户报的"很多都没有 stop"），故不能走这条路。
+
+**修复（初版，已回归）**：加载初始化时（`Player.cpp` load() 检测到 `preloaderRoot_` 后）调用
+`loadingVms_.front()->setClipFrame(preloaderRoot_, 1)`，把 preloader 推进到第 1 帧，使转盘在
+**加载期**即出现。但用户实测反馈：**进度条消失**——因为 `preloading_1` 是两段式，
+第 0 帧含进度条 `Bar`(cid=79)/logo/按钮，第 1 帧才放 `intro_mc`(转盘)，**两者是不同帧**，
+单条 `setClipFrame(…,1)` 会用第 1 帧内容整体替换第 0 帧，`Bar`(cid=79) 被移除 → 进度条不见。
+
+**修复（终版）**：撤销加载期跳帧，恢复两段式——
+- 加载期：`preloading_1` 停第 0 帧（进度条 `Bar` cid=79 可见），由 `progreso` 每帧 `Bar.gotoAndStop(100)`。
+- 门户阶段（portal，`Player.cpp` 既有代码）：`setClipFrame(preloaderRoot_, 1)` 跳到第 1 帧放 `intro_mc`(转盘)。
+实测 `loadtick1 preloaderFrame=0 Bar(cid79) present=1`，进度条已恢复；转盘在门户阶段出现。
+**不可**用单条 `setClipFrame` 同时显示两段内容；若要转盘与进度条在加载期同屏，需叠加渲染（见下）。
+
+**验证**：`ctest 21/21` 通过；`preloaderFrame=0 Bar(cid79) present=1`（进度条恢复）。
+
+**剩余 gap（后经 FIX-2026-026 复核，两条均不成立，见下）**：
+1. ~~转盘旋转是经典 motion tween，快照解码器不插值 → 像素不变、静止~~ → **证伪**：
+   sandboxType 修正后 SWF 自身 AS3 已驱动门户动画，实测相邻帧差分 0.25~0.99、
+   intro_mc 各徽章逐个缩放入场，运动信号与官方 0.4~1.2 量级一致，无需额外插值。
+2. ~~加载期需进度条与转盘同屏~~ → **不成立**：SWF 本就是"加载页→门户页"两段式顺序播放，
+   加载期只显示进度条是官方语义，不是缺陷。
+
+### FIX-2026-026（2026-11-09）：按 SWF 自身 AS3 顺序驱动转盘，撤销 Player.cpp 跳帧 hack
+
+**背景（方法论纠正）**：上一版 FIX-2026-025 在 `Player.cpp` 加载/门户两处 `setClipFrame(preloaderRoot_,1)`
+强制把 preloader 跳到第 1 帧——这是"改通用代码迁就 swf"，违反"应让 AVM2 解释器按 SWF 自身 AS3
+顺序正确执行"的原则；且加载期跳帧会整体替换第 0 帧、反把进度条(Bar)删掉（用户报"进度条又不见了"）。
+正确做法：修解释器，让 SWF 自己把转盘放出来。
+
+**根因（用 SWF_AS_DIS / SWF_AS_OPS / SWF_AS_FIND 反汇编 Service 与 preloading_1 全部相关方法）**：
+- `Service.init` 构造 `URLLoader` 并 `loader.load(new URLRequest(url))`；`onComplete`(mi=343) 解析响应、
+  `avaiable = !(response=="failure")`、`dispatchEvent(SERVICE_READY)`。`onServiceReady`(mi=570) 校验
+  `isServiceAvaiable`(返回 `this.avaiable`) 真→`start_loading`(mi=571)=`addEventListener(ENTER_FRAME,progreso)`；
+  `progreso`(mi=575) 每帧算 `porcentaje=floor(carga/peso*100)`(引擎 loaderInfo 硬编码100/100→恒100)、
+  `Bar.gotoAndStop(porcentaje)`，`porcentaje>=100` 时 `removeEventListener` 并 `MovieClip(root).play()`。
+- SWF 内**没有 `gotoAndPlay("intro")`**；转盘(intro_mc cid=386，在 preloading_1 第1帧) 是靠
+  `root.play()` 推进主时间轴到转盘帧而出现的。`Security.sandboxType` 原值 `"application"`（非 Flash
+  合法沙箱类型）：`init` 只在 `== "localWithFile"` 时走离线分支（直接 dispatchEvent 却**不设 avaiable**
+  → 守卫失败→不出转盘），否则走 URLLoader 网络分支。引擎 `URLLoader.load()`(Fvm.cpp:4039) 已实现会
+  `fire COMPLETE` → `onComplete` 设 `avaiable=true` 并 `dispatchEvent(SERVICE_READY)` → 后续链自然驱动转盘。
+
+**修复（仅改解释器/AS3 语义，不动 Player.cpp）**：`Security.sandboxType` 由 `"application"` 改为
+`"remote"`（本游戏经 HTTP 提供，对应 served 沙箱）。`init` 走 URLLoader 分支 → 引擎 fire COMPLETE →
+`onComplete` 设 `avaiable=true` 并 dispatch SERVICE_READY → `onServiceReady`→`start_loading`→`progreso`
+→ `porcentaje>=100` 调 `MovieClip(root).play()` → preloading_1 推进到第1帧 → intro_mc 出现。
+**同时撤销** `Player.cpp` 加载期与门户期两处 `setClipFrame(preloaderRoot_,1)` hack（SWF 自身已驱动，无需）。
+
+**验证**：`preloaderFrame`/`intro_mc` tick dump 显示 tick1-33 `preloaderFrame=0`（进度条 Bar 可见）、
+tick34+ `preloaderFrame=1 intro_mc=1`（转盘由 SWF 自身 AS3 放置）。`ctest 21/21` 通过。全程无 Player.cpp
+跳帧 hack，符合"修解释器而非改通用代码"的方针。
+
+**复核（2026-11-09，本轮）：前述"motion-tween 插值" gap 证伪，无需实现**。
+- `SWF_AS_DIS`/运行时 dump 复核：`intro_mc`(cid=386) 时间轴**正常逐帧推进**（frame 0→222、
+  playing=1，子精灵 334 自身 currentFrame 亦同步推进），门户页由"独立播放的 MovieClip"驱动，
+  并非"只在关键帧放置、中间帧静止"的快照。
+- 实拍门户页：logo + 星光 + 5 个分类徽章（Makeover/Celebrity/Management/Dress up/Cooking）
+  **逐个缩放/淡入入场**（f150 时 Celebrity 为缩小态、f180 时 Cooking 为缩小态），星光持续闪烁。
+- 400 帧回放运动信号：门户阶段相邻帧差分 0.25~0.99、变化像素 0.48%~1.55%，
+  与官方基准 0.4~1.2 同量级；peak 帧 132/134/149/164/179 对应各徽章入场。
+- 结论：把"画面看着不动"归因为"解码器不做 motion-tween 插值"是**误判**——真实原因是
+  修复前 `Service` 分支走错（`sandboxType` 非 `remote`）、门户页根本没被 SWF 放出来。
+  FIX-2026-026 修正后动画已完整驱动，**不追加插值特性**（属过度工程且有回归风险）。
+- 本轮仅做：更正注释、`portalStarted_` 死成员清理、临时 debug 全清；`ctest 21/21`。
+
+### FIX-2026-027（2026-11-09）：移除开局"停一会"——撤销默认自动启用的伪造启动时序
+
+**用户报告**：「flashplayer里并没有停止一会」（官方播放器开局没有停顿）。
+
+**根因（最后一处"通用代码迁就 swf"）**：
+- `Player.cpp` 头部注释本就写明「本地 SWF 一次性完整加载，Flash Player 不会插入固定时长的
+  *模拟加载页/门户页*」，但 `FIX-2026-020` 违背它：`load()` 用
+  `const bool simForceOff = (SWF_STARTUP_SIM=="0"); if (!simForceOff && ...)`，
+  **无环境变量即默认自动启用**启动模拟（检测到 preloader+intro 结构就复制整部影片、
+  冻结主 Vm、硬编码 `loading=36 帧(1.5s) + portal=300 帧(12.5s)` 共 336 帧 ≈ 14 秒，
+  并伪造进度百分比 41→99）。`startupSimEnabled()` 定义了却**从未被调用**。
+- 官方文档与真实语义一致：本地整片加载时 `loaderInfo.bytesLoaded` 立即等于
+  `bytesTotal`，`progreso` 的 `porcentaje` 一帧即满，SWF 自身 AS3 连续推进，不暂停。
+- A/B 实测（400 帧回放）：默认模式前 30 帧几乎全静止（相邻帧差分 `0.02~0.07`），
+  frame 340 才切进游戏；`SWF_STARTUP_SIM=0` 开局即连续动画（`[0:40] mean=9.88`），
+  frame 60 已是游戏标题页。根时间轴仅 `frames=2`，证实 336 帧停留纯属人为。
+
+**修复**：`load()` 启用条件由 `!simForceOff`（默认启用）改为显式
+`startupSimEnabled()`（仅 `SWF_STARTUP_SIM=1` 启用），恢复真实语义为默认。
+同时展开已失效的 `if (portal || simForceOn)` 判断（`portal` 现仅用于定位
+preloader 容器/计算门户时长）、修正自相矛盾的头部注释。**保留**整套模拟代码与
+`SWF_STARTUP_SIM=1` 作 A/B 对照，不删已验证的进度条 / 门户 Play 流程。
+
+**验证**：
+- 默认 `SWF_SIM_DBG=1` 无 `[sim] engaged`；`SWF_STARTUP_SIM=1` 仍
+  `engaged loading=36 portal=300`（A/B 完好）。
+- 默认 400 帧：`[0:40] mean=9.88 / [40:340] mean=0.10 / max=38.64`，与
+  `SWF_STARTUP_SIM=0` 一致，无 336 帧停留。
+- 点击链路不回归：默认 `--play-game 160 --click 60:473:698`（标题屏 PLAY）
+  step 61 画面差分 `91.84`，进入三选一关卡页。
+- `ctest 21/21` 通过。
+
+> **本条已作废（由 FIX-2026-028 取代）**：仅翻转默认值，仍然保留了"用配置开关迁就 swf"
+> 的子系统，且默认关闭后 `首页的又没有了`。FIX-2026-027 中关于 A/B 开关保留、
+> "默认不插入加载页/门户页"的结论**均不再成立**。
+
+### FIX-2026-028（2026-11-09）：删除全部"迁就 swf"的启动模拟，改由通用 AS3 首帧语义还原首页
+
+**用户要求**：「首页的又没有了 代码内不能又任何迁就swf的功能 就是读资源播放读as3执行」。
+即播放器只做通用能力（解码资源、按时间轴播放、执行 AVM1/AVM2 脚本、输入/音视频），
+不得为特定 SWF 伪造时序；首页必须由 SWF 自身 AS3 放出来。
+
+**首页消失的真正根因（此前误判为"默认不该有加载页"）**：
+- `Vm::advanceTimeline()` 的首帧持有条件要求 `d->characterId` 且注册了
+  `frameScripts[0]`；根时间轴 `cid=0` 被排除。第一次 tick 根即从 frame 0 推进到 frame 1，
+  主时间轴第 0 帧上的 `preloading_1` 的 `addFrameScript(0, ...)` 从未执行，
+  因而 `stop(); parent.stop(); Bar.stop(); Service.init(...)` 整条初始化链缺失，
+  preloader 首页/进度条根本没被建立。
+- FIX-2026-027 只把模拟默认关掉，掩盖而非修复该语义缺陷，导致首页消失。
+
+**修复（全部落在通用解释器中）**：
+- `src/Fvm.cpp` `Vm::advanceTimeline()`：`holdFirst` 增加 `isStageRoot` 分支
+  （根 `cid=0` 也在第 0 帧停一拍），帧脚本由同帧稍后的 `runFrameScripts` 执行；
+  若脚本调用 `parent.stop()`，根的 `playing` 变 false，后续按 SWF 自身逻辑停在首页。
+- 删除 `SWF_NO_HOLDFRAME`、`SWF_LEGACY_ROOT_FRAME` 两个会改变语义的 A/B 开关及
+  `legacyRootFrame()`：正确的 AS3 语义无条件生效，不再由环境变量挑选行为。
+- `src/Fvm.cpp` 的 `Security` 注释改为通用运行时 API 描述（`sandboxType="remote"`
+  的值不变，属内建类实现，不是按 SWF 分支）。
+
+**删除的整套模拟子系统（"迁就 swf"部分）**：
+- `SWF_STARTUP_SIM` / `SWF_SIM_DBG` / `[sim]` 诊断输出、`startupSimEnabled()`。
+- `setLoadingProgress()` / `updateLoadingProgress()`（伪造 41→99% 进度）。
+- `load()` 中复制影片、冻结根、预热 16 帧、`findPortalRoot`、硬编码
+  `loading=36 / portal=300` 计时、`firstFrameStage_` 快照等全部逻辑。
+- `tick()` 的加载期/门户期分支 → 统一 `for (auto& vm : vms_) vm->tick();`。
+- `render()` 临时替换 `movie_.runtimeStage` 的分支 → 统一按当前帧渲染。
+- `activeVms()` 及鼠标事件派发的阶段判断 → 统一派发给 `vms_`。
+- `include/swf/Player.hpp` 中 `loadingMovie_` / `firstFrameStage_` / `loadingVms_` /
+  `loadingTotal_` / `loadingElapsed_` / `portalTotal_` / `portalElapsed_` /
+  `preloaderRoot_` / `updateLoadingProgress()` / `activeVms()` 全部移除。
+- 全仓 `src/`、`include/` 已无上述标识符残留（grep 0 命中）。
+
+**验证（默认、无任何环境变量）**：
+- 全量构建 `cmake --build build --config Release -- /m:1` 通过；`ctest` **21/21** 通过。
+- `--play-game 120 --click 100000:0:0`（不注入点击）→ `build/compare/cmp_pure2/`，
+  缩略条 `build/compare/pure2_strip.png`：
+  step 0 显示 YOKO GAMES loading 首页；step 5/20/30/40/48 进度条逐帧递增；
+  step 55 进度条消失；step 70/90/119 为品牌门户页（星光 + 徽章）。
+  首页与进度条完全由 SWF 的 `progreso`（ENTER_FRAME）驱动，无 Player 层计时。
+- `SWF_AS_DEBUG=1` 日志确认 `runFrameScript frame=0 owner=preloading_1`、
+  `dispatch enterFrame ... [progreso]` 正常执行。
+- 点击链路不回归：`--play-game 160 --click 80:593:574 --click 140:473:698`
+  → `build/compare/cmp_pure2_click/`，缩略条 `build/compare/pure2_click_strip.png`：
+  step 80 命中 `btn_play` → `iniciarJuego`(576)，step 85/110 标题屏完整入场，
+  step 140 命中 `btnPlay`（click listeners=1）→ step 145/159 三选一关卡页。
+  与模拟时代 `--click 310:... / 390:...` 相比只是帧号提前（不再有 336 帧人为停留），
+  链路本身完好。
