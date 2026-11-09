@@ -5832,6 +5832,12 @@ void Vm::advanceTimeline(const std::shared_ptr<DisplayObject>& d) {
                 // 才 >=0，导致**无任何帧脚本的纯补间动画精灵**（转场 loading 屏的
                 // 泡泡/白云/水瓶 cid770/767/552 等）lastScriptFrame 永远为 -1，
                 // 被永久锁死在第 0 帧，动画整体冻结。
+                // FIX-2026-024（已回退）：曾试过默认关闭持有以让加载转盘转动，
+                // 但这会**跳过所有第 0 帧脚本**——大量本应停在首帧的剪辑（其
+                // addFrameScript(0,..) 调用 stop()）全部失控播放（用户反馈
+                // "很多都没有 stop"）。首帧持有是正确的 AS3 语义，必须保留。
+                // 加载转盘的旋转应走脚本驱动路径（enterFrame/_rotation），
+                // 见 FIX-2026-025。
                 if (d->currentFrame == 0 && d->lastScriptFrame < 0 &&
                     d->characterId && d->frameScripts.count(0) &&
                     !std::getenv("SWF_NO_HOLDFRAME")) {

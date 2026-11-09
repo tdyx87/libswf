@@ -1059,3 +1059,133 @@ MovieClip 没修复」的根因修复：
 
 - **排错工具沉淀**：`SWF_AS_OPS=<mi>` 强制只追踪指定 method body；`SWF_AS_DEBUG` 下
   `gotoStop` 原生打印 `name/cid/total/->idx` 便于核对部件帧切换。
+
+---
+
+## FIX-2026-023：加载转盘"卡住"诊断 + 通用 MorphShape 补间修复（2026-11-09）
+
+**用户报告**：Flash 播放器加载转盘（loading 转盘）"卡住"——不旋转 / 视觉冻结。
+
+- **状态**：已诊断、已部分修复（morph 补间）、**无回归验证通过（21/21 全绿）**。
+- **核心结论**：加载 / midloading 转盘的"卡住"**不是引擎 bug**，属**进度驱动的预期行为**；
+  真正修到的通用缺陷是快照解码未展开 shape-tween 跨度（见下）。
+
+### 一、转盘"卡住"诊断结论（非 bug）
+
+分两层，均与 pct 进度相关：
+
+1. **启动进度转盘（Bar 扇形扫描 + 中心盘）**：`updateLoadingProgress()`（`Player.cpp` ~286-300）
+   的 pct 公式为 `41 + 75*(loadingElapsed_-1)/loadingTotal_`，**封顶 99%** 直到切入门户页
+   （注释明确"停在 99% 直到切入门户页"——对齐官方行为，**非冻结**）。pct 到 99% plateau 即停转。
+2. **关卡内 midloading 黄色转盘**：仅转 ~3-6 帧即冻。旋转由**运行时脚本按加载进度设 `_rotation`
+   （`turntable._rotation = progress*360`）**驱动，进度一完成即停转——脚本行为，非静态 tween。
+   A/B 测试（`SWF_NO_TWEEN=1` 开/关 morph 补间）确认 midloading 转盘在有无 morph 补间时行为一致，
+   **证明转盘旋转与 morph tween 无关**。
+
+### 二、通用缺陷修复：MorphShape 跨度补间（保留）
+
+- **根因**：本引擎快照式解码只把显示列表逐帧拷贝（ShowFrame 时快照），不展开 tween 跨度。
+  Flash 的 shape tween 是"跨度"——MorphShape 仅在首尾关键帧各 `PlaceObject(HasRatio)` 一次，
+  中间帧 ratio 由播放器按播放头线性插值生成。快照解码导致 tween 跨度内所有中间帧的 morph 比值
+  停留在首关键帧 → **变形动画冻结**（这才是真正的"卡住"类 bug）。
+- **修复落点**：
+  | 文件 | 内容 |
+  |---|---|
+  | `src/Decoder.cpp` | 新增 `expandShapeTweens(std::map<...>& chars)`：对同一 depth 上连续帧内比值恒定的 Morph，按首尾关键帧比值线性插值中间帧 ratio；`decodeMovie` 末尾调用（`!std::getenv("SWF_NO_TWEEN")` 守卫，便于 A/B）。 |
+- **不覆盖项**：loading 转盘旋转由运行时进度驱动（见上），此处**刻意不覆盖**。
+
+### 三、已回退的危险改动（matrix / motion tween 插值）
+
+- 曾尝试在 `expandShapeTweens` 中追加**矩阵/运动补间插值**（旋转/位移中间帧矩阵插值）。
+- **回退原因**：加载屏时序发生变化（transition 从 1341→1350 偏移），说明移动了交互剪辑，
+  **存在破坏已验证按钮流程的回归风险**。依据"修复 bug 时禁止把之前能用的功能改坏"规则，**回退
+  matrix 部分，仅保留 MorphShape ratio 补间**。matrix 运动补间属独立特性，需另立任务、独立验证后再做。
+
+### 四、验证
+
+```bash
+cmake --build build --config Release -- /m:1   # exit 0
+ctest --test-dir build -C Release --output-on-failure   # 21/21 passed, 0 failed
+```
+测试可执行文件全部 OK，`bad=0`；`read_lints` 0（仅 `Decoder.cpp(2473)` 一处预存无关的 C4065 warning）。
+
+### 五、可选后续（非必须，会改变官方行为）
+
+若用户坚持转盘应"持续旋转"而非进度完成即停：需改为**运行时按模拟进度持续驱动 `_rotation`**，
+但这会偏离官方 Flash 行为，须明确与用户确认后再做。
+
+---
+
+## FIX-2026-024：加载转盘"卡住"真正根因——首帧持有逻辑永久锁死带第 0 帧脚本的剪辑（2026-11-09）
+
+**用户报告 / 上下文**：上一轮（FIX-2026-023）把 loading 转盘"卡住"误判为"进度驱动、非 bug"，
+但本轮用 `fp_capture.py` 驱动**真实官方 Adobe Flash Player 21 projector** 与本项目 `swfparser.exe`
+做了逐帧对比（双方均 1280×768），运动信号（相邻帧平均绝对差）证明：
+
+- **官方 REF**（每 10 帧）：`0.0 0.1 0.4 0.7 0.3 0.6 0.6 0.8 0.8 1.1 1.2 0.7 ...` —— 加载转盘**全程持续转动**。
+- **本方 OURS（修复前，默认）**（每 5 帧）：`0.0 0.0 3.4 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.4 0.3` ——
+  加载期 step 0–49 整屏**完全静止**，仅首尾微动。即 swf2 加载转盘在本方确实**冻住**，用户主诉属实，
+  上一轮"不是 bug"结论**有误**。
+
+### 根因（已用 `SWF_SIM_DBG` 诊断 + `SWF_NO_HOLDFRAME` A/B 双重实锤）
+
+- 加载期渲染用 `firstFrameStage_`（preloader 副本的 AVM2 树，`Fvm.cpp:6607` 确认
+  `vm->stage` 与 `movie.runtimeStage` 同一对象图，故 `vm->tick()` 推进的就是被渲染的树）。
+- 诊断显示 `cid=387`（preloader 容器）之子树中多个**带第 0 帧脚本的剪辑被永久钉在 frame 0**
+  （`playing=1` 却 `frame` 不前进），其子树（含转盘）整体冻结。
+- `Vm::advanceTimeline`（`Fvm.cpp:5800`）对子对象**无条件递归**，子剪辑默认 `playing=true`，
+  本应推进；但 FIX-2026-017 的"持有首帧"分支（`Fvm.cpp:5835`）：
+  ```cpp
+  if (d->currentFrame == 0 && d->lastScriptFrame < 0 &&
+      d->characterId && d->frameScripts.count(0) &&
+      !std::getenv("SWF_NO_HOLDFRAME")) { /* hold frame 0 */ } else { ++d->currentFrame; ... }
+  ```
+  把带第 0 帧脚本的剪辑（及其承载转盘的子树）**无限期锁死在 frame 0**——`runFrameScripts`
+  虽独立执行帧脚本，但持有逻辑把该剪辑的播放头钉死，导致官方在转的加载转盘在本方静止。
+- A/B：`SWF_NO_HOLDFRAME=1` 后本方运动信号变为全程连续 `0.43 0.29 0.27 0.40 0.37 ...`，
+  与官方模式一致 → **首帧持有即元凶**。
+
+### 修复落点
+
+| 文件 | 内容 |
+|---|---|
+| `src/Fvm.cpp` | 将首帧持有改为**默认关闭**（仅 `SWF_HOLDFRAME=1` 显式启用；`SWF_NO_HOLDFRAME=1` 仍作显式关闭别名）。`runFrameScripts` 本就独立执行第 0 帧脚本，故关闭持有不影响帧脚本语义；纯补间剪辑（无第 0 帧脚本）本就不受持有影响，FIX-2026-017 初衷无损。 |
+
+### 验证（全绿）
+
+```bash
+cmake --build build --config Release -- /m:1              # exit 0
+ctest --test-dir build -C Release --output-on-failure    # 21/21 passed, 0 failed
+# 加载转盘运动信号（默认即生效，无需开关）：
+#   OURS(default) motion (every5): 0.43 0.29 0.27 0.40 0.37 0.32 0.38 0.29 0.27 0.40 0.38 0.37
+#   ← 修复前为 0.0 0.0 3.4 0.0 ...（冻结）；现与官方"持续转动"一致
+python tools/cmp_loading.py   # 重新生成 build/compare/cmp_loading/ 下 our/ref 并排与缩略图
+```
+- 回放回归：`--play-game 220 --click 100:478:700 --click 150:225:375 --click 200:1160:550`
+  干净跑完 220 步，`bad=0`。
+- 产物：`build/compare/cmp_ours/`（本方）、`build/compare/cmp_ref/`（官方连拍）、
+  `build/compare/cmp_loading/loading_sidebyside.png`（上排官方、下排本方，各 12 帧取样）。
+
+### 注
+
+- 此修复**直接对齐官方 Flash Player 行为**（转盘在加载期持续转动），非偏离官方的"持续旋转"改造；
+  FIX-2026-023「五、可选后续」关于"进度完成即停 vs 持续旋转"的取舍仍另议，与本修复无关。
+- 若某些第三方 SWF 确需首帧持有以保证第 0 帧脚本时序，可 `SWF_HOLDFRAME=1` 回退本默认。
+
+### ⚠️ 已回退（2026-11-09 当日）
+
+用户反馈"**又出现更多问题了，很多都没有 stop**"——本修复（全局默认关闭首帧持有）是**过度修正**：
+
+- 显示树诊断实锤：preloader 树中 `cid=41/42/80/83/85`（fs0=0）卡 frame 0 是**无 Sprite 帧**（静态图，
+  与持有无关）；`cid=67`（星光，cid=75 之下）在持有开启下**本来就在推进**（8→10）。
+- 被持有真正影响的是**全游戏所有带第 0 帧脚本的剪辑**——大量剪辑的 `addFrameScript(0,..)` 调用
+  `stop()` 让自己停在首帧（正确 AS3 语义）。关掉持有会让它们**越过第 0 帧、`stop()` 永不执行**，
+  全部失控播放 → "很多都没有 stop"。
+- **回退动作**：`src/Fvm.cpp` 恢复首帧持有默认开启（原 FIX-2026-017 语义，`SWF_NO_HOLDFRAME`
+  仍可显式关闭）。"转盘转动"的正确路径是**脚本驱动旋转**（enterFrame 里 `_rotation` 按进度驱动，
+  官方即如此），见 FIX-2026-025。
+
+```bash
+cmake --build build --config Release -- /m:1              # exit 0
+ctest --test-dir build -C Release --output-on-failure    # 21/21 passed, 0 failed（回退后）
+```

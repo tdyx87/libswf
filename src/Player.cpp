@@ -334,9 +334,11 @@ bool Player::load(const std::vector<std::uint8_t>& data, std::string& err) {
         // （头像/logo/星光入场动画）。
         for (const auto& r : loadingMovie_.runtimeStage) {
             if (!r) continue;
+            // 只冻结副本根时间轴本身（防止 SWF_ROOT_TIMELINE 自动推进把副本从第 1 帧
+            // preloader 推到第 2 帧 main，导致启动模拟失效）。**不要**冻结根的直接子剪辑：
+            // 转盘/logo/星光等入场动画是独立播放 MovieClip，冻结它们会让 loading 转盘在
+            // 运行期静止（用户报告的「卡住」）。
             r->playing = false;
-            for (const auto& c : r->children)
-                if (c) c->playing = false;
         }
         if (std::getenv("SWF_SIM_DBG"))
             std::fprintf(stderr, "[sim] probe abc=%zu frames=%zu stage=%zu vms=%zu\n",

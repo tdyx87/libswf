@@ -1578,6 +1578,57 @@ static void resolveForwardRefs(std::vector<Frame>& frames,
     }
 }
 
+// FIX-2026-023：Flash 的 shape tween 是"跨度"——MorphShape 只在首尾关键帧各 PlaceObject
+// 一次（带 HasRatio），中间帧由播放器按播放头位置线性插值 ratio 生成。本引擎快照式解码只把
+// 显示列表逐帧拷贝，导致 tween 跨度内所有中间帧的 morph 比值都停留在首关键帧 → 变形动画
+// 看起来"卡住"。此函数在解码完成后补一遍跨度补间：对同一 depth 上连续帧内恒定的 Morph 比值，
+// 按首尾关键帧比值线性插值中间帧，使播放时 morph 正常插值。（注：loading 转盘的旋转由 SWF
+// 按加载进度在运行时设置 _rotation，进度一完成即停转，属另一类问题，此处不覆盖。）
+static void expandShapeTweens(std::map<std::uint16_t, std::shared_ptr<Character>>& chars) {
+    for (auto& kv : chars) {
+        auto& ch = kv.second;
+        if (!ch || ch->kind != Character::Kind::Sprite) continue;
+        auto& frames = ch->spriteFrames;
+        const int F = (int)frames.size();
+        if (F < 2) continue;
+        // depth -> 该 depth 上出现 Morph 的 (帧号, ratio) 序列
+        std::map<std::uint16_t, std::vector<std::pair<int, float>>> morphByDepth;
+        for (int f = 0; f < F; ++f)
+            for (auto& it : frames[f].items)
+                if (it.character && it.character->kind == Character::Kind::Morph)
+                    morphByDepth[it.depth].push_back({f, it.ratio});
+        for (auto& kv2 : morphByDepth) {
+            const std::uint16_t depth = kv2.first;
+            auto& seq = kv2.second;
+            int i = 0;
+            while (i < (int)seq.size()) {
+                const float r0 = seq[i].second;
+                int j = i;
+                while (j + 1 < (int)seq.size() && seq[j + 1].second == r0) ++j;
+                // 跨度 [i..j] 比值恒为 r0；若下一帧比值不同（r1），说明是 tween 跨度
+                if (j + 1 < (int)seq.size()) {
+                    const float r1 = seq[j + 1].second;
+                    if (r1 != r0) {
+                        const int startF = seq[i].first;
+                        const int endF = seq[j + 1].first;   // 末关键帧
+                        if (endF > startF + 1) {
+                            for (int f = startF + 1; f < endF; ++f) {
+                                const float t = (float)(f - startF) / (float)(endF - startF);
+                                const float rr = r0 + (r1 - r0) * t;
+                                for (auto& it : frames[f].items)
+                                    if (it.depth == depth && it.character &&
+                                        it.character->kind == Character::Kind::Morph)
+                                        it.ratio = rr;
+                            }
+                        }
+                    }
+                }
+                i = j + 1;
+            }
+        }
+    }
+}
+
 bool decodeMovie(const std::uint8_t* data, std::size_t size, Movie& out, std::string& err) {
     if (size < 8) { err = "file too small"; return false; }
     // 与 Parser::parse 保持同一套头校验，避免任意以 'F' 开头的字节流进入完整解码。
@@ -2429,6 +2480,7 @@ bool decodeMovie(const std::uint8_t* data, std::size_t size, Movie& out, std::st
     ctx.movie.characters = std::move(ctx.characters);
     { std::vector<const Character*> seen;
       resolveForwardRefs(ctx.movie.frames, ctx.movie.characters, seen, 0); }
+    if (!std::getenv("SWF_NO_TWEEN")) expandShapeTweens(ctx.movie.characters);
     out = std::move(ctx.movie);
     return true;
 }
