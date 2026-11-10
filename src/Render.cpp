@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1607,9 +1609,105 @@ void renderItemsWithClip(const std::vector<DisplayItem>& items, const Matrix& ro
                          std::size_t npix, float alpha,
                          const ColorTransform& inheritedCx = ColorTransform{});
 
+// —— 渲染热点分段时间计测（SWF_RENDER_PERF=1 时启用，进程退出打印）——
+namespace rperf {
+double g_sec[6] = {0, 0, 0, 0, 0, 0};   // 0=按钮滤镜 1=静态滤镜 2=运行时滤镜 3=遮罩 4=模糊 5=包围盒扫描
+double g_aux[4] = {0, 0, 0, 0};          // 0=滤镜调用次数 1=窗口像素累计 2=最大窗口 3=核功累计
+double g_winKind[8] = {0,0,0,0,0,0,0,0}; // 各 FilterKind 累计窗口像素（DropShadow..ColorMatrix）
+double g_kindPx[8] = {0,0,0,0,0,0,0,0};  // [4]=最大半径 [5]=Σ半径 [6]=Σpasses [7]=最大passes
+struct Reporter {
+    Reporter() {
+        std::atexit([] {
+            if (!std::getenv("SWF_RENDER_PERF")) return;
+            std::fprintf(stderr,
+                         "[rperf] btnFilt=%.2fs statFilt=%.2fs rtFilt=%.2fs mask=%.2fs blur=%.2fs bbox=%.2fs\n"
+                         "[rperf] calls=%.0f winPx_sum=%.0f winPx_max=%.0f winPx_kind[DS,Blur,Glow,Bevel,GG,GB,Cnv,CM]=%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f\n"
+                         "[rperf] radius: max=%.0f sum=%.0f | passes: max=%.0f sum=%.0f\n",
+                         g_sec[0], g_sec[1], g_sec[2], g_sec[3], g_sec[4], g_sec[5],
+                         g_aux[0], g_aux[1], g_aux[2],
+                         g_winKind[0], g_winKind[1], g_winKind[2], g_winKind[3],
+                         g_winKind[4], g_winKind[5], g_winKind[6], g_winKind[7],
+                         g_kindPx[4], g_kindPx[5], g_kindPx[7], g_kindPx[6]);
+        });
+    }
+};
+inline Reporter g_reporter;
+struct Timer {
+    int idx; std::chrono::steady_clock::time_point t0;
+    explicit Timer(int i) : idx(i), t0(std::chrono::steady_clock::now()) {}
+    ~Timer() { g_sec[idx] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
+};
+}  // namespace rperf
+
+// 渲染期离屏缓冲（滤镜/遮罩）的 thread_local 池。
+// 此前每个带滤镜/遮罩的对象每帧 new+free 整幅 npix*4（1280x768≈3.9MB）缓冲，
+// 5 个 logo 面板 + intro 遮罩同屏时每秒上百次大块分配 → 明显掉帧。
+// 池采用占用位图 + RAII 租约，嵌套（遮罩内含滤镜等）各拿各的，互不覆盖；
+// 池耗尽时自动回退堆分配，语义不变。
+namespace scratch_pool {
+constexpr int kSlots = 6;
+inline std::vector<std::uint8_t>* pool() { static thread_local std::vector<std::uint8_t> p[kSlots]; return p; }
+inline unsigned* usedBits() { static thread_local unsigned u = 0; return &u; }
+// 每个槽上一使用期的脏矩形（行区间）：复用时只重清这些行，而不是整幅 3.9MB memset。
+// 逐帧播放时脏区高度相近，省下的是「对象只占画面一小块」场景的绝大部分清零带宽。
+struct SlotDirty { int y0 = 0, y1 = -1; };
+inline SlotDirty* dirty() { static thread_local SlotDirty d[kSlots]; return d; }
+}  // namespace scratch_pool
+struct ScratchBuf {
+    std::vector<std::uint8_t>* v = nullptr;
+    std::vector<std::uint8_t> heap;   // 池耗尽时的后备
+    int slot = -1;
+    int rowBytes = 0;
+    int ownY0 = 0, ownY1 = -1;
+    bool declared = false;            // 调用方已 noteRows()
+    explicit ScratchBuf(std::size_t bytes, int rbytes) : rowBytes(rbytes) {
+        unsigned& used = *scratch_pool::usedBits();
+        for (int i = 0; i < scratch_pool::kSlots; ++i) {
+            if (!(used & (1u << i))) { used |= (1u << i); slot = i; v = &scratch_pool::pool()[i]; break; }
+        }
+        if (!v) { v = &heap; }
+        const bool grew = v->size() < bytes;
+        if (grew) v->resize(bytes);
+        if (slot >= 0) {
+            if (grew) {
+                std::memset(v->data(), 0, bytes);   // 尺寸变化：旧段可能残留
+            } else {
+                const auto& d = scratch_pool::dirty()[slot];
+                if (d.y1 >= d.y0)
+                    std::memset(v->data() + static_cast<std::size_t>(d.y0) * rowBytes, 0,
+                                static_cast<std::size_t>(d.y1 - d.y0 + 1) * rowBytes);
+            }
+        }
+    }
+    ScratchBuf(const ScratchBuf&) = delete;
+    ScratchBuf& operator=(const ScratchBuf&) = delete;
+    void noteRows(int y0, int y1) { ownY0 = y0; ownY1 = y1; declared = true; }
+    ~ScratchBuf() {
+        if (slot >= 0) {
+            auto& d = scratch_pool::dirty()[slot];
+            if (declared) { d.y0 = ownY0; d.y1 = ownY1; }
+            else { d.y0 = 0; d.y1 = static_cast<int>(v->size() / std::max(1, rowBytes)) - 1; }
+            *scratch_pool::usedBits() &= ~(1u << slot);
+        }
+    }
+    std::vector<std::uint8_t>& vec() { return *v; }
+    std::uint8_t* data() { return v->data(); }
+};
+
 // 把单个显示列表项（shape / bitmap / sprite / morph / text / edittext / button）渲染进 buf。
 // alpha：累积的对象级透明度；bm：混合模式（运行时 DisplayObject.blend / PlaceObject3 blend）。
 // 运行时覆盖（AVM1 SetProperty / EditText 输入）：item.hasRt 时以 rt* 字段合成矩阵/透明度。
+static void applyFilters(const std::vector<Filter>& filters, std::vector<std::uint8_t>& layer,
+                         std::uint8_t* buf, int W, int H, std::size_t npix,
+                         int* outRowY0 = nullptr, int* outRowY1 = nullptr);
+//
+// s_rtClockMode：AVM2 运行时显示树的"整段角色静态绘制"路径置位。
+// 回退分支里的 spInit/spStopped 是 AVM1 Player 运行态字段；AVM2 路径每帧新建 di，
+// 这些字段恒为默认值，若不区分，按钮/包装精灵里嵌套的多帧剪辑会被判"未初始化"
+// 而归零到第 0 帧（swf2.swf 元件3_24→Button198→194→193→177/180 的 p5 扫光动画
+// 因此静止）。置位时改按传入的 frameIndex 时钟取内部帧。
+static thread_local bool s_rtClockMode = false;
+
 void renderItemInto(const DisplayItem& item, const Matrix& root,
                     const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
                     std::uint8_t* buf, int W, int H, int frameIndex, float alpha = 1.0f,
@@ -1664,7 +1762,23 @@ void renderItemInto(const DisplayItem& item, const Matrix& root,
         for (const auto& sub : *bucket) order.push_back(&sub);
         std::stable_sort(order.begin(), order.end(),
                          [](const DisplayItem* a, const DisplayItem* b) { return a->depth < b->depth; });
-        for (const auto* sub : order) renderItemInto(*sub, world, dict, buf, W, H, frameIndex, alpha, bm, cx);
+        for (const auto* sub : order) {
+            // BUTTONRECORD2 可以携带 FILTERS（DefineButton2 SWF8+）：
+            // swf2.swf 的 play 按钮 150 第 2 条 Over 记录挂 GlowFilter（黄色），
+            // 悬停时的"黄边"就是它。与静态路径 (renderItemsWithClip) 一致：
+            // 先画进离屏层、应用滤镜、再合成回主缓冲。
+            if (!sub->filters.empty()) {
+                rperf::Timer tmr(0);
+                const std::size_t npf = static_cast<std::size_t>(W) * H;
+                ScratchBuf layer(npf * 4, W * 4);
+                renderItemInto(*sub, world, dict, layer.data(), W, H, frameIndex, alpha, bm, cx);
+                int ry0 = 0, ry1 = -1;
+                applyFilters(sub->filters, layer.vec(), buf, W, H, npf, &ry0, &ry1);
+                layer.noteRows(ry0, ry1);
+            } else {
+                renderItemInto(*sub, world, dict, buf, W, H, frameIndex, alpha, bm, cx);
+            }
+        }
     } else if (item.character->kind == Character::Kind::Sprite) {
         // 精灵：递归渲染其运行态内部帧子树（children 由 Player 每帧同步；支持嵌套精灵、
         // 嵌套按钮与各自的独立播放头/按钮态）。
@@ -1680,16 +1794,21 @@ void renderItemInto(const DisplayItem& item, const Matrix& root,
         int idx;
         if (item.rtFrame >= 0) {
             idx = item.rtFrame % static_cast<int>(sf.size());
-        } else if (!item.spInit) {
+        } else if (!item.spInit && !s_rtClockMode) {
             idx = 0;   // 尚未初始化的新精灵：按首帧渲染（下一 tick 由 initTree 接管）
-        } else if (item.spStopped) {
+        } else if (item.spStopped && !s_rtClockMode) {
             idx = 0;   // 首帧脚本 stop()：停在内部第 0 帧
         } else {
             idx = frameIndex - item.birthFrame;
             if (idx < 0) idx = 0;
             idx %= static_cast<int>(sf.size());
         }
-        renderItemsWithClip(sf[static_cast<std::size_t>(idx)].items, world, dict, buf, W, H, idx, npix, alpha, cx);
+        // 单帧包装精灵没有本地时间轴：把上层时钟原样下传，否则内嵌的多帧剪辑
+        // （swf2.swf 元件3_24→Button198→194→193→177/180 的 "p5" 扫光动画）会把
+        // idx=0 当成 frameIndex，永远冻结在第 0 帧。多帧精灵仍按本地帧对齐
+        // （内嵌内容的 birthFrame 以本精灵帧号为基准）。
+        const int childFrame = sf.size() == 1 ? frameIndex : idx;
+        renderItemsWithClip(sf[static_cast<std::size_t>(idx)].items, world, dict, buf, W, H, childFrame, npix, alpha, cx);
     } else if (item.character->kind == Character::Kind::Text && item.character->text) {
         // 文本：逐字形按文本矩阵+笔位放置，用字形颜色实心填充字形轮廓
         const TextDef& td = *item.character->text;
@@ -1781,82 +1900,254 @@ static void compositeOver(const std::uint8_t* src, std::uint8_t* dst, std::size_
         d[3] = static_cast<std::uint8_t>(outA * 255.0f);
     }
 }
-// 可分离盒式模糊（RGBA）。
-// 用前缀和滑窗代替逐像素内层循环：每个方向 O(W*H)，与原实现逐点取
-// [x-r, x+r] 窗口均值（边界按有效样本数取平均）结果完全一致。
-static void blurBuffer(std::uint8_t* buf, int W, int H, int rx, int ry, int passes) {
-    if (rx < 1 && ry < 1) return;
-    std::vector<int> ps(static_cast<std::size_t>(std::max(W, H) + 1) * 4);
-    for (int p = 0; p < passes; ++p) {
-        if (rx >= 1) {
-            for (int y = 0; y < H; ++y) {
-                const std::uint8_t* row = &buf[static_cast<std::size_t>(y) * W * 4];
-                for (int c = 0; c < 4; ++c) ps[c] = 0;
-                for (int x = 0; x < W; ++x) {
-                    for (int c = 0; c < 4; ++c)
-                        ps[static_cast<std::size_t>(x + 1) * 4 + c] =
-                            ps[static_cast<std::size_t>(x) * 4 + c] + row[x * 4 + c];
-                }
-                // 前缀和已整行就绪，可直接写回 buf（逐像素只依赖该行前缀）
-                std::uint8_t* out = &buf[static_cast<std::size_t>(y) * W * 4];
-                for (int x = 0; x < W; ++x) {
-                    int lo = std::max(0, x - rx), hi = std::min(W - 1, x + rx);
-                    int n = hi - lo + 1;
-                    for (int c = 0; c < 4; ++c)
-                        out[x * 4 + c] = static_cast<std::uint8_t>(
-                            (ps[static_cast<std::size_t>(hi + 1) * 4 + c] -
-                             ps[static_cast<std::size_t>(lo) * 4 + c]) / n);
-                }
-            }
-        }
-        if (ry >= 1) {
-            // 竖直方向按 16 列一块处理：若逐列整幅扫描，每次只取 4 字节却要跨
-            // W*4 字节的步长，缓存几乎全部失效（实测占模糊耗时的大头）。
-            // 分块后同一行 16 个像素处在同一两条缓存行内，块内前缀和也能留在 L2。
-            constexpr int kTile = 16;
-            std::vector<int> psTile(static_cast<std::size_t>(H) * kTile * 4);
-            for (int x0 = 0; x0 < W; x0 += kTile) {
-                const int tw = std::min(kTile, W - x0);
-                const int rowInts = tw * 4;
-                for (int y = 0; y < H; ++y) {
-                    const std::uint8_t* row = &buf[(static_cast<std::size_t>(y) * W + x0) * 4];
-                    int* cur = &psTile[static_cast<std::size_t>(y) * rowInts];
-                    const int* prev = y ? &psTile[static_cast<std::size_t>(y - 1) * rowInts] : nullptr;
-                    if (prev) {
-                        for (int c = 0; c < rowInts; ++c) cur[c] = prev[c] + row[c];
-                    } else {
-                        for (int c = 0; c < rowInts; ++c) cur[c] = row[c];
-                    }
-                }
-                for (int y = 0; y < H; ++y) {
-                    int lo = std::max(0, y - ry), hi = std::min(H - 1, y + ry);
-                    int n = hi - lo + 1;
-                    std::uint8_t* d = &buf[(static_cast<std::size_t>(y) * W + x0) * 4];
-                    const int* pHi = &psTile[static_cast<std::size_t>(hi) * rowInts];
-                    const int* pLo = lo ? &psTile[static_cast<std::size_t>(lo - 1) * rowInts] : nullptr;
-                    if (pLo) {
-                        for (int c = 0; c < rowInts; ++c)
-                            d[c] = static_cast<std::uint8_t>((pHi[c] - pLo[c]) / n);
-                    } else {
-                        for (int c = 0; c < rowInts; ++c)
-                            d[c] = static_cast<std::uint8_t>(pHi[c] / n);
-                    }
-                }
-            }
+static void compositeOverRect(const std::uint8_t* src, std::uint8_t* dst, int W,
+                              int x0, int y0, int sw, int sh) {
+    for (int y = 0; y < sh; ++y) {
+        std::size_t p = static_cast<std::size_t>(y0 + y) * W + x0;
+        const std::uint8_t* s = src + static_cast<std::size_t>(y) * sw * 4;
+        for (int x = 0; x < sw; ++x, ++p, s += 4) {
+            float sa = s[3] / 255.0f; if (sa <= 0.0f) continue;
+            std::uint8_t* d = &dst[p * 4];
+            float da = d[3] / 255.0f;
+            float outA = sa + da * (1.0f - sa); if (outA <= 0.0f) continue;
+            d[0] = static_cast<std::uint8_t>((s[0] * sa + d[0] * da * (1.0f - sa)) / outA);
+            d[1] = static_cast<std::uint8_t>((s[1] * sa + d[1] * da * (1.0f - sa)) / outA);
+            d[2] = static_cast<std::uint8_t>((s[2] * sa + d[2] * da * (1.0f - sa)) / outA);
+            d[3] = static_cast<std::uint8_t>(outA * 255.0f);
         }
     }
 }
+// 可分离盒式模糊（RGBA）。
+// 用前缀和滑窗代替逐像素内层循环：每个方向 O(W*H)，与原实现逐点取
+// [x-r, x+r] 窗口均值（边界按有效样本数取平均）结果完全一致。
+// 直通↔预乘转换（规范要点 1：模糊必须在预乘 alpha 空间进行，否则半透明边缘
+// 会被透明像素的 RGB=0 拖出暗边/色溢）。
+static void premultiplyRGBA(std::uint8_t* p, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) {
+        std::uint8_t* d = &p[i * 4];
+        const float a = d[3] / 255.0f;
+        d[0] = clampU8(static_cast<int>(d[0] * a + 0.5f));
+        d[1] = clampU8(static_cast<int>(d[1] * a + 0.5f));
+        d[2] = clampU8(static_cast<int>(d[2] * a + 0.5f));
+    }
+}
+static void unpremultiplyRGBA(std::uint8_t* p, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) {
+        std::uint8_t* d = &p[i * 4];
+        const int a = d[3];
+        if (a <= 0) { d[0] = d[1] = d[2] = 0; continue; }
+        const float inv = 255.0f / static_cast<float>(a);
+        d[0] = clampU8(static_cast<int>(d[0] * inv + 0.5f));
+        d[1] = clampU8(static_cast<int>(d[1] * inv + 0.5f));
+        d[2] = clampU8(static_cast<int>(d[2] * inv + 0.5f));
+    }
+}
+
+// 归一化一维高斯核：k̃i=exp(−i²/2σ²)，i∈[−r,r]，r=⌈3σ⌉（覆盖 99.7% 能量），Σk=1。
+// σ<0.01 退化为恒等核。归一化保证常数图像卷积后不变（不整体提亮/压暗）。
+static std::vector<float> gaussianKernel(float sigma) {
+    if (sigma < 0.01f) return std::vector<float>{1.0f};
+    const int r = std::max(1, static_cast<int>(std::ceil(3.0f * sigma)));
+    std::vector<float> k(static_cast<std::size_t>(2 * r + 1));
+    const double inv2s2 = 1.0 / (2.0 * static_cast<double>(sigma) * sigma);
+    double sum = 0.0;
+    for (int i = -r; i <= r; ++i) {
+        const double v = std::exp(-static_cast<double>(i) * i * inv2s2);
+        k[static_cast<std::size_t>(i + r)] = static_cast<float>(v);
+        sum += v;
+    }
+    const float in = static_cast<float>(1.0 / sum);
+    for (auto& x : k) x *= in;
+    return k;
+}
+
+// 可分离高斯模糊（RGBA，预乘空间）。参数 sx/sy = 标准差 σ（像素），quality = 迭代次数。
+// 规范 2.2：quality 是逼近精度而非模糊程度——直接重复模糊 n 次会使总方差变 n·σ²、半径失控；
+// 正确做法方差守恒 σi=σ/√n，n 次独立高斯方差叠加 = n·(σ²/n)=σ²。
+// 规范要点 1/3：输入须为预乘 RGBA（调用方负责预乘/还原），越界采样取边缘像素（clamp）。
+static void blurBufferCore(std::uint8_t* buf, int W, int H, float sx, float sy, int quality) {
+    if (sx < 0.01f && sy < 0.01f) return;
+    const int n = std::min(15, std::max(1, quality));
+    const float sxi = sx / std::sqrt(static_cast<float>(n));
+    const float syi = sy / std::sqrt(static_cast<float>(n));
+    const std::vector<float> kx = gaussianKernel(sxi);
+    const std::vector<float> ky = gaussianKernel(syi);
+    const int rx = static_cast<int>(kx.size()) / 2;
+    const int ry = static_cast<int>(ky.size()) / 2;
+    static thread_local std::vector<std::uint8_t> tmpBuf;
+    tmpBuf.assign(static_cast<std::size_t>(W) * H * 4, 0);
+    std::uint8_t* tmp = tmpBuf.data();
+    for (int it = 0; it < n; ++it) {
+        // 水平：buf -> tmp
+        if (rx >= 1) {
+            for (int y = 0; y < H; ++y) {
+                const std::uint8_t* row = &buf[static_cast<std::size_t>(y) * W * 4];
+                std::uint8_t* o = &tmp[static_cast<std::size_t>(y) * W * 4];
+                for (int x = 0; x < W; ++x) {
+                    float acc[4] = {0, 0, 0, 0};
+                    for (int i = -rx; i <= rx; ++i) {
+                        const int xx = std::min(W - 1, std::max(0, x + i));   // 边缘 clamp
+                        const float kv = kx[static_cast<std::size_t>(i + rx)];
+                        const std::uint8_t* s = &row[xx * 4];
+                        for (int c = 0; c < 4; ++c) acc[c] += s[c] * kv;
+                    }
+                    for (int c = 0; c < 4; ++c) o[x * 4 + c] = clampU8(static_cast<int>(acc[c] + 0.5f));
+                }
+            }
+        } else {
+            std::memcpy(tmp, buf, static_cast<std::size_t>(W) * H * 4);
+        }
+        // 垂直：tmp -> buf
+        if (ry >= 1) {
+            for (int y = 0; y < H; ++y) {
+                std::uint8_t* o = &buf[static_cast<std::size_t>(y) * W * 4];
+                for (int x = 0; x < W; ++x) {
+                    float acc[4] = {0, 0, 0, 0};
+                    for (int j = -ry; j <= ry; ++j) {
+                        const int yy = std::min(H - 1, std::max(0, y + j));
+                        const float kv = ky[static_cast<std::size_t>(j + ry)];
+                        const std::uint8_t* s = &tmp[(static_cast<std::size_t>(yy) * W + x) * 4];
+                        for (int c = 0; c < 4; ++c) acc[c] += s[c] * kv;
+                    }
+                    for (int c = 0; c < 4; ++c) o[x * 4 + c] = clampU8(static_cast<int>(acc[c] + 0.5f));
+                }
+            }
+        } else {
+            std::memcpy(buf, tmp, static_cast<std::size_t>(W) * H * 4);
+        }
+    }
+}
+// Flash 滤镜模糊语义（据 SPEC-SWF-GLOW-CPU-2026 + 字节 + Flash 截图定案）：
+//   blurX/blurY = 视觉扩散半径；映射到标准差 σ = blurX/2（规范 2.1，0.5 系数）。
+//   quality/passes = 高斯逼近的迭代次数，方差守恒 σi=σ/√n（规范 2.2），
+//                    故总扩散只由 σ 决定，与 n 无关；n 只让核更接近高斯。
+//   核截断半径 = 3σ（规范 4），窗口支撑 = 3σ + 偏移。
+//   证据：150 按钮 cid=147 GlowFilter = 纯黄(255,255,0)、blurX=blurY=20、
+//   strength=2、passes=1 → σ=10、3σ 支撑 30px 的软黄环。
+struct BlurShape { float sx = 0, sy = 0; int quality = 1; int extX = 0, extY = 0; };
+static BlurShape blurShapeOf(const Filter& f) {
+    static const float kScale = [] {
+        if (const char* e = std::getenv("SWF_BLUR_SIGMA")) { float v = std::strtof(e, nullptr); if (v > 0.0f) return v; }
+        return 0.5f;   // σ = blurX · kScale（规范 2.1：kScale=1/2）
+    }();
+    static const int kQualityOverride = [] {
+        if (const char* e = std::getenv("SWF_BLUR_PASSES")) { int v = std::atoi(e); if (v >= 1) return v; }
+        return 0;
+    }();
+    const int q = kQualityOverride > 0 ? kQualityOverride : std::max(1, static_cast<int>(f.passes));
+    const float bx = std::max(0.0f, f.blurX / 20.0f);   // twips -> px（内部约定）
+    const float by = std::max(0.0f, f.blurY / 20.0f);
+    BlurShape bs;
+    bs.quality = q;
+    bs.sx = bx * kScale; bs.sy = by * kScale;
+    bs.extX = static_cast<int>(std::ceil(3.0f * bs.sx));
+    bs.extY = static_cast<int>(std::ceil(3.0f * bs.sy));
+    return bs;
+}
+
+// 模糊入口：忠实可分离高斯（σ 与 quality 由 blurShapeOf 给出）。
+static void blurBuffer(std::uint8_t* buf, int W, int H, float sx, float sy, int quality) {
+    if (sx < 0.01f && sy < 0.01f) return;
+    rperf::Timer tmr(4);
+    blurBufferCore(buf, W, H, sx, sy, quality);
+}
+
 // 由 layer 的 alpha 生成投影/辉光（偏移 offx/offy，着色为 c，alpha 乘 strength）
 static void buildShadow(const std::uint8_t* layer, std::uint8_t* out, int W, int H,
                         const Color& c, int offx, int offy, float strength) {
+    const float ca = c.a / 255.0f;   // 滤镜色 alpha 参与调制
     for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) {
         const std::uint8_t* s = &layer[(static_cast<std::size_t>(y) * W + x) * 4];
         if (s[3] == 0) continue;
         int dx = x + offx, dy = y + offy;
         if (dx < 0 || dx >= W || dy < 0 || dy >= H) continue;
         std::uint8_t* d = &out[(static_cast<std::size_t>(dy) * W + dx) * 4];
-        std::uint8_t na = clampU8(static_cast<int>(s[3] * strength));
+        std::uint8_t na = clampU8(static_cast<int>(s[3] * strength * ca));
         if (na > d[3]) { d[0] = c.r; d[1] = c.g; d[2] = c.b; d[3] = na; }
+    }
+}
+// —— Glow/DropShadow 快路：二者只依赖源 alpha（输出恒为单色），
+// 用单通道平面代替 RGBA，内存流量降约 4 倍（logo 面板每帧数十次模糊的主瓶颈）。
+static void buildShadowA(const std::uint8_t* layer, std::uint8_t* plane, int W, int H,
+                         int offx, int offy) {
+    for (int y = 0; y < H; ++y) {
+        const std::uint8_t* s = &layer[static_cast<std::size_t>(y) * W * 4 + 3];
+        for (int x = 0; x < W; ++x) {
+            std::uint8_t a = s[x * 4];
+            if (!a) continue;
+            int dx = x + offx, dy = y + offy;
+            if (dx < 0 || dx >= W || dy < 0 || dy >= H) continue;
+            std::uint8_t* d = &plane[static_cast<std::size_t>(dy) * W + dx];
+            if (a > *d) *d = a;   // 仅取(偏移后的)源 alpha；strength 在模糊后施加
+        }
+    }
+}
+// 单通道可分离高斯模糊（辉光/投影的 alpha 平面）。σ 与 quality 语义同 blurBufferCore：
+// 方差守恒 σi=σ/√n，n 次迭代，边缘 clamp，核归一化。
+static void blurPlane(std::uint8_t* p, int W, int H, float sx, float sy, int quality) {
+    if (sx < 0.01f && sy < 0.01f) return;
+    const int n = std::min(15, std::max(1, quality));
+    const std::vector<float> kx = gaussianKernel(sx / std::sqrt(static_cast<float>(n)));
+    const std::vector<float> ky = gaussianKernel(sy / std::sqrt(static_cast<float>(n)));
+    const int rx = static_cast<int>(kx.size()) / 2;
+    const int ry = static_cast<int>(ky.size()) / 2;
+    static thread_local std::vector<std::uint8_t> tmp;
+    tmp.assign(static_cast<std::size_t>(W) * H, 0);
+    for (int it = 0; it < n; ++it) {
+        if (rx >= 1) {
+            for (int y = 0; y < H; ++y) {
+                const std::uint8_t* row = &p[static_cast<std::size_t>(y) * W];
+                std::uint8_t* o = &tmp[static_cast<std::size_t>(y) * W];
+                for (int x = 0; x < W; ++x) {
+                    float acc = 0.0f;
+                    for (int i = -rx; i <= rx; ++i) {
+                        const int xx = std::min(W - 1, std::max(0, x + i));
+                        acc += row[xx] * kx[static_cast<std::size_t>(i + rx)];
+                    }
+                    o[x] = clampU8(static_cast<int>(acc + 0.5f));
+                }
+            }
+        } else {
+            std::memcpy(tmp.data(), p, static_cast<std::size_t>(W) * H);
+        }
+        if (ry >= 1) {
+            for (int y = 0; y < H; ++y) {
+                std::uint8_t* o = &p[static_cast<std::size_t>(y) * W];
+                for (int x = 0; x < W; ++x) {
+                    float acc = 0.0f;
+                    for (int j = -ry; j <= ry; ++j) {
+                        const int yy = std::min(H - 1, std::max(0, y + j));
+                        acc += tmp[static_cast<std::size_t>(yy) * W + x] * ky[static_cast<std::size_t>(j + ry)];
+                    }
+                    o[x] = clampU8(static_cast<int>(acc + 0.5f));
+                }
+            }
+        } else {
+            std::memcpy(p, tmp.data(), static_cast<std::size_t>(W) * H);
+        }
+    }
+}
+// 单色平面按 alpha 混合进主缓冲（窗口坐标 → 全帧坐标）。
+// 规范 ⑤：ag = clamp(平面alpha · strength · colorAlpha, 0, 1)；输出恒色预乘。
+static void compositeColorA(const std::uint8_t* plane, const Color& c, float strength,
+                            std::uint8_t* buf, int W, int x0, int y0, int sw, int sh) {
+    const float ca = c.a / 255.0f;
+    for (int y = 0; y < sh; ++y) {
+        const std::uint8_t* prow = &plane[static_cast<std::size_t>(y) * sw];
+        std::size_t p = static_cast<std::size_t>(y0 + y) * W + x0;
+        for (int x = 0; x < sw; ++x, ++p) {
+            std::uint8_t sa8 = prow[x];
+            if (!sa8) continue;
+            std::uint8_t* d = &buf[p * 4];
+            float sa = std::min(1.0f, (sa8 / 255.0f) * strength * ca);
+            float da = d[3] / 255.0f;
+            float outA = sa + da * (1.0f - sa);
+            if (outA <= 0.0f) continue;
+            d[0] = static_cast<std::uint8_t>((c.r * sa + d[0] * da * (1.0f - sa)) / outA);
+            d[1] = static_cast<std::uint8_t>((c.g * sa + d[1] * da * (1.0f - sa)) / outA);
+            d[2] = static_cast<std::uint8_t>((c.b * sa + d[2] * da * (1.0f - sa)) / outA);
+            d[3] = static_cast<std::uint8_t>(outA * 255.0f);
+        }
     }
 }
 // 颜色矩阵滤镜（4x5）：对 layer 每像素应用矩阵（偏移项以 0..255 计），原位修改。
@@ -1930,13 +2221,99 @@ static void buildGradientGlow(const std::uint8_t* layer, std::uint8_t* out, int 
     }
 }
 // 对离屏 layer 应用滤镜并合成回 buf：Blur 模糊本体；DropShadow/Glow 生成着色模糊阴影衬底。
+// 性能：滤镜只在「内容包围盒 ⊕ 滤镜余量」的窗口内运算（复制到小缓冲→处理→回合成）。
+// 单位换算修复后真实 blur 值生效，若仍全幅逐滤镜扫描，1280x768 每帧每个滤镜记录
+// 都要整幅前缀和（实测播放从 ~15ms/帧 恶化到数百 ms/帧）。
 static void applyFilters(const std::vector<Filter>& filters, std::vector<std::uint8_t>& layer,
-                         std::uint8_t* buf, int W, int H, std::size_t npix) {
-
+                         std::uint8_t* buf, int W, int H, std::size_t npix,
+                         int* outRowY0, int* outRowY1) {
+    if (filters.empty()) { compositeOver(layer.data(), buf, npix); return; }
+    // 1) 内容包围盒（滤镜只消费 alpha；按 8 字节字聚合扫描，每字含两个 alpha 字节，
+    //    掩码抽取，比逐像素读快数倍且判定等价）
+    int cx0, cy0, cx1, cy1;
+    {
+    rperf::Timer scanTmr(5);
+    cx0 = W; cy0 = H; cx1 = -1; cy1 = -1;
+    {
+        const std::uint8_t* l = layer.data();
+        const std::size_t rowBytes = static_cast<std::size_t>(W) * 4;
+        for (int y = 0; y < H; ++y) {
+            const std::uint8_t* row = l + static_cast<std::size_t>(y) * rowBytes;
+            bool any = false;
+            int x = 0;
+            for (; x + 1 < W; x += 2) {
+                std::uint64_t w;
+                std::memcpy(&w, row + static_cast<std::size_t>(x) * 4, 8);
+                if (w & 0xFF000000FF000000ull) { any = true; break; }
+            }
+            if (!any && x < W && row[static_cast<std::size_t>(x) * 4 + 3]) any = true;
+            if (any) { if (y < cy0) cy0 = y; cy1 = y; }
+        }
+        if (cy1 >= cy0) {
+            cx0 = W; cx1 = -1;
+            for (int y = cy0; y <= cy1; ++y) {
+                const std::uint8_t* row = l + static_cast<std::size_t>(y) * rowBytes;
+                int x = 0;
+                for (; x + 1 < W; x += 2) {
+                    std::uint64_t w;
+                    std::memcpy(&w, row + static_cast<std::size_t>(x) * 4, 8);
+                    if (!(w & 0xFF000000FF000000ull)) continue;
+                    if ((w & 0x000000FF00000000ull) && x < cx0) cx0 = x;
+                    if ((w & 0x000000FF00000000ull) && x > cx1) cx1 = x;
+                    if ((w & 0xFF00000000000000ull) && x + 1 < cx0) cx0 = x + 1;
+                    if ((w & 0xFF00000000000000ull) && x + 1 > cx1) cx1 = x + 1;
+                }
+                if (x < W && row[static_cast<std::size_t>(x) * 4 + 3]) {
+                    if (x < cx0) cx0 = x; if (x > cx1) cx1 = x;
+                }
+            }
+        }
+    }
+    }   // 包围盒扫描计测作用域
+    if (outRowY0) *outRowY0 = (cx1 < 0) ? 0 : cy0;
+    if (outRowY1) *outRowY1 = (cx1 < 0) ? -1 : cy1;   // 空内容：无需为下一租约保留任何行
+    if (cx1 < 0) return;   // 本体全透明且无输入内容：滤镜输出也必为空
+    // 2) 滤镜窗口余量：偏移距离 + 核支撑（passes·r = passes·σ·√(3/passes) = σ·√(3·passes)）+ 2。
+    int margin = 2;
+    for (const auto& f : filters) {
+        const BlurShape bs = blurShapeOf(f);
+        int ext = std::max(bs.extX, bs.extY);
+        margin = std::max(margin, static_cast<int>(std::fabs(f.distance) / 20.0) + ext + 2);
+    }
+    const int x0 = std::max(0, cx0 - margin), y0 = std::max(0, cy0 - margin);
+    const int x1 = std::min(W - 1, cx1 + margin), y1 = std::min(H - 1, cy1 + margin);
+    const int sw = x1 - x0 + 1, sh = y1 - y0 + 1;
+    const std::size_t snpix = static_cast<std::size_t>(sw) * sh;
+    rperf::g_aux[0] += 1;
+    rperf::g_aux[1] += static_cast<double>(snpix);
+    if (static_cast<double>(snpix) > rperf::g_aux[2]) rperf::g_aux[2] = static_cast<double>(snpix);
+    for (const auto& f : filters) {
+        rperf::g_aux[3] += static_cast<double>(snpix) * std::max(1, f.passes) *
+                          (std::max(static_cast<int>(f.blurX / 20.0f), static_cast<int>(f.blurY / 20.0f)) * 2 + 1);
+        { int ki = static_cast<int>(f.kind); if (ki >= 0 && ki < 8) rperf::g_winKind[ki] += static_cast<double>(snpix); }
+        // 半径/passes 分布（诊断大半径多次迭代的成本来源）
+        int rxq = static_cast<int>(f.blurX / 20.0f), ryq = static_cast<int>(f.blurY / 20.0f);
+        int rq = std::max(rxq, ryq);
+        rperf::g_kindPx[6] += static_cast<double>(std::max(1, f.passes));   // Σpasses
+        if (static_cast<double>(std::max(1, f.passes)) > rperf::g_kindPx[7]) rperf::g_kindPx[7] = std::max(1, f.passes);  // max
+        rperf::g_kindPx[5] += rq;                                            // Σ半径
+        if (static_cast<double>(rq) > rperf::g_kindPx[4]) rperf::g_kindPx[4] = rq;  // max半径
+    }
+    // 3) 小缓冲处理（blur/shadow/composite 全部按窗口尺寸运行，逻辑与全幅一致）
+    std::vector<std::uint8_t> s(snpix * 4, 0);
+    for (int y = 0; y < sh; ++y)
+        std::memcpy(&s[static_cast<std::size_t>(y) * sw * 4],
+                    &layer[(static_cast<std::size_t>(y0 + y) * W + x0) * 4],
+                    static_cast<std::size_t>(sw) * 4);
+    std::vector<std::uint8_t> glow;
+    std::vector<std::uint8_t> glowA;
     for (const auto& f : filters) {
         if (f.kind == FilterKind::Blur) {
-            int rx = static_cast<int>(f.blurX / 20.0f), ry = static_cast<int>(f.blurY / 20.0f);
-            blurBuffer(layer.data(), W, H, rx, ry, std::max(1, f.passes));
+            const BlurShape bs = blurShapeOf(f);
+            // 规范要点 1：模糊必须在预乘空间进行。
+            premultiplyRGBA(s.data(), snpix);
+            blurBuffer(s.data(), sw, sh, bs.sx, bs.sy, bs.quality);
+            unpremultiplyRGBA(s.data(), snpix);
         } else if (f.kind == FilterKind::DropShadow || f.kind == FilterKind::Glow) {
             int offx = 0, offy = 0;
             if (f.kind == FilterKind::DropShadow) {
@@ -1944,50 +2321,56 @@ static void applyFilters(const std::vector<Filter>& filters, std::vector<std::ui
                 offx = static_cast<int>(f.distance / 20.0 * std::cos(rad));
                 offy = static_cast<int>(f.distance / 20.0 * std::sin(rad));
             }
-            float str = std::min(1.0f, std::max(0.0f, f.strength));
-            std::vector<std::uint8_t> glow(npix * 4, 0);
-            buildShadow(layer.data(), glow.data(), W, H, f.color, offx, offy, str);
-            int rx = static_cast<int>(f.blurX / 20.0f), ry = static_cast<int>(f.blurY / 20.0f);
-            if (rx >= 1 || ry >= 1) blurBuffer(glow.data(), W, H, rx, ry, std::max(1, f.passes));
-            compositeOver(glow.data(), buf, npix);   // 阴影衬底先合成（在对象之后）
+            const float str = std::max(0.0f, f.strength);   // 规范 ⑤：模糊后再乘 strength·colorAlpha
+            const BlurShape bs = blurShapeOf(f);
+            if (!f.knockout && !f.inner) {
+                // 单通道快路：Glow/DropShadow 输出恒色，只携带 alpha 信息（预乘等价）
+                glowA.assign(snpix, 0);
+                buildShadowA(s.data(), glowA.data(), sw, sh, offx, offy);   // 仅取(偏移)源 alpha
+                blurPlane(glowA.data(), sw, sh, bs.sx, bs.sy, bs.quality);
+                compositeColorA(glowA.data(), f.color, str, buf, W, x0, y0, sw, sh);
+            } else {
+                glow.assign(snpix * 4, 0);
+                buildShadow(s.data(), glow.data(), sw, sh, f.color, offx, offy, str);
+                blurBuffer(glow.data(), sw, sh, bs.sx, bs.sy, bs.quality);
+                compositeOverRect(glow.data(), buf, W, x0, y0, sw, sh);   // 阴影衬底先合成（在对象之后）
+            }
         } else if (f.kind == FilterKind::ColorMatrix) {
-            applyColorMatrix(layer, f.colorMatrix);   // 修改对象本体颜色，末尾由 layer 合成
+            applyColorMatrix(s, f.colorMatrix);       // s 即窗口全尺寸，原位修改
         } else if (f.kind == FilterKind::Convolution) {
-            applyConvolution(layer, W, H, f);         // 同上，原地作用于 layer
+            applyConvolution(s, sw, sh, f);           // 同上，原地作用于窗口层
         } else if (f.kind == FilterKind::Bevel) {
             double rad = f.angle * 3.141592653589793 / 180.0;
             int offx = static_cast<int>(f.distance / 20.0 * std::cos(rad));
             int offy = static_cast<int>(f.distance / 20.0 * std::sin(rad));
             float str = std::min(1.0f, std::max(0.0f, f.strength));
-            int rx = static_cast<int>(f.blurX / 20.0f), ry = static_cast<int>(f.blurY / 20.0f);
-            std::vector<std::uint8_t> sh(npix * 4, 0), hi(npix * 4, 0);
-            buildShadow(layer.data(), sh.data(), W, H, f.color, offx, offy, str);       // 暗侧
-            buildShadow(layer.data(), hi.data(), W, H, f.highlight, -offx, -offy, str); // 亮侧
-            if (rx >= 1 || ry >= 1) {
-                blurBuffer(sh.data(), W, H, rx, ry, std::max(1, f.passes));
-                blurBuffer(hi.data(), W, H, rx, ry, std::max(1, f.passes));
-            }
-            compositeOver(sh.data(), buf, npix);
-            compositeOver(hi.data(), buf, npix);
+            const BlurShape bs = blurShapeOf(f);
+            std::vector<std::uint8_t> sh1(snpix * 4, 0), hi(snpix * 4, 0);
+            buildShadow(s.data(), sh1.data(), sw, sh, f.color, offx, offy, str);       // 暗侧
+            buildShadow(s.data(), hi.data(), sw, sh, f.highlight, -offx, -offy, str);  // 亮侧
+            blurBuffer(sh1.data(), sw, sh, bs.sx, bs.sy, bs.quality);
+            blurBuffer(hi.data(), sw, sh, bs.sx, bs.sy, bs.quality);
+            compositeOverRect(sh1.data(), buf, W, x0, y0, sw, sh);
+            compositeOverRect(hi.data(), buf, W, x0, y0, sw, sh);
         } else if (f.kind == FilterKind::GradientGlow || f.kind == FilterKind::GradientBevel) {
             double rad = f.angle * 3.141592653589793 / 180.0;
             int offx = static_cast<int>(f.distance / 20.0 * std::cos(rad));
             int offy = static_cast<int>(f.distance / 20.0 * std::sin(rad));
             float str = std::min(1.0f, std::max(0.0f, f.strength));
-            int rx = static_cast<int>(f.blurX / 20.0f), ry = static_cast<int>(f.blurY / 20.0f);
-            std::vector<std::uint8_t> glow(npix * 4, 0);
-            buildGradientGlow(layer.data(), glow.data(), W, H, f, offx, offy);
+            const BlurShape bs = blurShapeOf(f);
+            std::vector<std::uint8_t> g(snpix * 4, 0);
+            buildGradientGlow(s.data(), g.data(), sw, sh, f, offx, offy);
             if (f.kind == FilterKind::GradientBevel) {  // 反向再生成一侧，模拟斜角
-                std::vector<std::uint8_t> glow2(npix * 4, 0);
-                buildGradientGlow(layer.data(), glow2.data(), W, H, f, -offx, -offy);
-                if (rx >= 1 || ry >= 1) blurBuffer(glow2.data(), W, H, rx, ry, std::max(1, f.passes));
-                compositeOver(glow2.data(), buf, npix);
+                std::vector<std::uint8_t> g2(snpix * 4, 0);
+                buildGradientGlow(s.data(), g2.data(), sw, sh, f, -offx, -offy);
+                blurBuffer(g2.data(), sw, sh, bs.sx, bs.sy, bs.quality);
+                compositeOverRect(g2.data(), buf, W, x0, y0, sw, sh);
             }
-            if (rx >= 1 || ry >= 1) blurBuffer(glow.data(), W, H, rx, ry, std::max(1, f.passes));
-            compositeOver(glow.data(), buf, npix);
+            blurBuffer(g.data(), sw, sh, bs.sx, bs.sy, bs.quality);
+            compositeOverRect(g.data(), buf, W, x0, y0, sw, sh);
         }
     }
-    compositeOver(layer.data(), buf, npix);          // 对象本体最后合成
+    compositeOverRect(s.data(), buf, W, x0, y0, sw, sh);   // 对象本体最后合成
 }
 
 // 渲染一组显示列表项；遇到 clipDepth 图层时，把其 depth+1..clipDepth 范围内的子项
@@ -2074,9 +2457,12 @@ void renderItemsWithClip(const std::vector<DisplayItem>& items, const Matrix& ro
             if (it.character) {
                 if (!it.filters.empty()) {
                     // 带滤镜：先渲染到离屏层，应用滤镜（投影/模糊/辉光），再合成回主缓冲
-                    std::vector<std::uint8_t> layer(npix * 4, 0);
+                    rperf::Timer tmr(1);
+                    ScratchBuf layer(npix * 4, W * 4);
                     renderItemInto(it, root, dict, layer.data(), W, H, frameIndex, alpha, it.blend, inheritedCx);
-                    applyFilters(it.filters, layer, buf, W, H, npix);
+                    int ry0 = 0, ry1 = -1;
+                    applyFilters(it.filters, layer.vec(), buf, W, H, npix, &ry0, &ry1);
+                    layer.noteRows(ry0, ry1);
                 } else {
                     renderItemInto(it, root, dict, buf, W, H, frameIndex, alpha, it.blend, inheritedCx);
                 }
@@ -2474,6 +2860,22 @@ static void renderGraphicsInto(const fvm::DisplayObject& d, const Matrix& world,
 // 临时诊断：当前 renderFrameWithItems 调用序号（按输出帧计）。
 static int g_dbgRenderCall = 0;
 
+// ---- AS3 运行时遮罩状态（详见 renderDisplayObject 注释）----
+// s_inMaskPass：正在把遮罩对象渲染进裁剪缓冲；此时不得跳过全黑 alpha 渐变形状。
+// g_maskExcluded：被任何 d->mask 引用的对象集合——它们自身不绘制、不可命中。
+static thread_local bool s_inMaskPass = false;
+static std::set<const fvm::DisplayObject*> g_maskExcluded;
+
+static void addMaskExclusions(const std::shared_ptr<fvm::DisplayObject>& d) {
+    if (!d) return;
+    if (d->mask) g_maskExcluded.insert(d->mask.get());
+    for (const auto& c : d->children) addMaskExclusions(c);
+}
+static void buildMaskExclusions(const std::vector<std::shared_ptr<fvm::DisplayObject>>& roots) {
+    g_maskExcluded.clear();
+    for (const auto& r : roots) addMaskExclusions(r);
+}
+
 // AVM2 运行时显示列表（AS3 构建的场景）的渲染。
 // parent：父级把"角色局部 twips"映射为设备像素的仿射矩阵；
 // DisplayObject 的 x/y 单位 = 父级局部空间的像素（20 twips），scale/rotation 分解自其变换矩阵。
@@ -2499,7 +2901,8 @@ static void renderDisplayObjectImpl(const std::shared_ptr<fvm::DisplayObject>& d
     // 带 clipDepth 的层是遮罩：Flash 只把它当作裁剪区域，自身不绘制。
     // 运行时显示树此前丢了该字段，preloader 头像的黑色渐变遮罩会被画成实心黑块。
     if (d->clipDepth > 0) return;
-    if (isAlphaMaskShape(*d, movie)) return;
+    // 正在渲染 AS3 遮罩形状时不可跳过全黑 alpha 渐变层——扫光层本身就是遮罩内容
+    if (!s_inMaskPass && isAlphaMaskShape(*d, movie)) return;
     // 对象局部变换（parent twips -> parent twips）。
     // 时间轴放置的对象直接沿用 PlaceObject 的完整 2x2（hasFull），保留错切/旋转的
     // 非正交分量；仅 AS3 动态创建/改写 scaleX/scaleY/rotation 的对象才走分解模型。
@@ -2589,7 +2992,13 @@ static void renderDisplayObjectImpl(const std::shared_ptr<fvm::DisplayObject>& d
             if (dbgPix) {
                 for (std::size_t k = 0; k < static_cast<std::size_t>(W) * H * 4; k += 97) s0 += buf[k];
             }
+            // AVM2 运行时路径的整段角色静态绘制：内部嵌套的多帧剪辑（按钮状态、
+            // 包装精灵里的 p5 扫光等）没有独立 DisplayObject 播放头，统一以本节点的
+            // 播放头 fIdx 作为时钟推进（详见 renderItemInto 的 s_rtClockMode 注释）。
+            bool prevRtClock = s_rtClockMode;
+            s_rtClockMode = true;
             renderItemInto(di, world, movie.characters, buf, W, H, fIdx, a, d->blend);
+            s_rtClockMode = prevRtClock;
             if (dbgPix) {
                 long long s1 = 0;
                 for (std::size_t k = 0; k < static_cast<std::size_t>(W) * H * 4; k += 97) s1 += buf[k];
@@ -2609,17 +3018,96 @@ static void renderDisplayObjectImpl(const std::shared_ptr<fvm::DisplayObject>& d
 // PlaceObject3 FilterList 在运行时显示树同样要生效：把对象（含整棵子树）画进
 // 离屏层，应用滤镜后再合成。静态 renderItemsWithClip 早已如此处理，此前只有
 // 运行时路径丢失，导致 AVM2 场景里的发光/投影/模糊全部消失。
+
+// ---- AS3 运行时遮罩（DisplayObject.mask = 兄弟对象）----
+// 与时间轴 clipDepth 不同的语义：intro_17 的 frame8 执行
+//   s1.mask = s2; s1.cacheAsBitmap = s2.cacheAsBitmap = true;
+// s2 是一个 106/117 帧的逐帧扫光精灵（内含全黑 alpha 渐变层 cid370/372）。
+// Flash 行为：s2 作为遮罩**自身不绘制**，s1 只在 s2 渲染结果 alpha>0 处显示，
+// 扫光动画因此"飘过" s1。此前 mask 赋值只落进通用 props slot，渲染器从不读取：
+// 后果一，s2 被当普通可见层直接画 → logo 上"多出一个扫光元素"；
+// 后果二，s1 不被裁剪 → 扫光揭示效果消失，动画看起来静止。
+// （g_maskExcluded / s_inMaskPass / buildMaskExclusions 定义在文件上方。）
+
 void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Matrix& parent,
                          const Movie& movie, std::uint8_t* buf, int W, int H,
                          int frameIndex, float alpha = 1.0f,
                          const ColorTransform& inheritedCx = ColorTransform{}) {
     if (!d) return;
-    if (d->filters && !d->filters->empty()) {
+    // 被任何对象引用为运行时遮罩：Flash 语义下它只作为裁剪形状，自身不显示、不接鼠标
+    if (g_maskExcluded.count(d.get())) return;
+
+    // ---- 带 AS3 mask 的对象：自身(含滤镜)渲染到离屏层，按遮罩层 alpha>0 二值裁剪后合成 ----
+    if (d->mask) {
+        rperf::Timer tmr(3);
         const std::size_t npix = static_cast<std::size_t>(W) * H;
-        std::vector<std::uint8_t> layer(npix * 4, 0);
+        // parallelBands 工作线程经指针读取（堆内存，租约期内有效）；
+        // 脏行登记仅主线程访问，安全。
+        ScratchBuf s_layer(npix * 4, W * 4), s_mbuf(npix * 4, W * 4);
+
+        renderDisplayObjectImpl(d, parent, movie, s_layer.data(), W, H, frameIndex, alpha, inheritedCx);
+        if (d->filters && !d->filters->empty()) {
+            std::vector<std::uint8_t> filt(s_layer.vec());   // 滤镜输入源快照
+            std::memset(s_layer.data(), 0, npix * 4);
+            applyFilters(*d->filters, filt, s_layer.data(), W, H, npix);
+        }
+        // 遮罩形状：直接调 Impl（不走本函数，避免被 g_maskExcluded 跳过），并置
+        // s_inMaskPass 使全黑 alpha 渐变扫光层不被 isAlphaMaskShape 误跳。坐标沿用
+        // d 的 parent——s1/s2 是兄弟，设备空间天然对齐；跨层级遮罩少见，接受此近似。
+        // Flash：遮罩对象 visible=false 时其渲染结果为空 ⇒ 宿主被完全裁掉，此处一致。
+        bool prevMaskPass = s_inMaskPass;
+        s_inMaskPass = true;
+        renderDisplayObjectImpl(d->mask, parent, movie, s_mbuf.data(), W, H, frameIndex, 1.0f,
+                                ColorTransform{});
+        s_inMaskPass = prevMaskPass;
+
+        // 求两缓冲的非零行区间：合成只在遮罩行范围内做；同时按各自真实写过的行
+        // 登记脏区（下一租约只重清这些行，省下整幅 3.9MB memset）。
+        int my0 = H, my1 = -1, ly0 = H, ly1 = -1;
+        for (int y = 0; y < H; ++y) {
+            const std::uint8_t* am = s_mbuf.data() + static_cast<std::size_t>(y) * W * 4 + 3;
+            const std::uint8_t* al = s_layer.data() + static_cast<std::size_t>(y) * W * 4 + 3;
+            bool anyM = false, anyL = false;
+            for (int x = 0; x < W; ++x) { if (am[x * 4]) { anyM = true; break; } }
+            for (int x = 0; x < W; ++x) { if (al[x * 4]) { anyL = true; break; } }
+            if (anyM) { if (y < my0) my0 = y; my1 = y; }
+            if (anyL) { if (y < ly0) ly0 = y; ly1 = y; }
+        }
+        s_mbuf.noteRows(my0, my1);
+        s_layer.noteRows(ly0, ly1);
+        if (my1 < 0) return;   // 空遮罩 ⇒ 全部裁掉
+        const std::uint8_t* mbd = s_mbuf.data();
+        const std::uint8_t* lyr = s_layer.data();
+        parallelBands(my0, my1, [&](int ya, int yb) {
+            for (int y = ya; y <= yb; ++y) {
+                std::size_t p = static_cast<std::size_t>(y) * W;
+                for (int x = 0; x < W; ++x, ++p) {
+                    if (mbd[p * 4 + 3] == 0) continue;        // 二值裁剪（Flash 遮罩语义）
+                    const std::uint8_t* s = &lyr[p * 4];
+                    if (s[3] == 0) continue;
+                    std::uint8_t* dst = &buf[p * 4];
+                    float sa = s[3] / 255.0f, da = dst[3] / 255.0f;
+                    float outA = sa + da * (1.0f - sa);
+                    if (outA <= 0.0f) continue;
+                    dst[0] = static_cast<std::uint8_t>((s[0] * sa + dst[0] * da * (1.0f - sa)) / outA);
+                    dst[1] = static_cast<std::uint8_t>((s[1] * sa + dst[1] * da * (1.0f - sa)) / outA);
+                    dst[2] = static_cast<std::uint8_t>((s[2] * sa + dst[2] * da * (1.0f - sa)) / outA);
+                    dst[3] = static_cast<std::uint8_t>(outA * 255.0f);
+                }
+            }
+        });
+        return;
+    }
+
+    if (d->filters && !d->filters->empty()) {
+        rperf::Timer tmr(2);
+        const std::size_t npix = static_cast<std::size_t>(W) * H;
+        ScratchBuf layer(npix * 4, W * 4);
         renderDisplayObjectImpl(d, parent, movie, layer.data(), W, H,
                                 frameIndex, alpha, inheritedCx);
-        applyFilters(*d->filters, layer, buf, W, H, npix);
+        int ry0 = 0, ry1 = -1;
+        applyFilters(*d->filters, layer.vec(), buf, W, H, npix, &ry0, &ry1);
+        layer.noteRows(ry0, ry1);
         return;
     }
     renderDisplayObjectImpl(d, parent, movie, buf, W, H, frameIndex, alpha, inheritedCx);
@@ -2632,6 +3120,9 @@ void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Mat
 void renderRuntimeObject(const std::shared_ptr<fvm::DisplayObject>& d, const Matrix& parent,
                          const Movie& movie, std::uint8_t* buf, int W, int H,
                          int frameIndex, float alpha) {
+    std::vector<std::shared_ptr<fvm::DisplayObject>> roots;
+    if (d) roots.push_back(d);
+    buildMaskExclusions(roots);   // 单对象子树入口：内部若有 d->mask 引用，遮罩对象自身仍应排除
     renderDisplayObject(d, parent, movie, buf, W, H, frameIndex, alpha);
 }
 
@@ -2682,6 +3173,7 @@ bool renderMovieToBuffer(const Movie& movie, int frameIndex,
 
     // 叠加 AVM2 运行时（ActionScript 构建）的显示列表
     if (!movie.runtimeStage.empty()) {
+        buildMaskExclusions(movie.runtimeStage);   // AS3 遮罩对象：自身不绘制
         Matrix rootM;                     // 角色局部 twips -> 设备像素
         rootM.sx = root.sx; rootM.sy = root.sy;
         rootM.tx = root.tx; rootM.ty = root.ty;
@@ -3061,6 +3553,7 @@ static bool runtimeInteractive(const Movie& movie, const fvm::DisplayObject& d) 
 static bool runtimeGeometryHit(const Movie& movie, const std::shared_ptr<fvm::DisplayObject>& d,
                                const Matrix& world, double x, double y, int guard) {
     if (!d || !d->visible || guard > 32) return false;
+    if (g_maskExcluded.count(d.get())) return false;   // 遮罩对象不构成父级可点区域
     if (runtimeSelfHit(movie, *d, world, x, y)) return true;
     for (int i = static_cast<int>(d->children.size()) - 1; i >= 0; --i) {
         const auto& c = d->children[static_cast<std::size_t>(i)];
@@ -3079,6 +3572,8 @@ static bool runtimeHitObject(const Movie& movie,
                              std::vector<std::shared_ptr<fvm::DisplayObject>>& chain,
                              int guard) {
     if (!d || !d->visible || guard > 32) return false;
+    // AS3 运行时遮罩对象：Flash 里不显示也不接收鼠标事件
+    if (g_maskExcluded.count(d.get())) return false;
     Matrix world = parent.post(runtimeLocalMatrix(*d));
     // mouseChildren=false：不再把子对象作为独立目标（父对象整体作为一个目标）
     if (d->mouseChildren) {
@@ -3102,6 +3597,7 @@ bool hitTestRuntimeStage(const Movie& movie,
                          double x, double y,
                          std::vector<std::shared_ptr<fvm::DisplayObject>>* chain) {
     if (chain) chain->clear();
+    buildMaskExclusions(roots);   // 遮罩对象不参与命中
     Matrix root;
     root.sx = 1.0f / 20.0f; root.sy = 1.0f / 20.0f;
     root.tx = -movie.frameSize.x0 / 20.0f;

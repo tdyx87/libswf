@@ -80,10 +80,10 @@ int main() {
     po3.push_back(0x00); po3.push_back(0x00); po3.push_back(0x00); po3.push_back(0xFF);  // RGBA 黑
     auto fixed = [&](double v){ std::int32_t raw=(std::int32_t)(v*65536.0);
         po3.push_back(raw&0xFF); po3.push_back((raw>>8)&0xFF); po3.push_back((raw>>16)&0xFF); po3.push_back((raw>>24)&0xFF); };
-    fixed(4.0);   // BlurX
-    fixed(4.0);   // BlurY
-    fixed(45.0);  // Angle
-    fixed(200.0); // Distance (10px)
+    fixed(0.0);     // BlurX   (规范单位：像素)
+    fixed(0.0);     // BlurY
+    fixed(0.7853981634);  // Angle 45°（规范单位：弧度）
+    fixed(10.0);    // Distance 10px（规范单位：像素）
     po3.push_back(0x00); po3.push_back(0x01);   // Strength = FIXED8(1.0) = 256
     po3.push_back(0x01);   // flags: passes=1
 

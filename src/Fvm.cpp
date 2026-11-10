@@ -2242,6 +2242,19 @@ void Vm::setProperty(std::shared_ptr<Object> obj, const std::string& name, const
             return;
         }
         if (name == "visible") { obj->display->visible = v.toBool(); obj->props[name] = v; return; }
+        // AS3 运行时遮罩：s1.mask = s2（渲染端按"遮罩渲染结果 alpha>0 二值裁剪"应用；
+        // 赋值即生效，null/undefined 清除）。
+        if (name == "mask") {
+            obj->display->mask = (v.kind == VKind::Object && v.obj && v.obj->display)
+                                     ? v.obj->display : nullptr;
+            if (std::getenv("SWF_AS_DEBUG"))
+                std::fprintf(stderr, "[as] %s.mask = %s%s\n", obj->display->name.c_str(),
+                             obj->display->mask ? obj->display->mask->name.c_str() : "(null)",
+                             obj->display->mask ? "" : " [cleared]");
+            obj->props[name] = v; return;
+        }
+        // cacheAsBitmap：软件光栅器不做位图缓存，登记语义供调试观察
+        if (name == "cacheAsBitmap") { obj->display->cacheAsBitmap = v.toBool(); obj->props[name] = v; return; }
         if (name == "mouseEnabled") { obj->display->mouseEnabled = v.toBool(); obj->props[name] = v; return; }
         if (name == "mouseChildren") { obj->display->mouseChildren = v.toBool(); obj->props[name] = v; return; }
         if (name == "name") {
@@ -5796,6 +5809,15 @@ void Vm::advanceTimeline(const std::shared_ptr<DisplayObject>& d) {
             if (it != movie_.characters.end() && it->second &&
                 it->second->kind == Character::Kind::Sprite)
                 frames = &it->second->spriteFrames;
+            // 按钮节点也要有播放头：Flash 里按钮状态中可以嵌套 MovieClip（swf2.swf：
+            // 元件3_24→Button198→194→193→177/180 的 "p5" 扫光精灵，106/117 帧逐帧动画），
+            // 静态递归渲染时以本节点 currentFrame 作时钟；不推进则内嵌剪辑永远画第 0 帧。
+            // 按钮自身没有帧内容，时钟仅需单调增长并在回绕处避免 0（渲染按 >0 取用）。
+            else if (it != movie_.characters.end() && it->second &&
+                     it->second->kind == Character::Kind::Button) {
+                ++d->currentFrame;
+                if (d->currentFrame >= 65535) d->currentFrame = 1;
+            }
         } else if (isStageRoot) {
             frames = &movie_.frames;
         }

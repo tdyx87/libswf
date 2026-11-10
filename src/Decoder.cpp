@@ -1202,7 +1202,12 @@ static std::shared_ptr<EditText> decodeEditText(ByteView& bv) {
 // Convolution 的 Divisor/Bias/Matrix 与 ColorMatrix 的 20 个值都是 32 位 FLOAT。
 static void parseFilterList(ByteView& bv, std::vector<Filter>& out) {
     std::uint8_t n = bv.readUI8();
-    auto fx = [&]() { return bv.readSI32() / 65536.0f; };                 // FIXED 16.16
+    // SWF 规范里 FILTER 的 BlurX/BlurY/Distance 是 **像素**（16.16），Angle 是 **弧度**。
+    // 内部渲染约定为 twips / 角度（见 applyFilters：/20 取像素、角度化弧度），在此统一换算。
+    // 若不做换算，真实文件的 4px 辉光会被当成 0.2px 取整为 0：辉光失去扩散，
+    // 被本体图形完全盖住（swf2.swf play 按钮 150 Over 态的黄色 GlowFilter"黄边"消失）。
+    auto fx = [&]() { return bv.readSI32() / 65536.0f * 20.0f; };            // px -> twips
+    auto fang = [&]() { return bv.readSI32() / 65536.0f * 57.29577951308232f; }; // rad -> deg
     auto fx8 = [&]() { return static_cast<std::int16_t>(bv.readUI16()) / 256.0f; };  // FIXED8
     auto rf = [&]() {                                                     // FLOAT32
         std::uint32_t bits = bv.readUI32();
@@ -1215,7 +1220,7 @@ static void parseFilterList(ByteView& bv, std::vector<Filter>& out) {
         switch (id) {
             case 0: {  // DropShadow
                 auto c = bv.readRGBA(true); f.kind = FilterKind::DropShadow; f.color = Color(c.r, c.g, c.b, c.a);
-                f.blurX = fx(); f.blurY = fx(); f.angle = fx(); f.distance = fx(); f.strength = fx8();
+                f.blurX = fx(); f.blurY = fx(); f.angle = fang(); f.distance = fx(); f.strength = fx8();
                 // 位：InnerShadow(7) Knockout(6) CompositeSource(5) Passes(4..0)
                 std::uint8_t fl = bv.readUI8(); f.inner = (fl & 0x80) != 0; f.knockout = (fl & 0x40) != 0; f.passes = (fl & 0x1F);
                 out.push_back(f); } break;
@@ -1232,7 +1237,7 @@ static void parseFilterList(ByteView& bv, std::vector<Filter>& out) {
                 Filter f; f.kind = FilterKind::Bevel;
                 auto sh = bv.readRGBA(true); f.color = Color(sh.r, sh.g, sh.b, sh.a);     // 阴影像素
                 auto hi = bv.readRGBA(true); f.highlight = Color(hi.r, hi.g, hi.b, hi.a); // 高光像素
-                f.blurX = fx(); f.blurY = fx(); f.angle = fx(); f.distance = fx(); f.strength = fx8();
+                f.blurX = fx(); f.blurY = fx(); f.angle = fang(); f.distance = fx(); f.strength = fx8();
                 // 位：InnerShadow(7) Knockout(6) CompositeSource(5) OnTop(4) Passes(3..0)
                 std::uint8_t fl = bv.readUI8();
                 f.inner = (fl & 0x80) != 0; f.knockout = (fl & 0x40) != 0; f.onTop = (fl & 0x10) != 0;
@@ -1245,7 +1250,7 @@ static void parseFilterList(ByteView& bv, std::vector<Filter>& out) {
                     auto c = bv.readRGBA(true); f.gradientColors.emplace_back(c.r, c.g, c.b, c.a);
                 }
                 for (int k = 0; k < nc && !bv.overflow(); ++k) f.gradientRatios.push_back(bv.readUI8());
-                f.blurX = fx(); f.blurY = fx(); f.angle = fx(); f.distance = fx(); f.strength = fx8();
+                f.blurX = fx(); f.blurY = fx(); f.angle = fang(); f.distance = fx(); f.strength = fx8();
                 // 位：InnerShadow(7) Knockout(6) CompositeSource(5) OnTop(4) Passes(3..0)
                 std::uint8_t fl = bv.readUI8();
                 f.inner = (fl & 0x80) != 0; f.knockout = (fl & 0x40) != 0; f.onTop = (fl & 0x10) != 0;

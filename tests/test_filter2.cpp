@@ -165,7 +165,8 @@ int main() {
         po3.push_back(0x01); po3.push_back(0x03);   // Bevel
         po3.push_back(0); po3.push_back(0); po3.push_back(0); po3.push_back(255);   // shadow black
         po3.push_back(255); po3.push_back(255); po3.push_back(255); po3.push_back(255); // highlight white
-        addFixed(po3, 0.0); addFixed(po3, 0.0); addFixed(po3, 45.0); addFixed(po3, 200.0);
+        addFixed(po3, 0.0); addFixed(po3, 0.0); addFixed(po3, 0.7853981634); addFixed(po3, 10.0);
+        // blur=0；angle 45°=0.7854rad；distance 10px（SWF 规范：像素/弧度）
         addFixed8(po3, 1.0);                         // strength (FIXED8)
         po3.push_back(0x01);                         // passes=1
         Raster R = raster(buildSwf(shape, po3), "bevel");
@@ -183,9 +184,9 @@ int main() {
         po3.push_back(255); po3.push_back(0); po3.push_back(0); po3.push_back(255);     // red
         po3.push_back(255); po3.push_back(255); po3.push_back(0); po3.push_back(255);   // yellow
         po3.push_back(0); po3.push_back(255);        // ratios
-        addFixed(po3, 160.0); addFixed(po3, 160.0);  // blurX/Y = 8px
-        addFixed(po3, 0.0); addFixed(po3, 0.0);
-        addFixed8(po3, 1.0);                         // angle, distance, strength (FIXED8)
+        addFixed(po3, 8.0); addFixed(po3, 8.0);      // blurX/Y = 8px（规范单位：像素）
+        addFixed(po3, 0.0); addFixed(po3, 0.0);      // angle=0, distance=0
+        addFixed8(po3, 1.0);
         po3.push_back(0x01);                         // passes=1
         Raster R = raster(buildSwf(shape, po3), "gradientglow");
         check(R.ok, "gradientglow: renders");
@@ -201,8 +202,8 @@ int main() {
         po3.push_back(0); po3.push_back(0); po3.push_back(0); po3.push_back(255);       // shadow black
         po3.push_back(255); po3.push_back(255); po3.push_back(255); po3.push_back(255); // highlight white
         po3.push_back(0); po3.push_back(255);
-        addFixed(po3, 160.0); addFixed(po3, 160.0);
-        addFixed(po3, 45.0); addFixed(po3, 200.0);
+        addFixed(po3, 8.0); addFixed(po3, 8.0);      // blur 8px（规范单位）
+        addFixed(po3, 0.7853981634); addFixed(po3, 10.0);  // angle 45°(rad), distance 10px
         addFixed8(po3, 1.0);                         // strength (FIXED8)
         po3.push_back(0x01);
         Raster R = raster(buildSwf(shape, po3), "gradientbevel");

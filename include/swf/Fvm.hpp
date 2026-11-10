@@ -180,6 +180,11 @@ struct DisplayObject {
     std::string tlStamp;           // 上一次由时间轴写入的变换指纹
     // Button 角色（DefineButton2）的交互态：0=Up 1=Over 2=Down（由鼠标命中链维护）
     int buttonState = 0;
+    // AS3 运行时遮罩：`DisplayObject.mask = 另一个显示对象`。与时间轴 clipDepth 不同：
+    // 遮罩对象自身不参与绘制，其渲染结果 alpha>0 的像素决定宿主对象的裁剪区域
+    // （二值遮罩，Flash 语义；swf2.swf intro_17 的 `s1.mask = s2` 扫光动画即此机制）。
+    std::shared_ptr<DisplayObject> mask;
+    bool cacheAsBitmap = false;    // 仅属性兼容：软件光栅器无位图缓存，不影响渲染语义
     std::shared_ptr<DisplayObject> parent;
     std::vector<std::shared_ptr<DisplayObject>> children;
     // AS3 addFrameScript(frameIndex, func)：进入对应帧时执行一次
