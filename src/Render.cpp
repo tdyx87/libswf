@@ -1639,6 +1639,33 @@ struct Timer {
 };
 }  // namespace rperf
 
+// applyFilters 的窗口工作缓冲池：按递归深度取槽（滤镜可嵌套），避免每次调用 new/free
+// 三块窗口缓冲（s / glow / glowA）。深度超出池大小时回退堆缓冲。
+namespace winpool {
+constexpr int kDepth = 8;
+inline std::vector<std::uint8_t>* bufs() { static thread_local std::vector<std::uint8_t> b[kDepth][3]; return &b[0][0]; }
+inline int& dep() { static thread_local int d = 0; return d; }
+}  // namespace winpool
+struct WinLease {
+    int slot;
+    std::vector<std::uint8_t> *s, *glow, *glowA;
+    std::vector<std::uint8_t> heap[3];
+    explicit WinLease(std::size_t bytes) {
+        int& d = winpool::dep();
+        if (d >= 0 && d < winpool::kDepth) {
+            slot = d;
+            s = &winpool::bufs()[slot * 3 + 0];
+            glow = &winpool::bufs()[slot * 3 + 1];
+            glowA = &winpool::bufs()[slot * 3 + 2];
+        } else { slot = -1; s = &heap[0]; glow = &heap[1]; glowA = &heap[2]; }
+        if (s->size() < bytes) s->resize(bytes);
+        ++d;
+    }
+    WinLease(const WinLease&) = delete;
+    WinLease& operator=(const WinLease&) = delete;
+    ~WinLease() { if (slot >= 0) --winpool::dep(); }
+};
+
 // 渲染期离屏缓冲（滤镜/遮罩）的 thread_local 池。
 // 此前每个带滤镜/遮罩的对象每帧 new+free 整幅 npix*4（1280x768≈3.9MB）缓冲，
 // 5 个 logo 面板 + intro 遮罩同屏时每秒上百次大块分配 → 明显掉帧。
@@ -1961,59 +1988,108 @@ static std::vector<float> gaussianKernel(float sigma) {
     return k;
 }
 
-// 可分离高斯模糊（RGBA，预乘空间）。参数 sx/sy = 标准差 σ（像素），quality = 迭代次数。
-// 规范 2.2：quality 是逼近精度而非模糊程度——直接重复模糊 n 次会使总方差变 n·σ²、半径失控；
-// 正确做法方差守恒 σi=σ/√n，n 次独立高斯方差叠加 = n·(σ²/n)=σ²。
-// 规范要点 1/3：输入须为预乘 RGBA（调用方负责预乘/还原），越界采样取边缘像素（clamp）。
+// 可分离高斯模糊（RGBA，预乘空间）。sx/sy = 标准差 σ（像素），quality = 逼近迭代次数。
+// 规范 §2.2 方差守恒：n 趟 σ/√n 高斯叠加 = 一趟 σ 高斯（高斯卷积可结合、方差相加
+// n·(σ²/n)=σ²）。因本实现用**真高斯核**而非盒核，多趟迭代在数学上与单趟 σ 等价，
+// 故直接单趟 σ（quality 仅保留语义，不再放大代价）——扫描类滤镜 quality=8 由此快 8×。
+// 规范 §2.3/①④：σ 大时先降采样 d 倍、σ 同步缩小、模糊后双线性还原（高斯是低通，
+// 软光晕下降采样视觉不可辨），代价约降 d³。边缘采样 clamp（要点 3）。
 static void blurBufferCore(std::uint8_t* buf, int W, int H, float sx, float sy, int quality) {
     if (sx < 0.01f && sy < 0.01f) return;
-    const int n = std::min(15, std::max(1, quality));
-    const float sxi = sx / std::sqrt(static_cast<float>(n));
-    const float syi = sy / std::sqrt(static_cast<float>(n));
+    (void)quality;
+    int d = 1;
+    const float smax = std::max(sx, sy);
+    // 降采样阈值：σ≥4 缩 2 倍、σ≥16 缩 4 倍。实测 σ=10 按钮黄环经 d=2 降/升采样后
+    // 径向衰减逐点吻合(389→276→134→53 vs 377→263→125→48)，软光晕视觉无损。
+    if (smax >= 16.0f) d = 4; else if (smax >= 4.0f) d = 2;
+    // —— 降采样（2×2 盒均值，逐通道）——
+    int sw = W, sh = H;
+    static thread_local std::vector<std::uint8_t> smallBuf, tmpBuf;
+    std::uint8_t* work = buf;
+    if (d > 1) {
+        sw = std::max(1, W / d); sh = std::max(1, H / d);
+        smallBuf.assign(static_cast<std::size_t>(sw) * sh * 4, 0);
+        for (int y = 0; y < sh; ++y) {
+            for (int x = 0; x < sw; ++x) {
+                int acc[4] = {0,0,0,0}, n = 0;
+                for (int yy = y*d; yy < std::min(H,(y+1)*d); ++yy)
+                    for (int xx = x*d; xx < std::min(W,(x+1)*d); ++xx) {
+                        const std::uint8_t* s = &buf[(static_cast<std::size_t>(yy)*W+xx)*4];
+                        for (int c=0;c<4;++c) acc[c]+=s[c];
+                        ++n;
+                    }
+                std::uint8_t* o = &smallBuf[(static_cast<std::size_t>(y)*sw+x)*4];
+                const float in = 1.0f / static_cast<float>(n>0?n:1);
+                for (int c=0;c<4;++c) o[c]=clampU8(static_cast<int>(acc[c]*in+0.5f));
+            }
+        }
+        work = smallBuf.data();
+    }
+    const float sxi = sx / static_cast<float>(d), syi = sy / static_cast<float>(d);
     const std::vector<float> kx = gaussianKernel(sxi);
     const std::vector<float> ky = gaussianKernel(syi);
     const int rx = static_cast<int>(kx.size()) / 2;
     const int ry = static_cast<int>(ky.size()) / 2;
-    static thread_local std::vector<std::uint8_t> tmpBuf;
-    tmpBuf.assign(static_cast<std::size_t>(W) * H * 4, 0);
+    tmpBuf.assign(static_cast<std::size_t>(sw) * sh * 4, 0);
     std::uint8_t* tmp = tmpBuf.data();
-    for (int it = 0; it < n; ++it) {
-        // 水平：buf -> tmp
-        if (rx >= 1) {
-            for (int y = 0; y < H; ++y) {
-                const std::uint8_t* row = &buf[static_cast<std::size_t>(y) * W * 4];
-                std::uint8_t* o = &tmp[static_cast<std::size_t>(y) * W * 4];
-                for (int x = 0; x < W; ++x) {
-                    float acc[4] = {0, 0, 0, 0};
-                    for (int i = -rx; i <= rx; ++i) {
-                        const int xx = std::min(W - 1, std::max(0, x + i));   // 边缘 clamp
-                        const float kv = kx[static_cast<std::size_t>(i + rx)];
-                        const std::uint8_t* s = &row[xx * 4];
-                        for (int c = 0; c < 4; ++c) acc[c] += s[c] * kv;
-                    }
-                    for (int c = 0; c < 4; ++c) o[x * 4 + c] = clampU8(static_cast<int>(acc[c] + 0.5f));
+    // 水平：work -> tmp
+    if (rx >= 1) {
+        for (int y = 0; y < sh; ++y) {
+            const std::uint8_t* row = &work[static_cast<std::size_t>(y) * sw * 4];
+            std::uint8_t* o = &tmp[static_cast<std::size_t>(y) * sw * 4];
+            for (int x = 0; x < sw; ++x) {
+                float acc[4] = {0,0,0,0};
+                for (int i = -rx; i <= rx; ++i) {
+                    const int xx = std::min(sw-1, std::max(0, x+i));
+                    const float kv = kx[static_cast<std::size_t>(i+rx)];
+                    const std::uint8_t* s = &row[xx*4];
+                    for (int c=0;c<4;++c) acc[c]+=s[c]*kv;
                 }
+                for (int c=0;c<4;++c) o[x*4+c]=clampU8(static_cast<int>(acc[c]+0.5f));
             }
-        } else {
-            std::memcpy(tmp, buf, static_cast<std::size_t>(W) * H * 4);
         }
-        // 垂直：tmp -> buf
-        if (ry >= 1) {
-            for (int y = 0; y < H; ++y) {
-                std::uint8_t* o = &buf[static_cast<std::size_t>(y) * W * 4];
-                for (int x = 0; x < W; ++x) {
-                    float acc[4] = {0, 0, 0, 0};
-                    for (int j = -ry; j <= ry; ++j) {
-                        const int yy = std::min(H - 1, std::max(0, y + j));
-                        const float kv = ky[static_cast<std::size_t>(j + ry)];
-                        const std::uint8_t* s = &tmp[(static_cast<std::size_t>(yy) * W + x) * 4];
-                        for (int c = 0; c < 4; ++c) acc[c] += s[c] * kv;
-                    }
-                    for (int c = 0; c < 4; ++c) o[x * 4 + c] = clampU8(static_cast<int>(acc[c] + 0.5f));
+    } else {
+        std::memcpy(tmp, work, static_cast<std::size_t>(sw)*sh*4);
+    }
+    // 垂直：tmp -> work
+    if (ry >= 1) {
+        for (int y = 0; y < sh; ++y) {
+            std::uint8_t* o = &work[static_cast<std::size_t>(y) * sw * 4];
+            for (int x = 0; x < sw; ++x) {
+                float acc[4] = {0,0,0,0};
+                for (int j = -ry; j <= ry; ++j) {
+                    const int yy = std::min(sh-1, std::max(0, y+j));
+                    const float kv = ky[static_cast<std::size_t>(j+ry)];
+                    const std::uint8_t* s = &tmp[(static_cast<std::size_t>(yy)*sw+x)*4];
+                    for (int c=0;c<4;++c) acc[c]+=s[c]*kv;
+                }
+                for (int c=0;c<4;++c) o[x*4+c]=clampU8(static_cast<int>(acc[c]+0.5f));
+            }
+        }
+    } else {
+        std::memcpy(work, tmp, static_cast<std::size_t>(sw)*sh*4);
+    }
+    // —— 升采样（双线性，规范④）——
+    if (d > 1) {
+        const float fx = static_cast<float>(sw - 1) / static_cast<float>(std::max(1, W - 1));
+        const float fy = static_cast<float>(sh - 1) / static_cast<float>(std::max(1, H - 1));
+        for (int y = 0; y < H; ++y) {
+            const float syv = y * fy; const int y0 = std::min(sh-1, std::max(0, static_cast<int>(syv)));
+            const int y1 = std::min(sh-1, y0+1); const float ty = syv - y0;
+            for (int x = 0; x < W; ++x) {
+                const float sxv = x * fx; const int x0 = std::min(sw-1, std::max(0, static_cast<int>(sxv)));
+                const int x1 = std::min(sw-1, x0+1); const float tx = sxv - x0;
+                const std::uint8_t* p00=&work[(static_cast<std::size_t>(y0)*sw+x0)*4];
+                const std::uint8_t* p10=&work[(static_cast<std::size_t>(y0)*sw+x1)*4];
+                const std::uint8_t* p01=&work[(static_cast<std::size_t>(y1)*sw+x0)*4];
+                const std::uint8_t* p11=&work[(static_cast<std::size_t>(y1)*sw+x1)*4];
+                std::uint8_t* dstd=&buf[(static_cast<std::size_t>(y)*W+x)*4];
+                for (int c=0;c<4;++c){
+                    const float top=p00[c]+(p10[c]-p00[c])*tx;
+                    const float bot=p01[c]+(p11[c]-p01[c])*tx;
+                    dstd[c]=clampU8(static_cast<int>(top+(bot-top)*ty+0.5f));
                 }
             }
-        } else {
-            std::memcpy(buf, tmp, static_cast<std::size_t>(W) * H * 4);
         }
     }
 }
@@ -2082,48 +2158,72 @@ static void buildShadowA(const std::uint8_t* layer, std::uint8_t* plane, int W, 
         }
     }
 }
-// 单通道可分离高斯模糊（辉光/投影的 alpha 平面）。σ 与 quality 语义同 blurBufferCore：
-// 方差守恒 σi=σ/√n，n 次迭代，边缘 clamp，核归一化。
+// 单通道可分离高斯模糊（辉光/投影的 alpha 平面）。语义同 blurBufferCore：
+// 真高斯单趟 σ（quality 对方差冗余），σ 大时降采样 d 倍 + 双线性还原。边缘 clamp。
 static void blurPlane(std::uint8_t* p, int W, int H, float sx, float sy, int quality) {
     if (sx < 0.01f && sy < 0.01f) return;
-    const int n = std::min(15, std::max(1, quality));
-    const std::vector<float> kx = gaussianKernel(sx / std::sqrt(static_cast<float>(n)));
-    const std::vector<float> ky = gaussianKernel(sy / std::sqrt(static_cast<float>(n)));
+    (void)quality;
+    int d = 1;
+    const float smax = std::max(sx, sy);
+    if (smax >= 16.0f) d = 4; else if (smax >= 4.0f) d = 2;
+    int sw = W, sh = H;
+    static thread_local std::vector<std::uint8_t> smallA, tmpA;
+    std::uint8_t* work = p;
+    if (d > 1) {
+        sw = std::max(1, W / d); sh = std::max(1, H / d);
+        smallA.assign(static_cast<std::size_t>(sw) * sh, 0);
+        for (int y = 0; y < sh; ++y)
+            for (int x = 0; x < sw; ++x) {
+                int acc = 0, n = 0;
+                for (int yy = y*d; yy < std::min(H,(y+1)*d); ++yy)
+                    for (int xx = x*d; xx < std::min(W,(x+1)*d); ++xx) { acc += p[static_cast<std::size_t>(yy)*W+xx]; ++n; }
+                smallA[static_cast<std::size_t>(y)*sw+x] = clampU8(static_cast<int>(acc / (n>0?n:1) + 0.5f));
+            }
+        work = smallA.data();
+    }
+    const std::vector<float> kx = gaussianKernel(sx / static_cast<float>(d));
+    const std::vector<float> ky = gaussianKernel(sy / static_cast<float>(d));
     const int rx = static_cast<int>(kx.size()) / 2;
     const int ry = static_cast<int>(ky.size()) / 2;
-    static thread_local std::vector<std::uint8_t> tmp;
-    tmp.assign(static_cast<std::size_t>(W) * H, 0);
-    for (int it = 0; it < n; ++it) {
-        if (rx >= 1) {
-            for (int y = 0; y < H; ++y) {
-                const std::uint8_t* row = &p[static_cast<std::size_t>(y) * W];
-                std::uint8_t* o = &tmp[static_cast<std::size_t>(y) * W];
-                for (int x = 0; x < W; ++x) {
-                    float acc = 0.0f;
-                    for (int i = -rx; i <= rx; ++i) {
-                        const int xx = std::min(W - 1, std::max(0, x + i));
-                        acc += row[xx] * kx[static_cast<std::size_t>(i + rx)];
-                    }
-                    o[x] = clampU8(static_cast<int>(acc + 0.5f));
+    tmpA.assign(static_cast<std::size_t>(sw) * sh, 0);
+    if (rx >= 1) {
+        for (int y = 0; y < sh; ++y) {
+            const std::uint8_t* row = &work[static_cast<std::size_t>(y) * sw];
+            std::uint8_t* o = &tmpA[static_cast<std::size_t>(y) * sw];
+            for (int x = 0; x < sw; ++x) {
+                float acc = 0.0f;
+                for (int i = -rx; i <= rx; ++i) {
+                    const int xx = std::min(sw-1, std::max(0, x+i));
+                    acc += row[xx] * kx[static_cast<std::size_t>(i+rx)];
                 }
+                o[x] = clampU8(static_cast<int>(acc + 0.5f));
             }
-        } else {
-            std::memcpy(tmp.data(), p, static_cast<std::size_t>(W) * H);
         }
-        if (ry >= 1) {
-            for (int y = 0; y < H; ++y) {
-                std::uint8_t* o = &p[static_cast<std::size_t>(y) * W];
-                for (int x = 0; x < W; ++x) {
-                    float acc = 0.0f;
-                    for (int j = -ry; j <= ry; ++j) {
-                        const int yy = std::min(H - 1, std::max(0, y + j));
-                        acc += tmp[static_cast<std::size_t>(yy) * W + x] * ky[static_cast<std::size_t>(j + ry)];
-                    }
-                    o[x] = clampU8(static_cast<int>(acc + 0.5f));
+    } else { std::memcpy(tmpA.data(), work, static_cast<std::size_t>(sw)*sh); }
+    if (ry >= 1) {
+        for (int y = 0; y < sh; ++y) {
+            std::uint8_t* o = &work[static_cast<std::size_t>(y) * sw];
+            for (int x = 0; x < sw; ++x) {
+                float acc = 0.0f;
+                for (int j = -ry; j <= ry; ++j) {
+                    const int yy = std::min(sh-1, std::max(0, y+j));
+                    acc += tmpA[static_cast<std::size_t>(yy)*sw+x] * ky[static_cast<std::size_t>(j+ry)];
                 }
+                o[x] = clampU8(static_cast<int>(acc + 0.5f));
             }
-        } else {
-            std::memcpy(p, tmp.data(), static_cast<std::size_t>(W) * H);
+        }
+    } else { std::memcpy(work, tmpA.data(), static_cast<std::size_t>(sw)*sh); }
+    if (d > 1) {
+        const float fx = static_cast<float>(sw-1)/static_cast<float>(std::max(1,W-1));
+        const float fy = static_cast<float>(sh-1)/static_cast<float>(std::max(1,H-1));
+        for (int y = 0; y < H; ++y) {
+            const float syv=y*fy; const int y0=std::min(sh-1,std::max(0,(int)syv)); const int y1=std::min(sh-1,y0+1); const float ty=syv-y0;
+            for (int x = 0; x < W; ++x) {
+                const float sxv=x*fx; const int x0=std::min(sw-1,std::max(0,(int)sxv)); const int x1=std::min(sw-1,x0+1); const float tx=sxv-x0;
+                const float top=work[(size_t)y0*sw+x0]+(work[(size_t)y0*sw+x1]-work[(size_t)y0*sw+x0])*tx;
+                const float bot=work[(size_t)y1*sw+x0]+(work[(size_t)y1*sw+x1]-work[(size_t)y1*sw+x0])*tx;
+                p[(size_t)y*W+x]=clampU8(static_cast<int>(top+(bot-top)*ty+0.5f));
+            }
         }
     }
 }
@@ -2228,9 +2328,14 @@ static void applyFilters(const std::vector<Filter>& filters, std::vector<std::ui
                          std::uint8_t* buf, int W, int H, std::size_t npix,
                          int* outRowY0, int* outRowY1) {
     if (filters.empty()) { compositeOver(layer.data(), buf, npix); return; }
-    // 1) 内容包围盒（滤镜只消费 alpha；按 8 字节字聚合扫描，每字含两个 alpha 字节，
-    //    掩码抽取，比逐像素读快数倍且判定等价）
+    // 1) 内容包围盒 + 恒色判定（单遍融合）：
+    //    先用 u64 alpha 掩码快速定位非空行；再在非空行内逐字解码，一次同时得到
+    //    x 范围与非零 alpha 像素的 RGB min/max（供 Blur 恒色快路用），避免多次全扫。
     int cx0, cy0, cx1, cy1;
+    int rmin=255,gmin=255,bmin=255,rmax=0,gmax=0,bmax=0; bool anyPix=false;
+    // 仅当滤镜列表含 Blur 时才需要 RGB min/max（恒色判定），避免纯 Glow 调用做多余解码。
+    bool needRgb = false;
+    for (const auto& f : filters) if (f.kind == FilterKind::Blur) { needRgb = true; break; }
     {
     rperf::Timer scanTmr(5);
     cx0 = W; cy0 = H; cx1 = -1; cy1 = -1;
@@ -2258,13 +2363,27 @@ static void applyFilters(const std::vector<Filter>& filters, std::vector<std::ui
                     std::uint64_t w;
                     std::memcpy(&w, row + static_cast<std::size_t>(x) * 4, 8);
                     if (!(w & 0xFF000000FF000000ull)) continue;
-                    if ((w & 0x000000FF00000000ull) && x < cx0) cx0 = x;
-                    if ((w & 0x000000FF00000000ull) && x > cx1) cx1 = x;
-                    if ((w & 0xFF00000000000000ull) && x + 1 < cx0) cx0 = x + 1;
-                    if ((w & 0xFF00000000000000ull) && x + 1 > cx1) cx1 = x + 1;
+                    if (w & 0x000000FF00000000ull) {
+                        if (x < cx0) cx0 = x; if (x > cx1) cx1 = x;
+                        if (needRgb) { const std::uint8_t* s = &row[x*4]; anyPix=true;
+                            if(s[0]<rmin)rmin=s[0]; if(s[0]>rmax)rmax=s[0];
+                            if(s[1]<gmin)gmin=s[1]; if(s[1]>gmax)gmax=s[1];
+                            if(s[2]<bmin)bmin=s[2]; if(s[2]>bmax)bmax=s[2]; }
+                    }
+                    if (w & 0xFF00000000000000ull) {
+                        if (x + 1 < cx0) cx0 = x + 1; if (x + 1 > cx1) cx1 = x + 1;
+                        if (needRgb) { const std::uint8_t* s = &row[(x+1)*4]; anyPix=true;
+                            if(s[0]<rmin)rmin=s[0]; if(s[0]>rmax)rmax=s[0];
+                            if(s[1]<gmin)gmin=s[1]; if(s[1]>gmax)gmax=s[1];
+                            if(s[2]<bmin)bmin=s[2]; if(s[2]>bmax)bmax=s[2]; }
+                    }
                 }
                 if (x < W && row[static_cast<std::size_t>(x) * 4 + 3]) {
                     if (x < cx0) cx0 = x; if (x > cx1) cx1 = x;
+                    if (needRgb) { const std::uint8_t* s = &row[x*4]; anyPix=true;
+                        if(s[0]<rmin)rmin=s[0]; if(s[0]>rmax)rmax=s[0];
+                        if(s[1]<gmin)gmin=s[1]; if(s[1]>gmax)gmax=s[1];
+                        if(s[2]<bmin)bmin=s[2]; if(s[2]>bmax)bmax=s[2]; }
                 }
             }
         }
@@ -2273,6 +2392,10 @@ static void applyFilters(const std::vector<Filter>& filters, std::vector<std::ui
     if (outRowY0) *outRowY0 = (cx1 < 0) ? 0 : cy0;
     if (outRowY1) *outRowY1 = (cx1 < 0) ? -1 : cy1;   // 空内容：无需为下一租约保留任何行
     if (cx1 < 0) return;   // 本体全透明且无输入内容：滤镜输出也必为空
+    // Blur 恒色快路：内容区非零 alpha 像素 RGB 恒定时，预乘模糊等价于只模糊 alpha +
+    // 常数色（约 4× 提速，数学等价、无视觉差）。
+    bool blurUniform = needRgb && anyPix && rmin==rmax && gmin==gmax && bmin==bmax;
+    const int ur=rmin, ug=gmin, ub=bmin;
     // 2) 滤镜窗口余量：偏移距离 + 核支撑（passes·r = passes·σ·√(3/passes) = σ·√(3·passes)）+ 2。
     int margin = 2;
     for (const auto& f : filters) {
@@ -2299,21 +2422,34 @@ static void applyFilters(const std::vector<Filter>& filters, std::vector<std::ui
         rperf::g_kindPx[5] += rq;                                            // Σ半径
         if (static_cast<double>(rq) > rperf::g_kindPx[4]) rperf::g_kindPx[4] = rq;  // max半径
     }
-    // 3) 小缓冲处理（blur/shadow/composite 全部按窗口尺寸运行，逻辑与全幅一致）
-    std::vector<std::uint8_t> s(snpix * 4, 0);
+    // 3) 小缓冲处理（blur/shadow/composite 全部按窗口尺寸运行，逻辑与全幅一致）。
+    //    按递归深度取 thread_local 缓冲（滤镜可嵌套：遮罩内含滤镜），避免每次调用
+    //    new/free 三块窗口缓冲；s 逐像素被 memcpy 覆盖，无需清零。
+    WinLease win(snpix * 4);
+    std::vector<std::uint8_t>& s = *win.s;
+    std::vector<std::uint8_t>& glow = *win.glow;
+    std::vector<std::uint8_t>& glowA = *win.glowA;
     for (int y = 0; y < sh; ++y)
         std::memcpy(&s[static_cast<std::size_t>(y) * sw * 4],
                     &layer[(static_cast<std::size_t>(y0 + y) * W + x0) * 4],
                     static_cast<std::size_t>(sw) * 4);
-    std::vector<std::uint8_t> glow;
-    std::vector<std::uint8_t> glowA;
     for (const auto& f : filters) {
         if (f.kind == FilterKind::Blur) {
             const BlurShape bs = blurShapeOf(f);
-            // 规范要点 1：模糊必须在预乘空间进行。
-            premultiplyRGBA(s.data(), snpix);
-            blurBuffer(s.data(), sw, sh, bs.sx, bs.sy, bs.quality);
-            unpremultiplyRGBA(s.data(), snpix);
+            if (blurUniform) {
+                // 恒色：只模糊 alpha 平面，再回填常数色（等价于预乘 4 通道模糊）
+                glowA.assign(snpix, 0);
+                for (std::size_t i = 0; i < snpix; ++i) glowA[i] = s[i * 4 + 3];
+                blurPlane(glowA.data(), sw, sh, bs.sx, bs.sy, bs.quality);
+                for (std::size_t i = 0; i < snpix; ++i) {
+                    std::uint8_t* d = &s[i * 4];
+                    d[0]=ur; d[1]=ug; d[2]=ub; d[3]=glowA[i];
+                }
+            } else {
+                premultiplyRGBA(s.data(), snpix);
+                blurBuffer(s.data(), sw, sh, bs.sx, bs.sy, bs.quality);
+                unpremultiplyRGBA(s.data(), snpix);
+            }
         } else if (f.kind == FilterKind::DropShadow || f.kind == FilterKind::Glow) {
             int offx = 0, offy = 0;
             if (f.kind == FilterKind::DropShadow) {
