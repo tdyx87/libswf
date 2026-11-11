@@ -5340,15 +5340,9 @@ void Vm::instantiateDocumentClasses() {
                         d->filters = std::make_shared<std::vector<Filter>>(di.filters);
                     d->x = di.matrix.tx / 20.0;
                     d->y = di.matrix.ty / 20.0;
-                    // 矩阵 [sx r0; r1 sy] → scaleX/scaleY/rotation（与渲染器分解方式一致）
+                    // 矩阵 [sx r0; r1 sy] → scaleX/scaleY/rotation（Matrix::decompose 统一定义）
                     double cxs = di.matrix.sx, cys = di.matrix.sy;
-                    d->scaleX = std::sqrt(cxs * cxs + static_cast<double>(di.matrix.r1) * di.matrix.r1);
-                    if (d->scaleX == 0) d->scaleX = 1;
-                    // scaleY 取带符号值 det/scaleX：镜像放置（det<0，如娃娃左眼虹膜）时
-                    // sqrt 取绝对值会丢符号，重建后镜像变成 180° 旋转，图形翻到错误一侧。
-                    d->scaleY = (cxs * cys - static_cast<double>(di.matrix.r0) * di.matrix.r1) / d->scaleX;
-                    if (d->scaleY == 0) d->scaleY = 1;
-                    d->rotation = std::atan2(static_cast<double>(di.matrix.r1), cxs) * 180.0 / 3.141592653589793;
+                    di.matrix.decompose(d->scaleX, d->scaleY, d->rotation);
                     // 完整 2x2 线性部分（无量纲比例，与渲染器 Lt 的 sx/r0/r1/sy 约定一致；
                     // 平移仍由 x/y（像素）承载）。渲染器直接用它，保留错切/旋转的非正交分量。
                     // scaleX/scaleY/rotation 只是 3 自由度近似，对带错切的矩阵（如浴垫粉色圆点
@@ -5526,14 +5520,16 @@ void Vm::applyTimelineFrame(const std::shared_ptr<DisplayObject>& d, int frameIn
         if (!keepScript) {
             child->x = di.matrix.tx / 20.0;
             child->y = di.matrix.ty / 20.0;
-            // 矩阵 [sx r0; r1 sy] → scaleX/scaleY/rotation（与渲染器分解方式一致）
+            // 矩阵 [sx r0; r1 sy] → scaleX/scaleY/rotation（Matrix::decompose 统一定义）
             double cxs = di.matrix.sx, cys = di.matrix.sy;
-            child->scaleX = std::sqrt(cxs * cxs + static_cast<double>(di.matrix.r1) * di.matrix.r1);
-            if (child->scaleX == 0) child->scaleX = 1;
-            // scaleY 取带符号值 det/scaleX（同上：保留镜像符号）
-            child->scaleY = (cxs * cys - static_cast<double>(di.matrix.r0) * di.matrix.r1) / child->scaleX;
-            if (child->scaleY == 0) child->scaleY = 1;
-            child->rotation = std::atan2(static_cast<double>(di.matrix.r1), cxs) * 180.0 / 3.141592653589793;
+            di.matrix.decompose(child->scaleX, child->scaleY, child->rotation);
+            // 完整 2x2 线性部分：时间轴放置的矩阵一律保留原样（含镜像/错切/旋转），
+            // 渲染器直接使用它；AS3 改写 scaleX/scaleY/rotation 后 hasFull 才失效。
+            // 此前只保留三自由度近似，镜像矩阵（拍手动画的手掌 d910、手臂 d792）
+            // 分解后与原矩阵不符 → 手掌被甩到腹部、手臂倾斜。
+            child->hasFull = true;
+            child->fullA = cxs;             child->fullB = di.matrix.r0;
+            child->fullC = di.matrix.r1;     child->fullD = cys;
             child->alpha = di.cxform.hasMult ? di.cxform.ma : 1.0;
             // 完整 ColorTransform：rgb 乘/加项（ma 已并入 alpha，aa 罕见忽略）
             child->cxMr = di.cxform.mr; child->cxMg = di.cxform.mg; child->cxMb = di.cxform.mb;

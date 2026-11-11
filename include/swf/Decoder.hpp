@@ -34,6 +34,17 @@ struct Matrix {
     Matrix post(const Matrix& o) const;   // 组合：this * o
     void apply(float x, float y, float& ox, float& oy) const;
     bool invert(Matrix& out) const;        // 求逆（仿射）
+
+    // 把 2x2 线性部分分解为 scaleX / scaleY / rotation（AS3 变换属性的语义）。
+    // SWF MATRIX 的布局是 [[ScaleX, RotateSkew1],[RotateSkew0, ScaleY]]：
+    // RotateSkew0(r1) 可能含错切分量，**不能**当作旋转角；Flash 语义为
+    //     a = cos·sx,  b = -sin·sx,
+    //     c = sin·sy,  d =  cos·sy
+    // 故旋转角 = atan2(-r0, sx)，scaleX = hypot(sx, r0)，
+    // scaleY = det/scaleX（保留符号：det<0 表示镜像放置）。
+    // 注意：三自由度模型无法表达真正的错切矩阵（r0 != r1）；
+    // 需要精确保真时应直接使用完整 2x2（见 DisplayObject::hasFull）。
+    void decompose(double& scaleX, double& scaleY, double& rotation) const;
 };
 
 struct RectB {

@@ -69,7 +69,7 @@ void maybeAutoSave() {
         dlog("[autosave] cid=%u frame=%d (sprite now %d) -> %s\n", g_asCid, g_asFrame, cf, g_asPath.c_str());
     else
         dlog("[autosave] write FAILED: %s\n", g_asPath.c_str());
-    g_player.logSpriteSubtree(g_asCid);   // 同时 dump 运行时子树实例位置，供比对
+    dlog("%s", g_player.spriteSubtreeDump(g_asCid).c_str());   // dump 运行时子树实例位置到日志
     g_asDone = true;
     if (g_autoExit) PostMessage(g_hwnd, WM_CLOSE, 0, 0);
 }

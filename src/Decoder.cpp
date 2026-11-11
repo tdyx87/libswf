@@ -47,6 +47,16 @@ void Matrix::apply(float x, float y, float& ox, float& oy) const {
     ox = sx * x + r0 * y + tx;
     oy = r1 * x + sy * y + ty;
 }
+void Matrix::decompose(double& outScaleX, double& outScaleY, double& outRotation) const {
+    const double a = sx, d = sy, b = r0, c = r1;
+    double sX = std::sqrt(a * a + b * b);          // hypot(ScaleX, RotateSkew1)
+    if (sX == 0) sX = 1;
+    double sY = (a * d - b * c) / sX;              // det/scaleX：保留镜像符号
+    if (sY == 0) sY = 1;
+    // 旋转角取自 RotateSkew1(r0)：RotateSkew0(r1) 可能含错切分量。
+    const double rot = std::atan2(-b, a) * 180.0 / 3.14159265358979323846;
+    outScaleX = sX; outScaleY = sY; outRotation = rot;
+}
 bool Matrix::invert(Matrix& out) const {
     float det = sx * sy - r0 * r1;
     if (det == 0) return false;

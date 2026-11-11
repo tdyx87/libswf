@@ -419,7 +419,61 @@ int main() {
         }
     }
 
-    // ---- 11. applicationDomain.domainMemory（Alchemy 小端读写）----
+    // ---- 11. 嵌套精灵的放置矩阵必须精确保真（镜像/错切）----
+    // 回归：时间轴放置的矩阵此前被分解成 scaleX/scaleY/rotation 三自由度近似，
+    // 且分解公式误用 RotateSkew0(r1) 当旋转角，使带镜像的矩阵（拍手动画的
+    // 手掌/手臂）重建后与原矩阵不符 → 手掌被甩到腹部、手臂倾斜。
+    {
+        swf::Movie m;
+        m.frameRate = 12;
+        // 嵌套精灵 20 的第 1 帧：用拍手动画中手掌 d910 的真实矩阵（镜像，det<0）
+        swf::DisplayItem inner;
+        inner.depth = 1;
+        inner.characterId = 21;
+        inner.matrix.sx = -0.377f; inner.matrix.r0 = -0.6529f;
+        inner.matrix.r1 = -0.6529f; inner.matrix.sy = 0.377f;
+        inner.matrix.tx = 13154; inner.matrix.ty = 15995;   // twips
+        swf::Frame subFrame;
+        subFrame.items = {inner};
+        auto sprite = std::make_shared<swf::Character>();
+        sprite->kind = swf::Character::Kind::Sprite;
+        sprite->spriteFrames = {subFrame};
+        m.characters[20] = sprite;
+        m.characters[21] = std::make_shared<swf::Character>();   // 占位子角色
+
+        swf::DisplayItem top;
+        top.depth = 1; top.characterId = 20; top.matrix.tx = 100;
+        swf::Frame tf;
+        tf.items = {top};
+        m.frames = {tf};
+
+        swf::abc::AbcFile abc;
+        f::Vm v(abc, m);
+        v.run();
+        auto root = std::make_shared<f::DisplayObject>();
+        root->characterId = 0;
+        v.stage.push_back(root);
+        v.setClipFrame(root, 0);
+
+        check(root->children.size() == 1, "top-level sprite instance built");
+        if (!root->children.empty()) {
+            auto sp = root->children[0];
+            check(sp->children.size() == 1, "nested sprite frame built its children");
+            if (!sp->children.empty()) {
+                auto& c = sp->children[0];
+                check(c->hasFull,
+                      "timeline-placed child keeps the full 2x2 matrix (hasFull)");
+                bool same = std::fabs(c->fullA - inner.matrix.sx) < 1e-6 &&
+                            std::fabs(c->fullB - inner.matrix.r0) < 1e-6 &&
+                            std::fabs(c->fullC - inner.matrix.r1) < 1e-6 &&
+                            std::fabs(c->fullD - inner.matrix.sy) < 1e-6;
+                check(same, "full 2x2 equals the original PlaceObject matrix");
+                check(c->scaleY < 0, "mirrored placement keeps negative scaleY");
+            }
+        }
+    }
+
+    // ---- 12. applicationDomain.domainMemory（Alchemy 小端读写）----
     {
         auto mem = std::make_shared<std::vector<std::uint8_t>>(16, 0);
         vm.setDomainMemoryData(mem);

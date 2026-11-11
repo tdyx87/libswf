@@ -163,7 +163,10 @@ private:
     double itemScaleY() const { return item_->hasRt ? item_->rtScaleY : item_->matrix.sy; }
     double itemRotation() const {
         if (item_->hasRt) return item_->rtRotation;
-        return std::atan2(item_->matrix.r1, item_->matrix.sx) * 180.0 / 3.14159265358979323846;
+        // SWF 矩阵布局 [[ScaleX, RotateSkew1],[RotateSkew0, ScaleY]]：旋转角取自
+        // RotateSkew1(r0)（Flash：a=cos·sx, b=-sin·sx → 角 = atan2(-r0, sx)），
+        // RotateSkew0(r1) 可能含错切分量，不能当作旋转角。
+        return std::atan2(-item_->matrix.r0, item_->matrix.sx) * 180.0 / 3.14159265358979323846;
     }
     double itemAlpha() const {
         if (item_->hasRt) return item_->rtAlpha;
@@ -684,15 +687,23 @@ static swf::Matrix playerWorldMatrix(const std::shared_ptr<fvm::DisplayObject>& 
     }
     return world;
 }
-void Player::logSpriteSubtree(unsigned cid) const {
+std::string Player::spriteSubtreeDump(unsigned cid) const {
+    std::string out;
+    char b[256];
     std::function<void(const std::shared_ptr<fvm::DisplayObject>&, int)> rec =
         [&](const std::shared_ptr<fvm::DisplayObject>& d, int lvl) {
         if (!d) return;
         swf::Matrix w = playerWorldMatrix(d, movie_);
-        std::fprintf(stderr, "[sub] %*scid=%u name=%s f=%d built=%d vis=%d xy=(%.1f,%.1f) world=(%.1f,%.1f) full=%d(%.3f,%.3f,%.3f,%.3f)\n",
-                     lvl * 2, "", (unsigned)d->characterId, d->name.c_str(), d->currentFrame,
-                     (int)d->timelineBuilt, (int)d->visible, d->x, d->y, w.tx, w.ty,
-                     (int)d->hasFull, d->fullA, d->fullB, d->fullC, d->fullD);
+        // 旋转角取自 RotateSkew1(r0)：SWF 矩阵布局 [[sx, r0],[r1, sy]]，r1 可能含错切分量。
+        double wang = std::atan2(-(double)w.r0, (double)w.sx) * 180.0 / 3.141592653589793;
+        double wsc = std::sqrt((double)w.sx * w.sx + (double)w.r0 * w.r0);
+        std::snprintf(b, sizeof(b),
+            "[sub] %*scid=%u name=%s f=%d built=%d vis=%d xy=(%.1f,%.1f) world=(%.1f,%.1f) wrot=%.1f wsc=%.3f full=%d(%.3f,%.3f,%.3f,%.3f)\n",
+            lvl * 2, "", (unsigned)d->characterId, d->name.c_str(), d->currentFrame,
+            (int)d->timelineBuilt, (int)d->visible, d->x, d->y, w.tx, w.ty,
+            wang, wsc,
+            (int)d->hasFull, d->fullA, d->fullB, d->fullC, d->fullD);
+        out += b;
         for (const auto& c : d->children) rec(c, lvl + 1);
     };
     std::function<bool(const std::shared_ptr<fvm::DisplayObject>&)> find =
@@ -702,10 +713,11 @@ void Player::logSpriteSubtree(unsigned cid) const {
         for (const auto& c : d->children) if (find(c)) return true;
         return false;
     };
-    std::fprintf(stderr, "[sub] === subtree of cid=%u ===\n", cid);
+    out += "[sub] === subtree of cid=" + std::to_string(cid) + " ===\n";
     for (const auto& vm : vms_)
-        for (const auto& root : vm->stage) if (find(root)) return;
-    std::fprintf(stderr, "[sub] cid=%u not found in runtime tree\n", cid);
+        for (const auto& root : vm->stage) if (find(root)) return out;
+    out += "[sub] cid=" + std::to_string(cid) + " not found in runtime tree\n";
+    return out;
 }
 void Player::keyDown(int vk) {
     int kc = vkToKeyPressCode(vk);

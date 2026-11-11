@@ -231,6 +231,15 @@ if(MSVC)
 endif()
 add_test(NAME swfparser_placeobject3 COMMAND test_placeobject3)
 
+# 时间轴放置矩阵的分解/重建一致性测试（镜像与错切矩阵必须精确还原）
+add_executable(test_matrix_decomp tests/test_matrix_decomp.cpp)
+target_link_libraries(test_matrix_decomp PRIVATE swf_render)
+if(MSVC)
+    target_compile_options(test_matrix_decomp PRIVATE /W3 /utf-8)
+    target_compile_definitions(test_matrix_decomp PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+add_test(NAME swfparser_matrix_decomp COMMAND test_matrix_decomp)
+
 # 精灵内 clipDepth 遮罩渲染测试（读回 PNG 像素验证裁剪）
 add_executable(test_spriteclip tests/test_spriteclip.cpp)
 target_link_libraries(test_spriteclip PRIVATE swf_render)
@@ -376,7 +385,8 @@ set(SWF_ALL_TESTS
     swfparser_help swfparser_opcodes swfparser_avm2_opcodes
     swfparser_sample_fws swfparser_sample_cws
     swfparser_avm1 swfparser_avm2_vm swfparser_avm2_runtime
-    swfparser_edittext swfparser_placeobject3 swfparser_spriteclip
+    swfparser_edittext swfparser_placeobject3 swfparser_matrix_decomp
+    swfparser_spriteclip
     swfparser_filter swfparser_filter2 swfparser_screenvideo swfparser_font
     swfparser_font_old swfparser_render swfparser_audio swfparser_boundary
     swfparser_graphics)
