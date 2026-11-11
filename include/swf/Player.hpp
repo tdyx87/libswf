@@ -41,6 +41,12 @@ public:
         for (const auto& vm : vms_) n += vm->stage.size();
         return n;
     }
+    // 诊断：在运行时显示树中查找 characterId==cid 的节点，返回其 currentFrame（找不到返回 -1）。
+    // 用于"跑到某精灵的某帧时自动存图"（如 swf2 拍手步 stepMC=1042 到 f200）。
+    int runtimeSpriteFrame(unsigned cid) const;
+    // 诊断：把 characterId==cid 的运行时节点子树（含各后代 characterId + 世界平移）
+    // 打印到 stderr，用于定位"运行时合成 vs 原始时间轴"的实例位置差异。
+    void logSpriteSubtree(unsigned cid) const;
 
     void tick();
     // targetW/targetH > 0：按该设备分辨率重新光栅化（窗口放大时保持矢量/文字清晰）；

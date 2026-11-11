@@ -648,6 +648,65 @@ bool Player::handCursor() const {
     DisplayItem* leaf = resolveItemChain(hoverChain_, &container);
     return leaf && isButtonItem(*leaf);
 }
+// 运行时显示树里按 characterId 找节点、返回其 currentFrame（深度优先，命中即返）。
+int Player::runtimeSpriteFrame(unsigned cid) const {
+    std::function<int(const std::shared_ptr<fvm::DisplayObject>&)> walk =
+        [&](const std::shared_ptr<fvm::DisplayObject>& d) -> int {
+        if (!d) return -1;
+        if (d->characterId == cid) return d->currentFrame;
+        for (const auto& c : d->children) { int r = walk(c); if (r >= 0) return r; }
+        return -1;
+    };
+    for (const auto& vm : vms_)
+        for (const auto& root : vm->stage) { int r = walk(root); if (r >= 0) return r; }
+    return -1;
+}
+// 复刻 displayWorldMatrix（Fvm.cpp 内部静态）：链上逐级 post 局部矩阵。
+static swf::Matrix playerWorldMatrix(const std::shared_ptr<fvm::DisplayObject>& d, const Movie& movie) {
+    std::vector<const fvm::DisplayObject*> chain;
+    for (auto c = d; c; c = c->parent) chain.push_back(c.get());
+    swf::Matrix world;
+    world.sx = 1.0f / 20.0f; world.sy = 1.0f / 20.0f;
+    world.tx = static_cast<float>(-movie.frameSize.x0 / 20.0);
+    world.ty = static_cast<float>(-movie.frameSize.y0 / 20.0);
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        const fvm::DisplayObject& o = **it;
+        swf::Matrix lt;
+        if (o.hasFull) {
+            lt.sx = (float)o.fullA; lt.r0 = (float)o.fullB; lt.r1 = (float)o.fullC; lt.sy = (float)o.fullD;
+        } else {
+            double rad = o.rotation * 3.141592653589793 / 180.0, ca = std::cos(rad), sa = std::sin(rad);
+            lt.sx = (float)(o.scaleX * ca); lt.r0 = (float)(-o.scaleX * sa);
+            lt.r1 = (float)(o.scaleY * sa); lt.sy = (float)(o.scaleY * ca);
+        }
+        lt.tx = (float)(o.x * 20.0); lt.ty = (float)(o.y * 20.0);
+        world = world.post(lt);
+    }
+    return world;
+}
+void Player::logSpriteSubtree(unsigned cid) const {
+    std::function<void(const std::shared_ptr<fvm::DisplayObject>&, int)> rec =
+        [&](const std::shared_ptr<fvm::DisplayObject>& d, int lvl) {
+        if (!d) return;
+        swf::Matrix w = playerWorldMatrix(d, movie_);
+        std::fprintf(stderr, "[sub] %*scid=%u name=%s f=%d built=%d vis=%d xy=(%.1f,%.1f) world=(%.1f,%.1f) full=%d(%.3f,%.3f,%.3f,%.3f)\n",
+                     lvl * 2, "", (unsigned)d->characterId, d->name.c_str(), d->currentFrame,
+                     (int)d->timelineBuilt, (int)d->visible, d->x, d->y, w.tx, w.ty,
+                     (int)d->hasFull, d->fullA, d->fullB, d->fullC, d->fullD);
+        for (const auto& c : d->children) rec(c, lvl + 1);
+    };
+    std::function<bool(const std::shared_ptr<fvm::DisplayObject>&)> find =
+        [&](const std::shared_ptr<fvm::DisplayObject>& d) -> bool {
+        if (!d) return false;
+        if (d->characterId == cid) { rec(d, 0); return true; }
+        for (const auto& c : d->children) if (find(c)) return true;
+        return false;
+    };
+    std::fprintf(stderr, "[sub] === subtree of cid=%u ===\n", cid);
+    for (const auto& vm : vms_)
+        for (const auto& root : vm->stage) if (find(root)) return;
+    std::fprintf(stderr, "[sub] cid=%u not found in runtime tree\n", cid);
+}
 void Player::keyDown(int vk) {
     int kc = vkToKeyPressCode(vk);
     if (kc <= 0) return;

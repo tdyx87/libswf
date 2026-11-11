@@ -54,6 +54,26 @@ long long g_tickCount = 0;            // tick 总数（点击调度的时基，�
 std::map<int, std::pair<double, double>> g_clickDown, g_clickUp;  // tick->舞台坐标
 std::vector<std::uint8_t> g_recRgba;  // 录制用舞台原生尺寸缓冲
 
+// ---- 自动保存：SWF_AUTOSAVE=cid:frame:outpath —— 当运行时某精灵(characterId=cid)
+// 的播放头到达 >= frame 时，自动把当前整屏存成 outpath（一次），无需手动抓帧。
+// 用于精准抓取"1042 到 f200 的拍手瞬间"这类需要交互导航才能到达的帧。
+unsigned g_asCid = 0; int g_asFrame = -1; std::string g_asPath; bool g_asDone = false;
+std::vector<std::uint8_t> g_asRgba;
+void maybeAutoSave() {
+    if (g_asDone || g_asFrame < 0 || g_asPath.empty()) return;
+    int cf = g_player.runtimeSpriteFrame(g_asCid);
+    if (cf < g_asFrame) return;
+    int w = 0, h = 0;
+    if (!g_player.render(g_asRgba, w, h, 0, 0) || w <= 0) return;
+    if (stbi_write_png(g_asPath.c_str(), w, h, 4, g_asRgba.data(), w * 4))
+        dlog("[autosave] cid=%u frame=%d (sprite now %d) -> %s\n", g_asCid, g_asFrame, cf, g_asPath.c_str());
+    else
+        dlog("[autosave] write FAILED: %s\n", g_asPath.c_str());
+    g_player.logSpriteSubtree(g_asCid);   // 同时 dump 运行时子树实例位置，供比对
+    g_asDone = true;
+    if (g_autoExit) PostMessage(g_hwnd, WM_CLOSE, 0, 0);
+}
+
 // 把当前帧按舞台原生尺寸写入 rec_NNNN.png。返回 false 表示渲染失败或已录满。
 bool recordFrame() {
     if (g_recDir.empty() || g_recCount >= g_recMax) return false;
@@ -284,6 +304,15 @@ int main(int argc, char** argv) {
         else if (a == "--record" && i + 1 < argc) g_recDir = argv[++i];
         else if (a == "--max-frames" && i + 1 < argc) g_recMax = std::atoi(argv[++i]);
         else if (a == "--auto-exit") g_autoExit = true;
+        else if (a == "--save-at" && i + 1 < argc) {   // --save-at <cid>:<frame>:<outpath>
+            const std::string spec = argv[++i];
+            char p[512] = {0};
+            if (std::sscanf(spec.c_str(), "%u:%d:%511s", &g_asCid, &g_asFrame, p) == 3) {
+                g_asPath = p;
+                std::printf("[save-at] will capture when runtime sprite cid=%u reaches frame %d -> %s\n",
+                            g_asCid, g_asFrame, g_asPath.c_str());
+            }
+        }
         else if (a == "--click" && i + 1 < argc) {   // --click <tick>:<x>:<y>
             const std::string spec = argv[++i];
             int fr = 0; double x = 0, y = 0;
@@ -465,6 +494,7 @@ int main(int argc, char** argv) {
                 if (g_autoExit) { PostMessage(g_hwnd, WM_CLOSE, 0, 0); }
             }
         }
+        maybeAutoSave();   // 运行时精灵到达目标帧则自动存图
         QueryPerformanceCounter(&t1);
         InvalidateRect(g_hwnd, nullptr, FALSE);
         ++frameIdx;
