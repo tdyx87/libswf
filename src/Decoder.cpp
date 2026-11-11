@@ -304,6 +304,8 @@ struct ShapeBuilder {
     std::vector<FillStyle>* fills = nullptr;
     std::vector<LineStyle>* lines = nullptr;
     std::shared_ptr<Shape> shape;
+    // MorphShape 解码时开启：额外记录**未拍平**的原始形状记录流，供逐记录插值。
+    bool recordRaw = false;
 
     int actFill0 = 0, actFill1 = 0, actLine = 0;
     // 当前样式表的基址（1 基索引 = 基址 + 相对索引）。初始表为 0；StateNewStyles
@@ -325,6 +327,12 @@ struct ShapeBuilder {
     }
     void addPoint(Cur& c, float x, float y) {
         c.sx.push_back(x); c.sy.push_back(y); c.lastX = x; c.lastY = y;
+    }
+    // 原始记录（仅 recordRaw）：与 fillPaths 的拍平结果并行维护。
+    void rawRec(unsigned char kind, float x, float y, float cx, float cy) {
+        if (!recordRaw || !shape) return;
+        Shape::RawRec r; r.kind = kind; r.x = x; r.y = y; r.cx = cx; r.cy = cy;
+        shape->rawRecs.push_back(r);
     }
 
     // 记录某样式路径首次被刷新的位置（渲染顺序 = Flash 的记录流顺序）。
@@ -400,23 +408,35 @@ struct ShapeBuilder {
     // 该样式当前的路径就此**结束并闭合**，之后若再次选中同一索引，则从当前笔
     // 位置**重开**一条新路径"。
     void styleChange(int nf0, int nf1, int nl, bool has0, bool has1, bool hasL) {
+        bool changed = false;
         if (has0 && nf0 != actFill0) {
             if (actFill0) pushFill(keyOf(actFill0, 0), openFill[keyOf(actFill0, 0)]);
             actFill0 = nf0;
             if (actFill0) ensure(openFill[keyOf(actFill0, 0)], penX, penY);
+            changed = true;
         }
         if (has1 && nf1 != actFill1) {
             if (actFill1) pushFill(keyOf(actFill1, 1), openFill[keyOf(actFill1, 1)]);
             actFill1 = nf1;
             if (actFill1) ensure(openFill[keyOf(actFill1, 1)], penX, penY);
+            changed = true;
         }
         if (hasL && nl != actLine) {
             if (actLine > 0) { pushLine(actLine, openLine[actLine]); openLine.erase(actLine); }
             actLine = nl;
             if (actLine > 0) ensure(openLine[actLine], penX, penY);
+            changed = true;
+        }
+        if (recordRaw && shape && changed) {
+            // 样式变更也占一条记录，保证起止两段的记录流逐条对应
+            Shape::RawRec r;
+            r.kind = 3; r.f0 = nf0; r.f1 = nf1; r.ln = nl;
+            r.has = static_cast<unsigned char>((has0 ? 1 : 0) | (has1 ? 2 : 0) | (hasL ? 4 : 0));
+            shape->rawRecs.push_back(r);
         }
     }
     void moveTo(float x, float y) {
+        rawRec(0, x, y, 0, 0);
         finalizeAll();
         penX = x; penY = y;
         // 新的子路径从笔位置起头；只给当前激活的样式开路径
@@ -425,10 +445,14 @@ struct ShapeBuilder {
         if (actLine)  ensure(openLine[actLine], x, y);
     }
     void lineTo(float x, float y) {
+        rawRec(1, x, y, 0, 0);
         addLineTo(x, y);
         penX = x; penY = y;
     }
     void curveTo(float cx, float cy, float ax, float ay) {
+        // 原始记录先落（拍平循环走 addLineTo，不产生额外记录）：控制点与锚点各自
+        // 独立插值，才是 Flash 的 morph 语义。
+        rawRec(2, ax, ay, cx, cy);
         // 二次贝塞尔拍平：段数由控制点到弦的偏离（矢高 sag，twips）决定。
         // 几何推导：二次曲线总弦的矢高 h，整段 N 等分后每小段矢高约 h/N²
         //（控制点结构按 1/N² 缩放）；弦高差（折线最大偏差）≈ 矢高/2 = h/(2N²)。
@@ -891,6 +915,16 @@ static std::shared_ptr<MorphShape> decodeMorphShape(ByteView& bv, int shapeVer, 
     int numFillBits = nb >> 4;
     int numLineBits = nb & 0x0F;
 
+    // 两段都额外记录**未拍平**的原始形状记录流，供 interpolateMorph 逐记录插值。
+    sbS.recordRaw = true;
+    sbE.recordRaw = true;
+    // 每段开头补一条"初始样式状态"记录（kind=4）：终止段的样式索引是从起始段
+    // 末尾继承来的、并不写在自己的记录流里，回放时必须显式给出，否则第一段
+    // MoveTo 之后所有边都会落到"无填充"。两段各一条，保持记录流逐条对应。
+    {
+        Shape::RawRec r; r.kind = 4; r.f0 = 0; r.f1 = 0; r.ln = 0;
+        ms->start->rawRecs.push_back(r);
+    }
     parseMorphSection(bv, shapeVer, sbS, numFillBits, numLineBits);   // 起始段
     // 终止段**不 seek 到 Offset**（对照 Ruffle read_define_morph_shape）：起始段的
     // EndShapeRecord 之后紧跟 1 个打包字节（本片写 0，即终止段的 NumFillBits|NumLineBits），
@@ -903,9 +937,109 @@ static std::shared_ptr<MorphShape> decodeMorphShape(ByteView& bv, int shapeVer, 
     sbE.actFill0 = sbS.actFill0;
     sbE.actFill1 = sbS.actFill1;
     sbE.actLine = sbS.actLine;
+    {
+        Shape::RawRec r; r.kind = 4; r.f0 = sbS.actFill0; r.f1 = sbS.actFill1; r.ln = sbS.actLine;
+        ms->end->rawRecs.push_back(r);
+    }
     parseMorphSection(bv, shapeVer, sbE, numFillBits, numLineBits);
     (void)endOffset; (void)recStart; (void)shapeId;
     return ms;
+}
+
+// MorphShape 的逐记录插值（首选路径）。
+// SWF 规范保证 morph 起止两段的形状记录一一对应；把每条记录的锚点/控制点线性
+// 插值后再按插值结果拍平，才是 Flash 的 shape tween 语义。
+// 不能反过来对"拍平后的点"插值：拍平段数 N 由矢高决定，起止形态弯曲程度不同
+// 就会段数不同，逐点对齐既错位又会把合法 morph 误判为不可插值
+// （loading_mc c1269 的扇形遮罩 c1252/1253/1258 因此整段冻结）。
+// 记录数量或类型不对应、或没有原始记录时返回 false，调用方退回逐点插值。
+bool interpolateMorphRecords(const MorphShape& m, float t, Shape& out) {
+    if (!m.start || !m.end) return false;
+    // 配对策略：只按**几何记录**（Move/Line/Curve）逐条对应，样式状态作为每条记录
+    // 的附属信息带过去，样式变更记录本身不参与配对。
+    // 原因：终止段沿用起始段末尾的样式状态（由 kind=4 承载），于是起始段里那些
+    // "把索引从 A 改成 B"的记录在终止段根本不出现（索引已经是 B，无变化），两段
+    // 的记录条数天然不等。而 SWF 规范保证的是**几何记录**逐条对应。
+    struct Item { unsigned char kind; float x, y, cx, cy; int f0, f1, ln; };
+    auto flatten = [](const std::vector<Shape::RawRec>& in) {
+        std::vector<Item> r;
+        r.reserve(in.size());
+        int f0 = 0, f1 = 0, ln = 0;
+        for (const auto& rec : in) {
+            switch (rec.kind) {
+                case 4: f0 = rec.f0; f1 = rec.f1; ln = rec.ln; break;
+                case 3:
+                    if (rec.has & 1) f0 = rec.f0;
+                    if (rec.has & 2) f1 = rec.f1;
+                    if (rec.has & 4) ln = rec.ln;
+                    break;
+                default: r.push_back(Item{rec.kind, rec.x, rec.y, rec.cx, rec.cy, f0, f1, ln}); break;
+            }
+        }
+        return r;
+    };
+    const std::vector<Item> a = flatten(m.start->rawRecs);
+    const std::vector<Item> b = flatten(m.end->rawRecs);
+    if (a.empty() || a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const unsigned char ka = a[i].kind, kb = b[i].kind;
+        // 允许同种记录，以及直边↔曲边互变；MoveTo 与边记录互不对应属结构不符。
+        const bool edgePair = (ka >= 1 && ka <= 2) && (kb >= 1 && kb <= 2);
+        if (ka != kb && !edgePair) return false;
+    }
+    auto lerpF = [](float x, float y, float tt) { return x + (y - x) * tt; };
+    auto sh = std::make_shared<Shape>();
+    sh->bounds.x0 = static_cast<std::int32_t>(lerpF(static_cast<float>(m.start->bounds.x0), static_cast<float>(m.end->bounds.x0), t));
+    sh->bounds.y0 = static_cast<std::int32_t>(lerpF(static_cast<float>(m.start->bounds.y0), static_cast<float>(m.end->bounds.y0), t));
+    sh->bounds.x1 = static_cast<std::int32_t>(lerpF(static_cast<float>(m.start->bounds.x1), static_cast<float>(m.end->bounds.x1), t));
+    sh->bounds.y1 = static_cast<std::int32_t>(lerpF(static_cast<float>(m.start->bounds.y1), static_cast<float>(m.end->bounds.y1), t));
+    sh->usesWinding = m.start->usesWinding;
+    // 样式表沿用起始段（颜色/渐变矩阵由调用方按同一 t 插值后覆盖），
+    // 几何容器按样式数量预置，ShapeBuilder 的索引边界检查依赖其大小。
+    sh->fillStyles = m.start->fillStyles;
+    sh->lineStyles = m.start->lineStyles;
+    sh->fillPaths.resize(sh->fillStyles.size());
+    sh->fillEdges.resize(sh->fillStyles.size());
+    sh->strokePaths.resize(sh->lineStyles.size());
+    ShapeBuilder sb;
+    sb.fills = &sh->fillStyles;
+    sb.lines = &sh->lineStyles;
+    sb.shape = sh;
+    // 直线↔曲线互变：Flash 的 shape tween 允许一条直边渐变为曲边（loading 扇形
+    // 遮罩 c1252/1253/1258 就是这样：两个底点不动，闭合边由直变鼓）。把直边视作
+    // "控制点落在弦中点"的退化二次曲线 —— 中点控制点使 B(t) 恰为线性插值，因此
+    // t=0 精确还原起始直边、t=1 精确还原终止曲边，中间帧连续过渡。
+    float penX = 0, penY = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const Item& ra = a[i];
+        const Item& rb = b[i];
+        // 样式状态随几何记录一起给出（styleChange 内部只在索引真的变化时才闭合/
+        // 重开路径，值相同即无副作用），保证中间帧的样式归属与起止两端一致。
+        sb.styleChange(ra.f0, ra.f1, ra.ln, true, true, true);
+        const float nx = lerpF(ra.x, rb.x, t), ny = lerpF(ra.y, rb.y, t);
+        if (ra.kind == 0) {
+            sb.moveTo(nx, ny);
+            penX = nx; penY = ny;
+            continue;
+        }
+        if (ra.kind == 1 && rb.kind == 1) {
+            sb.lineTo(nx, ny);
+        } else if (ra.kind == 2 && rb.kind == 2) {
+            sb.curveTo(lerpF(ra.cx, rb.cx, t), lerpF(ra.cy, rb.cy, t), nx, ny);
+        } else if (ra.kind == 1 && rb.kind == 2) {
+            sb.curveTo(lerpF((penX + nx) * 0.5f, rb.cx, t),
+                       lerpF((penY + ny) * 0.5f, rb.cy, t), nx, ny);
+        } else if (ra.kind == 2 && rb.kind == 1) {
+            sb.curveTo(lerpF(ra.cx, (penX + nx) * 0.5f, t),
+                       lerpF(ra.cy, (penY + ny) * 0.5f, t), nx, ny);
+        } else {
+            return false;
+        }
+        penX = nx; penY = ny;
+    }
+    sb.finalizeAll();
+    out = std::move(*sh);
+    return true;
 }
 
 // 字形轮廓：字形内嵌于字体表，格式同 DefineShape 记录流但无 bounds、无填充/线数量表头，

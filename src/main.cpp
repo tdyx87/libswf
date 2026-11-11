@@ -61,6 +61,7 @@ static void printUsage() {
     std::printf("  swfparser <file.swf> --play <count> <outdir> [--click F:X:Y] [--hover F:X:Y]  AVM2 playback -> PNG frames\n");
     std::printf("  swfparser <file.swf> --play-game <count> <outdir> [--click F:X:Y]...  headless full playback via swf::Player\n");
     std::printf("  swfparser <file.swf> --play-game <count> <outdir> [--hover F:X:Y]...  move mouse (no press) at step F\n");
+    std::printf("  swfparser <file.swf> --render-char <cid>:<frame>:<out.png>  render one sprite frame standalone (diagnostics)\n");
     std::printf("  [--size WxH]  re-rasterize each frame at WxH (vector/text stay sharp when upscaled)\n");
 }
 
@@ -252,6 +253,7 @@ int main(int argc, char** argv) {
     bool listAvm1 = false, extractAudio = false, playAvm1 = false;
     bool wav = false, playSound = false, wavStream = false, renderVideo = false;
     bool playGame = false, noRender = false;
+    std::string renderCharSpec;   // --render-char <cid>:<frame>:<out.png>
     struct ClickSpec { int frame; double x, y; };
     std::vector<ClickSpec> clicks;   // --click <frame>:<x>:<y>（可重复，模拟按下并在 +2 帧释放）
     std::vector<ClickSpec> hovers;   // --hover <frame>:<x>:<y>（可重复，把鼠标移到该位置但不按下）
@@ -302,6 +304,7 @@ int main(int argc, char** argv) {
             playGame = true; playCount = std::atoi(argv[++i]); outDir = argv[++i];
         }
         else if (a == "--no-render") noRender = true;   // 只推进时间轴与交互，不导出 PNG
+        else if (a == "--render-char" && i + 1 < argc) renderCharSpec = argv[++i];
         else if (a == "--click" && i + 1 < argc) {  // --click <frame>:<x>:<y>
             std::string spec = argv[++i];
             double x = 0, y = 0; int fr = 0;
@@ -535,7 +538,7 @@ int main(int argc, char** argv) {
     }
 
     // 渲染模式：解码 + 光栅化（--run-as 也走这条路径以执行 AVM2）
-    if (render || renderAll || inspect || runAs) {
+    if (render || renderAll || inspect || runAs || !renderCharSpec.empty()) {
         std::vector<std::uint8_t> buf;
         if (!readFile(path, buf)) { std::fprintf(stderr, "cannot open %s\n", path.c_str()); return 1; }
         swf::Movie movie;
@@ -545,6 +548,59 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (movie.frames.empty()) { std::fprintf(stderr, "no frames to render\n"); return 1; }
+
+        // --render-char <cid>:<frame>:<out.png>：单独渲染某精灵的某一帧（诊断用）。
+        // 精灵内部的子时间轴按该帧的放置列表渲染，可用于隔离验证嵌套动画
+        // （如 loading_mc cid1269 的 MorphShape 遮罩扫过）是否逐帧连续。
+        if (!renderCharSpec.empty()) {
+            unsigned cid = 0; int fr = 0; char outp[512] = {0};
+            // 格式 <cid>:<frame>[:<out.png>]：输出路径可能自带冒号（盘符），故从
+            // 第二个冒号起整段作为路径，而不是用 %s 扫描（会在盘符处截断）。
+            const std::string& spec = renderCharSpec;
+            std::size_t c1 = spec.find(':');
+            if (c1 == std::string::npos) {
+                std::fprintf(stderr, "--render-char needs <cid>:<frame>[:<out.png>]\n");
+                return 1;
+            }
+            cid = static_cast<unsigned>(std::atoi(spec.substr(0, c1).c_str()));
+            std::size_t c2 = spec.find(':', c1 + 1);
+            if (c2 == std::string::npos) {
+                std::fprintf(stderr, "--render-char needs <cid>:<frame>[:<out.png>]\n");
+                return 1;
+            }
+            fr = std::atoi(spec.substr(c1 + 1, c2 - c1 - 1).c_str());
+            if (c2 + 1 < spec.size())
+                std::snprintf(outp, sizeof(outp), "%s", spec.substr(c2 + 1).c_str());
+            auto it = movie.characters.find(static_cast<std::uint16_t>(cid));
+            if (it == movie.characters.end()) { std::fprintf(stderr, "no char %u\n", cid); return 2; }
+            std::vector<swf::DisplayItem> items;
+            if (it->second && !it->second->spriteFrames.empty()) {
+                int fi = fr;
+                if (fi < 0) fi = 0;
+                if (fi >= static_cast<int>(it->second->spriteFrames.size()))
+                    fi = static_cast<int>(it->second->spriteFrames.size()) - 1;
+                items = it->second->spriteFrames[static_cast<std::size_t>(fi)].items;
+            } else {
+                swf::DisplayItem di;
+                di.characterId = static_cast<std::uint16_t>(cid);
+                di.character = it->second;
+                di.depth = 1;
+                di.matrix = swf::Matrix{};
+                items.push_back(di);
+            }
+            std::vector<std::uint8_t> rgba; int RW = 0, RH = 0;
+            if (!swf::renderFrameWithItems(movie, items, fr, rgba, RW, RH)) {
+                std::fprintf(stderr, "[render-char] render failed\n");
+                return 1;
+            }
+            const char* dst = outp[0] ? outp : "char_render.png";
+            if (!stbi_write_png(dst, RW, RH, 4, rgba.data(), RW * 4)) {
+                std::fprintf(stderr, "[render-char] write failed: %s\n", dst);
+                return 1;
+            }
+            std::fprintf(stderr, "[render-char] cid=%u frame=%d -> %s (%dx%d)\n", cid, fr, dst, RW, RH);
+            return 0;
+        }
 
         if (runAs) {
             if (movie.abcFiles.empty()) {
@@ -654,6 +710,24 @@ int main(int argc, char** argv) {
                             std::printf("\n");
                         }
                     }
+                } else if (ch->kind == swf::Character::Kind::Morph && ch->morph) {
+                    // MorphShape：报告**原始记录**的对应性 —— 这才是插值的结构依据。
+                    // 拍平后的点数在起止两端本来就可以不等（直边↔曲边互变），
+                    // 拿它判断"可否插值"会把合法 morph 误判为冻结。
+                    const auto& ms = *ch->morph;
+                    auto flat = [](const std::shared_ptr<swf::Shape>& s) -> std::size_t {
+                        std::size_t n = 0;
+                        if (s) for (const auto& c : s->fillPaths) for (const auto& ct : c) n += ct.xs.size();
+                        return n;
+                    };
+                    swf::Shape probe;
+                    const bool ok = swf::interpolateMorphRecords(ms, 0.5f, probe);
+                    std::printf("  [%5u] Morph  rawRecs=%zu/%zu  flatPts=%zu/%zu  %s\n",
+                                kv.first,
+                                ms.start ? ms.start->rawRecs.size() : 0,
+                                ms.end ? ms.end->rawRecs.size() : 0,
+                                flat(ms.start), flat(ms.end),
+                                ok ? "(逐记录插值可用)" : "(退回按点插值)");
                 } else if (ch->kind == swf::Character::Kind::Font && ch->font) {
                     int nonEmpty = 0;
                     for (const auto& gs : ch->font->shapes) if (gs && !gs->fillPaths.empty() && !gs->fillPaths[0].empty()) ++nonEmpty;

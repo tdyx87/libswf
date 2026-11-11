@@ -1003,9 +1003,16 @@ static Shape interpolateMorph(const MorphShape& m, float t) {
     bool edgesMatch = m.start->fillEdges.size() == m.end->fillEdges.size();
     for (std::size_t fi = 0; edgesMatch && fi < m.start->fillEdges.size(); ++fi)
         if (m.start->fillEdges[fi].size() != m.end->fillEdges[fi].size()) edgesMatch = false;
-    if (!edgesMatch ||
-        !contoursMatch(m.start->fillPaths, m.end->fillPaths) ||
-        !contoursMatch(m.start->strokePaths, m.end->strokePaths))
+    // 首选路径：逐**原始记录**插值后重新拍平。起止形态的曲线弯曲程度不同，拍平
+    // 段数就不同，用拍平后的点数/轮廓比对结构会把合法 morph 误判为不可插值并退化
+    // 成起始形状 —— loading_mc(c1269) 的扇形遮罩 c1252/1253/1258 正是如此（起始段
+    // 曲线 N=1、终止段 N=60），表现为"进度扫过 14 帧后整段冻结"。
+    Shape geom;
+    const bool rawOk = interpolateMorphRecords(m, t, geom);
+    if (!rawOk &&
+        (!edgesMatch ||
+         !contoursMatch(m.start->fillPaths, m.end->fillPaths) ||
+         !contoursMatch(m.start->strokePaths, m.end->strokePaths)))
         return *m.start;
     s.bounds = m.start->bounds;
     s.usesWinding = m.start->usesWinding;
@@ -1052,6 +1059,14 @@ static Shape interpolateMorph(const MorphShape& m, float t) {
         s.lineStyles[i].width = lerp(s.lineStyles[i].width, m.end->lineStyles[i].width, t);
         s.lineStyles[i].color = mixColor(s.lineStyles[i].color, m.end->lineStyles[i].color);
     }
+    // 几何：逐记录插值成功时直接采用其拍平结果；否则退回按点插值（两段点数一致）。
+    if (rawOk) {
+        s.fillPaths = std::move(geom.fillPaths);
+        s.fillEdges = std::move(geom.fillEdges);
+        s.strokePaths = std::move(geom.strokePaths);
+        s.drawOrder = geom.drawOrder;
+        s.bounds = geom.bounds;
+    } else {
     // 有向边同步插值，否则 fillEdges 为空会退回轮廓启发式，丢失洞/并集的
     // 非零环绕语义（MORPHSHAPE 的边记录是逐边一一对应的）。
     s.fillEdges.resize(m.start->fillEdges.size());
@@ -1092,6 +1107,7 @@ static Shape interpolateMorph(const MorphShape& m, float t) {
             s.strokePaths[li][ci] = c;
         }
     }
+    }   // else（按点插值回退）
     return s;
 }
 

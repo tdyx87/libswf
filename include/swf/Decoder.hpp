@@ -139,6 +139,18 @@ struct Shape {
     // DefineShape4 的 UsesFillWindingRule：true 表示该形状用非零环绕规则填充
     // （仅 tag 83 提供该标志；其它版本按偶奇/嵌套规则处理）
     bool usesWinding = false;
+    // 原始形状记录流（**未拍平**）：仅 MorphShape 解码时填充。
+    // 二次曲线在 fillPaths 里已按矢高拍平成 N 段，起止两个形态的弯曲程度不同 →
+    // 段数不同，若拿拍平后的点数比对结构，合法 morph 会被误判为不可插值。
+    // Morph 的插值必须逐记录进行（SWF 规范保证两段记录一一对应），插值后再拍平。
+    struct RawRec {
+        unsigned char kind = 0;   // 0=MoveTo 1=LineTo 2=CurveTo 3=StyleChange
+        float x = 0, y = 0;       // Move/Line/Curve 的锚点（绝对 twips）
+        float cx = 0, cy = 0;     // Curve 的控制点（绝对 twips）
+        int f0 = 0, f1 = 0, ln = 0;   // StyleChange 的新样式索引
+        unsigned char has = 0;    // StyleChange: bit0=f0 bit1=f1 bit2=ln 有效
+    };
+    std::vector<RawRec> rawRecs;
 };
 
 // 解码后的位图（已转 RGBA）
@@ -336,6 +348,11 @@ struct MorphShape {
     std::shared_ptr<Shape> start;
     std::shared_ptr<Shape> end;
 };
+
+// MorphShape 的逐记录插值（首选路径）：把起止两段**未拍平**的原始形状记录逐条
+// 插值，再按插值结果重新拍平成中间形状，写入 out。记录数量/类型不对应或没有
+// 原始记录时返回 false，调用方退回按点插值。
+bool interpolateMorphRecords(const MorphShape& m, float t, Shape& out);
 
 // 文本字段（DefineEditText, tag 37）：时间轴上的静态/输入文本框。
 struct EditText {

@@ -240,6 +240,15 @@ if(MSVC)
 endif()
 add_test(NAME swfparser_matrix_decomp COMMAND test_matrix_decomp)
 
+# MorphShape 逐记录插值测试（直边↔曲边互变；拍平点数不等不得拒绝插值）
+add_executable(test_morph_interp tests/test_morph_interp.cpp)
+target_link_libraries(test_morph_interp PRIVATE swf_render)
+if(MSVC)
+    target_compile_options(test_morph_interp PRIVATE /W3 /utf-8)
+    target_compile_definitions(test_morph_interp PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+add_test(NAME swfparser_morph_interp COMMAND test_morph_interp)
+
 # 精灵内 clipDepth 遮罩渲染测试（读回 PNG 像素验证裁剪）
 add_executable(test_spriteclip tests/test_spriteclip.cpp)
 target_link_libraries(test_spriteclip PRIVATE swf_render)
