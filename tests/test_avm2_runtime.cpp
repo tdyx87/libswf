@@ -775,6 +775,85 @@ int main() {
               "SharedObject.getLocal exposes a data object");
     }
 
+    // ---- 嵌套时间轴实例的 stage 可达性（GreenSock ticker 注册的前提）----
+    // 换装道具的悬停放大走 gs.TweenMax.to(mc, 1, {scaleX…, ease:Elastic.easeOut})。
+    // GreenSock 11 的 addTickListener 是 `s = target.stage; if (s) s.addEventListener(
+    // Event.ENTER_FRAME, tick)` —— stage 拿不到就**静默跳过**，补间被创建但永远不被
+    // 推进，表现正是"悬停毫无动画、且没有任何报错"。实测日志里 enterFrame 的监听者
+    // 只有预加载器的 progreso，GreenSock 的 tick 从未注册，故锁定此路径。
+    // 层级按真实显示树复刻：root → main → stepMC → List → a6。
+    {
+        swf::Movie m;
+        m.frameRate = 12;
+        // 由内向外建 4 层精灵：33(a6) ← 32(List) ← 31(stepMC) ← 30(main)
+        auto leaf = std::make_shared<swf::Character>();
+        leaf->kind = swf::Character::Kind::Sprite;
+        leaf->spriteFrames = {swf::Frame{}};
+        m.characters[33] = leaf;
+        for (int cid = 32; cid >= 30; --cid) {
+            swf::DisplayItem child;
+            child.depth = 1;
+            child.characterId = static_cast<std::uint16_t>(cid + 1);
+            swf::Frame fr;
+            fr.items = {child};
+            auto sp = std::make_shared<swf::Character>();
+            sp->kind = swf::Character::Kind::Sprite;
+            sp->spriteFrames = {fr};
+            m.characters[cid] = sp;
+        }
+        swf::DisplayItem top;
+        top.depth = 1; top.characterId = 30;
+        swf::Frame tf;
+        tf.items = {top};
+        m.frames = {tf};
+
+        swf::abc::AbcFile abc;
+        f::Vm v(abc, m);
+        v.run();
+        auto root = std::make_shared<f::DisplayObject>();
+        root->characterId = 0;
+        v.stage.push_back(root);
+        v.setClipFrame(root, 0);
+
+        // 走到最深层 a6
+        std::shared_ptr<f::DisplayObject> cur = root;
+        for (int lvl = 0; lvl < 4 && !cur->children.empty(); ++lvl)
+            cur = cur->children[0];
+        check(cur != root && cur->characterId == 33, "4 层嵌套实例全部建成");
+
+        // 诊断：从最深层沿 parent 上溯，必须能到达 stage 根（stage getter 依赖它）
+        {
+            std::shared_ptr<f::DisplayObject> up = cur;
+            int hops = 0;
+            while (up->parent) { up = up->parent; ++hops; }
+            check(hops == 4 && up.get() == root.get(),
+                  "4 层嵌套实例的 parent 链上溯到舞台根");
+        }
+        // 用公开 API 验证 stage getter 的祖先上溯：给最深层实例挂一个 AS3 包装对象。
+        // 必须像运行时那样把 cls 指到 MovieClip 的 ClassDef，否则 stage/root 这些
+        // 继承来的 getter 在成员链上查不到（那是测试构造缺陷，不是引擎行为）。
+        auto wrap = v.newObject(ObjKind::MovieClip, "a6");
+        wrap->display = cur;
+        const Value mc = global(v, "MovieClip");
+        if (mc.kind == VKind::Object && mc.obj && mc.obj->classDef)
+            wrap->cls = mc.obj->classDef;
+        const Value st = v.getProperty(wrap, "stage");
+        check(st.kind == VKind::Object && st.obj && st.obj->display,
+              "嵌套时间轴实例的 stage 非空（GreenSock 才能注册 ENTER_FRAME ticker）");
+        const Value rt = v.getProperty(wrap, "root");
+        check(rt.kind == VKind::Object && rt.obj, "同一实例的 root 非空");
+        if (st.kind == VKind::Object && st.obj) {
+            // GreenSock 拿到 stage 后立刻 addEventListener(Event.ENTER_FRAME, tick)。
+            // 这里真的注册一个并跑几帧，确认 tick 会被调用（否则补间永远不推进）。
+            int ticks = 0;
+            const Value fn = nativeFn(v, "gsTick",
+                [&ticks](const std::vector<Value>&) -> Value { ++ticks; return Value::undefined(); });
+            call(v, st.obj, "addEventListener", {Value::str("enterFrame"), fn});
+            for (int i = 0; i < 3; ++i) v.tick();
+            check(ticks >= 3, "Stage 上的 ENTER_FRAME 监听每帧都被派发");
+        }
+    }
+
     std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }
