@@ -699,6 +699,56 @@ int main() {
         }
     }
 
+    // ---- 换装道具的悬停光晕：new GlowFilter(...) 与 filters 赋值 ----
+    // 回归：换装_448 的 onOver 做 `curOB.filters = [new GlowFilter(0xFFFFFF,1,10,10)]`
+    // 再 `gotoAndPlay(2)`。此前 GlowFilter 等类根本没注册，而 constructObject 对未
+    // 注册类不抛异常、只返回不带参数的空对象，构造实参全丢；且 filters 赋值没有接进
+    // display->filters，渲染器看不到 —— 光晕两头都断。另注意单位：AS3 用像素，
+    // Filter 内部约定是 twips，必须 ×20。
+    {
+        const Value gf = global(vm, "GlowFilter");
+        check(gf.kind == VKind::Object && gf.obj && gf.obj->classDef,
+              "GlowFilter class is registered");
+        const Value filt = vm.constructObject(gf, {Value::uintv(0xFFFFFF), Value::num(1.0),
+                                                   Value::num(10.0), Value::num(10.0)});
+        check(filt.kind == VKind::Object && filt.obj, "new GlowFilter(...) yields an instance");
+        if (filt.obj) {
+            check(vm.getProperty(filt.obj, "blurX").toNumber() == 10.0,
+                  "GlowFilter keeps its blurX constructor argument");
+            check(vm.getProperty(filt.obj, "color").toNumber() == 16777215.0,
+                  "GlowFilter keeps its color constructor argument");
+            // AS3 默认值：未传 strength 时 GlowFilter 默认 2
+            check(vm.getProperty(filt.obj, "strength").toNumber() == 2.0,
+                  "GlowFilter applies AS3 default strength=2");
+        }
+
+        const Value sp = make(vm, "Sprite");
+        auto arr = vm.newObject(ObjKind::Array, "Array");
+        arr->props["$length"] = Value::intg(1);
+        arr->props["0"] = filt;
+        vm.setProperty(sp.obj, "filters", Value::object(arr));
+        check(sp.obj->display != nullptr, "Sprite instance has a display object");
+        check(sp.obj->display && sp.obj->display->filters &&
+                  !sp.obj->display->filters->empty(),
+              "assigning filters reaches the renderer's filter list");
+        if (sp.obj->display && sp.obj->display->filters &&
+            !sp.obj->display->filters->empty()) {
+            const swf::Filter& f = (*sp.obj->display->filters)[0];
+            check(f.kind == swf::FilterKind::Glow, "GlowFilter maps to FilterKind::Glow");
+            check(f.color.r == 255 && f.color.g == 255 && f.color.b == 255,
+                  "GlowFilter color 0xFFFFFF decodes to white RGB");
+            check(f.blurX == 200.0f && f.blurY == 200.0f,
+                  "blurX/blurY convert pixels -> twips (x20, renderer divides by 20)");
+        }
+
+        // 空数组 = 清除（onOut 里的 `curOB.filters = []` 走的就是这条路）
+        auto emptyArr = vm.newObject(ObjKind::Array, "Array");
+        emptyArr->props["$length"] = Value::intg(0);
+        vm.setProperty(sp.obj, "filters", Value::object(emptyArr));
+        check(sp.obj->display->filters == nullptr,
+              "filters = [] clears the renderer's filter list");
+    }
+
     // ---- 18. 加载 / 网络 / 媒体 / 本地存储 ----
     {
         const Value req = make(vm, "URLRequest", {Value::str("asset.swf")});

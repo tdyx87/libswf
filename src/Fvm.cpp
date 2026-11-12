@@ -2254,6 +2254,79 @@ void Vm::setProperty(std::shared_ptr<Object> obj, const std::string& name, const
             obj->props[name] = v; return;
         }
         // cacheAsBitmap：软件光栅器不做位图缓存，登记语义供调试观察
+        // AS3 运行时滤镜：displayObject.filters = [new GlowFilter(...), ...]。
+        // 翻译成渲染器的 Filter 列表（空数组 = 清除滤镜）。
+        // 单位注意：AS3 的 blurX/blurY/distance 用**像素**，而本引擎 Filter 的内部
+        // 约定是 **twips**（渲染端按 blurX/20 还原像素，见 Render.cpp applyFilters）。
+        // 漏乘 20 会让 GlowFilter(…,10,10) 退化成 0.5 像素 —— 光晕几乎不可见，
+        // 正是"加了 filter 却看不到效果"的典型成因。
+        if (name == "filters") {
+            auto flt = std::make_shared<std::vector<Filter>>();
+            if (v.kind == VKind::Object && v.obj) {
+                int n = 0;
+                auto lp = v.obj->props.find("$length");
+                if (lp != v.obj->props.end()) n = lp->second.toInt();
+                for (int i = 0; i < n; ++i) {
+                    auto ep = v.obj->props.find(std::to_string(i));
+                    if (ep == v.obj->props.end() || !ep->second.obj) continue;
+                    const auto& fo = *ep->second.obj;
+                    auto at = [&fo](const char* k, double def) {
+                        auto it = fo.props.find(k);
+                        return (it != fo.props.end() && !it->second.isNullOrUndef())
+                            ? it->second.toNumber() : def;
+                    };
+                    const std::string cn = fo.className;
+                    Filter f;
+                    double defColor = 0xFF0000;
+                    if (cn == "GlowFilter") {
+                        f.kind = FilterKind::Glow;
+                    } else if (cn == "BlurFilter") {
+                        f.kind = FilterKind::Blur;
+                    } else if (cn == "DropShadowFilter") {
+                        f.kind = FilterKind::DropShadow;
+                        defColor = 0.0;                 // AS3 默认投影色为黑
+                    } else if (cn == "ColorMatrixFilter") {
+                        f.kind = FilterKind::ColorMatrix;
+                    } else {
+                        continue;                        // 未知滤镜：跳过而不是猜成 Glow
+                    }
+                    const unsigned col = static_cast<unsigned>(at("color", defColor));
+                    const double al = at("alpha", 1.0);
+                    const int a8 = al <= 0.0 ? 0 : (al >= 1.0 ? 255
+                                                   : static_cast<int>(al * 255.0 + 0.5));
+                    f.color = Color(static_cast<std::uint8_t>((col >> 16) & 0xFF),
+                                    static_cast<std::uint8_t>((col >> 8) & 0xFF),
+                                    static_cast<std::uint8_t>(col & 0xFF),
+                                    static_cast<std::uint8_t>(a8));
+                    f.blurX = static_cast<float>(at("blurX", 4.0) * 20.0);
+                    f.blurY = static_cast<float>(at("blurY", 4.0) * 20.0);
+                    f.strength = static_cast<float>(at("strength", 1.0));
+                    f.distance = static_cast<float>(at("distance", 0.0) * 20.0);
+                    f.angle = static_cast<float>(at("angle", 45.0));
+                    f.inner = at("inner", 0) != 0;
+                    f.knockout = at("knockout", 0) != 0;
+                    const double q = at("quality", 1.0);
+                    f.passes = q < 1.0 ? 1 : (q > 15.0 ? 15 : static_cast<int>(q + 0.5));
+                    if (f.kind == FilterKind::ColorMatrix) {
+                        // matrix 是 4x5 行主序数组，缺省保持单位矩阵
+                        auto mp = fo.props.find("matrix");
+                        if (mp != fo.props.end() && mp->second.obj) {
+                            int mn = 0;
+                            auto mlp = mp->second.obj->props.find("$length");
+                            if (mlp != mp->second.obj->props.end()) mn = mlp->second.toInt();
+                            for (int k = 0; k < mn && k < 20; ++k) {
+                                auto kv = mp->second.obj->props.find(std::to_string(k));
+                                if (kv != mp->second.obj->props.end())
+                                    f.colorMatrix[k] = static_cast<float>(kv->second.toNumber());
+                            }
+                        }
+                    }
+                    flt->push_back(f);
+                }
+            }
+            obj->display->filters = flt->empty() ? nullptr : flt;
+            obj->props[name] = v; return;
+        }
         if (name == "cacheAsBitmap") { obj->display->cacheAsBitmap = v.toBool(); obj->props[name] = v; return; }
         if (name == "mouseEnabled") { obj->display->mouseEnabled = v.toBool(); obj->props[name] = v; return; }
         if (name == "mouseChildren") { obj->display->mouseChildren = v.toBool(); obj->props[name] = v; return; }
@@ -4041,6 +4114,42 @@ void Vm::registerNativeClasses() {
                         [tp](const TweenTask& t) { return t.target == tp; }), tweens_.end());
                 }
                 return Value::undefined(); });
+        }
+
+        // ---- flash.filters：GlowFilter / BlurFilter / DropShadowFilter /
+        //      ColorMatrixFilter ----
+        // 换装道具的悬停效果是 `curOB.filters = [new GlowFilter(0xFFFFFF,1,10,10)]`
+        // 再 `curOB.gotoAndPlay(2)`。此前这几个类完全没注册（上面的 mkClass 名单里
+        // 没有它们），而 constructObject 对未注册类**不抛异常**、只返回一个不带任何
+        // 参数的空 Generic 对象 —— 于是构造实参（颜色/alpha/blurX/blurY）全部丢失，
+        // 再叠加 DisplayObject.filters 赋值没接进渲染层，光晕两头都是断的。
+        // 参数名与默认值按 AS3 签名给出；单位换算（像素→twips）在 filters 赋值处做。
+        {
+            struct FParam { const char* name; double def; };
+            struct FSpec { const char* name; std::vector<FParam> params; };
+            const FSpec specs[] = {
+                {"GlowFilter", {{"color", 0xFF0000}, {"alpha", 1.0}, {"blurX", 6.0}, {"blurY", 6.0},
+                                {"strength", 2.0}, {"inner", 0}, {"knockout", 0}, {"expanded", 0}}},
+                {"BlurFilter", {{"blurX", 4.0}, {"blurY", 4.0}, {"quality", 1}}},
+                {"DropShadowFilter", {{"distance", 4.0}, {"angle", 45.0}, {"color", 0}, {"alpha", 1.0},
+                                      {"blurX", 4.0}, {"blurY", 4.0}, {"strength", 1.0},
+                                      {"inner", 0}, {"knockout", 0}, {"hideObject", 0}}},
+                {"ColorMatrixFilter", {{"matrix", 0}}},
+            };
+            for (const auto& sp : specs) {
+                auto c = mkClass(sp.name, ObjKind::Generic);
+                globals_->props[std::string("flash.filters.") + sp.name] = Value::object(c);
+                auto cd = c->classDef;
+                if (!cd) continue;
+                const std::vector<FParam> params = sp.params;
+                cd->ctor = [params](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
+                    if (!self) return Value::undefined();
+                    for (std::size_t i = 0; i < params.size(); ++i)
+                        self->props[params[i].name] =
+                            (i < a.size() && !a[i].isNullOrUndef()) ? a[i] : Value::num(params[i].def);
+                    return Value::undefined();
+                };
+            }
         }
 
         // ---- 加载 / 网络 / 媒体 / 本地存储：无外部 I/O，但对象结构与常用方法完整 ----
