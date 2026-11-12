@@ -134,6 +134,59 @@ int main() {
         check(outC[3] == 0, "圆形外部保持透明");
     }
 
+    // ---- 3) 运行时滤镜：displayObject.filters 走 applyFilters 真实出画 ----
+    // 换装道具悬停时 AS3 设的是 GlowFilter。AVM2 侧的赋值接线由
+    // test_avm2_runtime 覆盖（props → Filter 转换），这里补上最后一环：
+    // DisplayObject::filters 非空时，渲染器必须在图形**之外**画出光晕 ——
+    // 否则说明运行时滤镜路径整体无效（此前 filters 赋值根本没接进来）。
+    {
+        swf::Movie gmovie;
+        auto d = std::make_shared<f::DisplayObject>();
+        d->kind = ObjKind::Shape;
+        d->graphics = std::make_shared<std::vector<f::GraphicsCmd>>();
+        f::GraphicsCmd bf;
+        bf.op = f::GraphicsCmd::Op::BeginFill;
+        bf.color = 0xFFFFFFFF;
+        d->graphics->push_back(bf);
+        f::GraphicsCmd rc;
+        rc.op = f::GraphicsCmd::Op::Rect;
+        rc.x = 30; rc.y = 30; rc.w = 20; rc.h = 20;
+        d->graphics->push_back(rc);
+        f::GraphicsCmd ef;
+        ef.op = f::GraphicsCmd::Op::EndFill;
+        d->graphics->push_back(ef);
+
+        const int W = 80, H = 80;
+        std::vector<std::uint8_t> buf(static_cast<std::size_t>(W) * H * 4, 0);
+        swf::Matrix root;
+        root.sx = root.sy = 1.0f / 20.0f;
+
+        // 基线：无滤镜时矩形外必须全透明
+        swf::renderRuntimeObject(d, root, gmovie, buf.data(), W, H, 0);
+        auto px = [&](int x, int y) -> const std::uint8_t* {
+            return buf.data() + (static_cast<std::size_t>(y) * W + x) * 4;
+        };
+        check(px(20, 20)[3] == 0, "无滤镜时矩形外全透明");
+
+        // 加 GlowFilter(0xFFFFFF,1,10,10)：AS3 像素 10 → 内部 twips 200
+        swf::Filter glow;
+        glow.kind = swf::FilterKind::Glow;
+        glow.color = swf::Color(255, 255, 255, 255);
+        glow.blurX = glow.blurY = 200.0f;
+        glow.strength = 2.0f;
+        d->filters = std::make_shared<std::vector<swf::Filter>>(
+            std::vector<swf::Filter>{glow});
+        std::fill(buf.begin(), buf.end(), 0);
+        swf::renderRuntimeObject(d, root, gmovie, buf.data(), W, H, 0);
+        int halo = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const bool inside = x >= 30 && x < 50 && y >= 30 && y < 50;
+                if (!inside && px(x, y)[3] > 0) ++halo;
+            }
+        check(halo > 0, "运行时 GlowFilter 在图形外画出光晕像素（滤镜路径生效）");
+    }
+
     std::printf(g_fail ? "FAILED (%d)\n" : "ALL PASS\n", g_fail);
     return g_fail ? 1 : 0;
 }
