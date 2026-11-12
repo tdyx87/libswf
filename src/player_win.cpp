@@ -334,8 +334,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // --log：诊断写入独立文件句柄；同时把 stdout 也重定向过去，
-    // 配合 SWF_AS_DEBUG 可一并抓取引擎内部日志（[mouse]/[tree]/[as]）。
+    // --log：诊断写入独立文件句柄；同时把 stdout 与 stderr 都重定向过去。
+    // 引擎内部日志（SWF_AS_DEBUG 的 [mouse]/[tree]/[as]、SWF_TWEEN_DBG 的 [tween]、
+    // SWF_AS_MISS 的 [miss]）一律写 stderr，此前只重定向 stdout，GUI 子系统下
+    // stderr 无处可去，这些开关在 swfplayer 里等于完全无输出。
     if (!logPath.empty()) {
         if (FILE* t = fopen(logPath.c_str(), "w")) fclose(t);   // 先清空旧日志
         g_log = fopen(logPath.c_str(), "a");                    // 追加模式：与 stdout 共写不互相覆盖
@@ -343,6 +345,8 @@ int main(int argc, char** argv) {
             g_diag = true;
             freopen(logPath.c_str(), "a", stdout);
             setvbuf(stdout, nullptr, _IONBF, 0);
+            freopen(logPath.c_str(), "a", stderr);
+            setvbuf(stderr, nullptr, _IONBF, 0);
         }
     }
     dlog("[win] === swfplayer start === file=%s\n", path.c_str());
