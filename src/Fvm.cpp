@@ -564,7 +564,15 @@ inline void registerFvmOps() {
                 for(auto& s:c.vm.stage) if(s.get()==objv.obj->display.get()){dup=true;break;}
                 if(!dup) c.vm.stage.push_back(objv.obj->display);
             }
-        } else if(objv.kind==VKind::String) c.vm.callMethod(c.vm.boxString(objv),mname,cargs); });
+        } else if(objv.kind==VKind::String) c.vm.callMethod(c.vm.boxString(objv),mname,cargs);
+        else if(std::getenv("SWF_AS_DEBUG"))
+            // 接收者为 null/undefined 时调用被静默丢弃。这类吞掉极难从表现反推：
+            // 例如 gs.TweenMax 把 ticker 挂在静态 timingSprite 上，若该静态变量在
+            // 初始化方法里写好、在另一方法里读回时丢失，timingSprite.addEventListener
+            // 就会这样消失 —— 补间被创建却永不推进（换装悬停无动画即此）。
+            std::fprintf(stderr, "[callvoid-null] .%s argc=%zu 接收者=%s\n",
+                         mname.c_str(), cargs.size(),
+                         objv.kind==VKind::Null ? "null" : "undefined"); });
     fvmOps().add(0x41, [](ExecCtx& c) {   // call
         uint32_t argc=c.in.u30(); std::vector<Value> cargs(argc);
         for(uint32_t k=0;k<argc;++k) cargs[argc-1-k]=c.pop();
