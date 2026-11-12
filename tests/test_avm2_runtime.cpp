@@ -642,6 +642,61 @@ int main() {
         check(late == 0, "delayedCall does not fire immediately");
         for (int i = 0; i < 4; ++i) vm.tick();
         check(late == 1, "TweenMax.delayedCall fires after its delay");
+
+        // ---- ease 必须真正参与插值 ----
+        // 回归：vars.ease 此前只被列进"保留键"（不作为补间属性），但从未被调用，
+        // 所有补间一律按 elapsed/duration 线性推进。换装道具的悬停放大用的是
+        // gs.easing.Elastic（弹性回弹），线性化后动画特征全部丢失。
+        {
+            const Value s3 = make(vm, "Sprite");
+            auto vars3 = vm.newObject(ObjKind::Generic, "Object");
+            vars3->props["x"] = Value::num(100);
+            int easeCalls = 0;
+            // 恒定返回 0.5 的 ease：中间帧必须停在起止值的一半处，
+            // 线性（k≈0.08）与"忽略 ease"都会让这个断言失败。
+            vars3->props["ease"] = nativeFn(vm, "easeHalf",
+                [](const std::vector<Value>&) -> Value { return Value::num(0.5); },
+                &easeCalls);
+            call(vm, tl.obj, "to", {s3, Value::num(1.0), Value::object(vars3)});
+            vm.tick();
+            const double mid = vm.getProperty(s3.obj, "x").toNumber();
+            check(easeCalls > 0, "ease callback is invoked by the tween driver");
+            check(std::fabs(mid - 50.0) < 1e-6,
+                  "ease output drives the interpolated value (not linear)");
+            for (int i = 0; i < 20; ++i) vm.tick();
+            check(std::fabs(vm.getProperty(s3.obj, "x").toNumber() - 100.0) < 1e-6,
+                  "the final frame lands exactly on the target regardless of ease");
+        }
+
+        // ---- EaseBase 实例走 getRatio(p)（GreenSock 的实际用法）----
+        {
+            const Value s4 = make(vm, "Sprite");
+            auto vars4 = vm.newObject(ObjKind::Generic, "Object");
+            vars4->props["x"] = Value::num(200);
+            auto ecd = std::make_shared<f::ClassDef>();
+            f::Member em;
+            em.kind = f::Member::Method;
+            em.name = "getRatio";
+            static int ratioCalls = 0;
+            em.native = [](std::shared_ptr<f::Object>,
+                           const std::vector<Value>& a) -> Value {
+                ++ratioCalls;
+                // 平方曲线：p=0.5 -> 0.25
+                const double p = a.empty() ? 0.0 : a[0].toNumber();
+                return Value::num(p * p);
+            };
+            ecd->instanceMembers.push_back(em);
+            auto easeObj = vm.newObject(ObjKind::Generic, "Elastic_easeOut");
+            easeObj->cls = ecd;
+            vars4->props["ease"] = Value::object(easeObj);
+            ratioCalls = 0;
+            call(vm, tl.obj, "to", {s4, Value::num(1.0), Value::object(vars4)});
+            vm.tick();
+            check(ratioCalls > 0, "EaseBase instance is driven through getRatio(p)");
+            for (int i = 0; i < 20; ++i) vm.tick();
+            check(std::fabs(vm.getProperty(s4.obj, "x").toNumber() - 200.0) < 1e-6,
+                  "getRatio-based tween reaches its target");
+        }
     }
 
     // ---- 18. 加载 / 网络 / 媒体 / 本地存储 ----

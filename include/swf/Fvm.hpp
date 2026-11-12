@@ -297,6 +297,11 @@ private:
         std::shared_ptr<Object> target;
         std::map<std::string, std::pair<double, double>> fromTo;  // 属性 -> 起止数值
         double startMs = 0, durationMs = 0, delayMs = 0;
+        // GreenSock 的 ease：vars.ease 传入的对象/函数。此前只把 "ease" 列为保留键
+        // （即不作为补间属性），但从未调用它，所有补间都按线性推进 —— 弹性/回弹
+        // 类动画（换装道具的悬停放大 ElasticBtnHelps）因此失去全部特征。
+        Value easeFn;
+        bool hasEase = false;
         Value onComplete;
         std::vector<Value> completeParams;
         bool hasComplete = false;

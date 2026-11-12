@@ -3866,8 +3866,32 @@ void Vm::registerNativeClasses() {
             "immediateRender", "overwrite", "paused", "repeat", "repeatDelay", "yoyo",
             "onReverseComplete", "onReverseCompleteParams", "startAt", "visible"
         };
-        auto buildTween = [this](const std::vector<Value>& a, int mode) -> Value {
+        // SWF_TWEEN_DBG=1：打印每条补间的创建参数。用于判断"悬停没有动画"这类
+        // 问题是补间根本没被创建（注册/命中链问题），还是创建了但驱动不对。
+        auto logTween = [](int mode, const std::vector<Value>& a) {
+            if (!std::getenv("SWF_TWEEN_DBG")) return;
+            std::fprintf(stderr, "[tween] mode=%d argc=%zu", mode, a.size());
+            // delayedCall(mode 3) 的第二参数是回调，不是时长，不能当数字打印。
+            if (mode != 3 && a.size() > 1)
+                std::fprintf(stderr, " dur=%.3f", asNumber(a[1]));
+            Value vars;
+            if (mode == 2 && a.size() > 3) vars = a[3];
+            else if (a.size() > 2) vars = a[2];
+            if (vars.kind == VKind::Object && vars.obj) {
+                std::fprintf(stderr, " vars=");
+                for (const auto& kv : vars.obj->props) {
+                    if (kv.first.empty() || kv.first[0] == '$') continue;
+                    std::fprintf(stderr, " %s", kv.first.c_str());
+                    if (kv.first == "ease")
+                        std::fprintf(stderr, "=%s",
+                                     kv.second.obj ? kv.second.obj->className.c_str() : "?");
+                }
+            }
+            std::fprintf(stderr, "\n");
+        };
+        auto buildTween = [this, logTween](const std::vector<Value>& a, int mode) -> Value {
             auto handle = newObject(ObjKind::Generic, "Tween");
+            logTween(mode, a);
             if (mode == 3) {   // delayedCall(delaySeconds, onComplete, params)
                 TweenTask t;
                 t.startMs = timerNowMs_;
@@ -3917,10 +3941,16 @@ void Vm::registerNativeClasses() {
             Value onComplete;
             bool hasComplete = false;
             std::vector<Value> completeParams;
+            Value easeFn;
+            bool hasEase = false;
             if (varObj) {
                 const auto& vp = varObj->obj->props;
                 auto dp = vp.find("delay");
                 if (dp != vp.end()) delayMs = asNumber(dp->second) * 1000.0;
+                // ease 可以是 GreenSock 的 EaseBase 实例（用 getRatio(p)），也可以是
+                // 直接传入的函数（TweenLite 允许 ease 为 Function，签名 (p,t,b,c,d)）。
+                auto ep = vp.find("ease");
+                if (ep != vp.end() && ep->second.obj) { easeFn = ep->second; hasEase = true; }
                 auto cp = vp.find("onComplete");
                 if (cp != vp.end() && cp->second.obj) { onComplete = cp->second; hasComplete = true; }
                 auto pp = vp.find("onCompleteParams");
@@ -3946,6 +3976,8 @@ void Vm::registerNativeClasses() {
                 t.onComplete = onComplete;
                 t.completeParams = completeParams;
                 t.hasComplete = hasComplete;
+                t.easeFn = easeFn;
+                t.hasEase = hasEase;
                 if (varObj) {
                     for (const auto& kv : varObj->obj->props) {
                         if (kv.first.empty() || kv.first[0] == '$' ||
@@ -5935,11 +5967,30 @@ void Vm::advanceTweens() {
         if (elapsed < 0.0) { pending.push_back(t); continue; }   // delay 未到
         const bool done = t.durationMs <= 0.0 || elapsed >= t.durationMs;
         const double k = done ? 1.0 : elapsed / t.durationMs;
+        // ease 生效：GreenSock 的 EaseBase 用 getRatio(p)；直接传函数时按
+        // TweenLite 的 (p, time, begin, change, duration) 约定调用。取不到有效
+        // 数值就退回线性，避免一个坏 ease 把整条补间变成静止。
+        // 末帧不应用 ease：合法 ease 满足 f(1)=1，但强制取 1.0 才能保证补间一定
+        // 精确落在目标值（onComplete 之后的状态不能依赖回调方实现是否正确）。
+        double ek = k;
+        if (!done && t.hasEase && t.easeFn.obj) {
+            auto numeric = [](const Value& v) {
+                return v.kind == VKind::Number || v.kind == VKind::Int || v.kind == VKind::UInt;
+            };
+            Value r;
+            if (t.easeFn.obj->className != "Function")
+                r = callMethod(t.easeFn.obj, "getRatio", {Value::num(k)});
+            if (!numeric(r))
+                r = invokeValue(t.easeFn, {Value::num(k), Value::num(elapsed),
+                                           Value::num(0.0), Value::num(1.0),
+                                           Value::num(t.durationMs)}, nullptr);
+            if (numeric(r)) ek = r.toNumber();
+        }
         if (t.target) {
             for (const auto& kv : t.fromTo)
                 setProperty(t.target, kv.first,
                             Value::num(kv.second.first +
-                                       (kv.second.second - kv.second.first) * k));
+                                       (kv.second.second - kv.second.first) * ek));
         }
         if (done) {
             if (t.hasComplete) {
