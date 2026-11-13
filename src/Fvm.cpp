@@ -18,6 +18,7 @@
 #include "swf/Render.hpp"    // hitTestRuntimeStage（运行时显示树命中测试）
 
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 
 namespace swf {
@@ -139,6 +140,7 @@ static bool looseEquals(const Value& a, const Value& b);
 static bool strictEquals(const Value& a, const Value& b);
 static bool valueIsType(const Value& v, const std::shared_ptr<Object>& t);
 static bool declaresProperty(const std::shared_ptr<Object>& o, const std::string& name);
+static bool g_traceOpsActive = false;   // SWF_AS_OPS 命中时的 opcode 轨迹开关（callstatic 处理器在文件前部需要）
 // 运行时 multiname：RTQName 只压 ns，RTQNameL/MultinameL 压 name(+ns)。
 static int mnRuntimeStackPops(const abc::AbcFile& abc, uint32_t index);
 static bool mnHasRuntimeNameValue(const abc::AbcFile& abc, uint32_t index);
@@ -246,7 +248,33 @@ inline void registerFvmOps() {
         std::vector<Value> cargs(argc); for (uint32_t k = 0; k < argc; ++k) cargs[argc - 1 - k] = c.pop();
         std::string mname = takeRuntimeName(c, mn);
         Value recv = c.pop();
-        if (recv.kind == VKind::Object && recv.obj) c.vm.callMethod(recv.obj, mname, cargs); });
+        if (recv.kind != VKind::Object || !recv.obj) return;  // void 调用：不压栈
+        auto obj = recv.obj;
+        // AVM2 语义：super.f() 是静态 super 分派——从接收者类的【父类】开始查找，
+        // 跳过本类（virtual 分派会命中本类覆盖实现，导致 super 调用自递归）。
+        // 例：gs.TweenMax.initTweenVals() 体内 callsupervoid [initTweenVals]，
+        // 必须解析到 gs.TweenLite 的实现而不是 TweenMax 的转发覆盖。
+        // 注意 callsupervoid 无压栈效应，返回值一律丢弃。
+        for (auto cls = obj->cls ? obj->cls->superClass : nullptr; cls; cls = cls->superClass) {
+            for (const auto& m : cls->instanceMembers) {
+                if (m.name != mname || m.kind != Member::Method) continue;
+                if (std::getenv("SWF_AS_DEBUG") && mname == "initTweenVals")
+                    std::fprintf(stderr, "[super-dispatch] %s.%s -> %s mi=%u bi=%d\n",
+                                 obj->className.c_str(), mname.c_str(), cls->name.c_str(),
+                                 m.methodIndex,
+                                 (m.methodIndex < c.vm.abcFile().methods.size()) ? c.vm.abcFile().methods[m.methodIndex].bodyIndex : -1);
+                if (m.native) return;
+                if (m.methodIndex < c.vm.abcFile().methods.size()) {
+                    int bi = c.vm.abcFile().methods[m.methodIndex].bodyIndex;
+                    if (bi >= 0 && bi < static_cast<int>(c.vm.abcFile().methodBodies.size())) {
+                        c.vm.exec(c.vm.abcFile().methodBodies[bi], cargs, obj);
+                        return;
+                    }
+                }
+            }
+        }
+        // 父类链上没有：退回普通调用（动态属性/原生基类兜底）
+        c.vm.callMethod(obj, mname, cargs); });
     fvmOps().add(0x4c, [](ExecCtx& c) {  // callproplex
         uint32_t mn = c.in.u30(); uint32_t argc = c.in.u30();
         std::vector<Value> cargs(argc); for (uint32_t k = 0; k < argc; ++k) cargs[argc - 1 - k] = c.pop();
@@ -334,6 +362,47 @@ inline void registerFvmOps() {
         if (obj.kind == VKind::Object && obj.obj) r = c.vm.getProperty(obj.obj, name);
         else if (obj.kind == VKind::String) r = c.vm.getProperty(c.vm.boxString(obj), name);
         else r = Value::undefined();
+        // [dease]：TweenLite 构造器把 this.ease 设为 defaultEase（vars.ease 缺失时）。
+        if (std::getenv("SWF_AS_DEBUG") && name == "defaultEase" && obj.kind == VKind::Object &&
+            obj.obj && obj.obj->className.find("Tween") != std::string::npos) {
+            static int ec5 = 0;
+            if (ec5++ < 8) {
+                std::string info;
+                if (r.kind == VKind::Object && r.obj) {
+                    info = "kind=" + std::to_string((int)r.obj->kind) + " cls='" + r.obj->className + "'";
+                    for (const char* k : {"$method", "$native", "$this"}) {
+                        auto it = r.obj->props.find(k);
+                        if (it != r.obj->props.end())
+                            info += std::string(" ") + k + "=" + (it->second.obj ? ("obj:" + it->second.obj->className) : it->second.toString());
+                    }
+                    if (r.obj->cls) info += " cls链='" + r.obj->cls->name + "'";
+                } else {
+                    info = r.toString();
+                }
+                std::fprintf(stderr, "[dease] receiver=%s defaultEase={%s}\n",
+                             obj.obj->className.c_str(), info.c_str());
+            }
+        }
+        // [elastic]：定位 gs.Elastic.easeOut 静态成员的解析结果（换装缓动缺失）。
+        if (std::getenv("SWF_AS_DEBUG") && name == "easeOut") {
+            static int ec = 0;
+            if (ec++ < 20) {
+                const char* rc = (obj.kind == VKind::Object && obj.obj) ? obj.obj->className.c_str() : "?";
+                int rk = (obj.kind == VKind::Object && obj.obj) ? (int)obj.obj->kind : -1;
+                size_t rp = (obj.kind == VKind::Object && obj.obj) ? obj.obj->props.size() : 0;
+                std::fprintf(stderr, "[elastic] receiver=%s kind=%d props=%zu r='%s'",
+                             rc, rk, rp, r.toString().c_str());
+                // 返回的函数身份：$method(mi) 与 $this（绑定的接收者）
+                if (r.kind == VKind::Object && r.obj) {
+                    auto mm = r.obj->props.find("$method");
+                    auto tt = r.obj->props.find("$this");
+                    if (mm != r.obj->props.end()) std::fprintf(stderr, " $method=%u", mm->second.u);
+                    if (tt != r.obj->props.end() && tt->second.obj)
+                        std::fprintf(stderr, " $this=%s", tt->second.obj->className.c_str());
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
         if (std::getenv("SWF_AS_DEBUG") && obj.kind == VKind::Object && obj.obj &&
             obj.obj->kind == ObjKind::Array && !name.empty() &&
             name.find_first_not_of("0123456789") == std::string::npos) {
@@ -359,13 +428,53 @@ inline void registerFvmOps() {
                 }
             }
         }
+        // [active-r]：定位 GS 构造器中 this.active 的读取值与对象身份（换装无动画根因）。
+        if (std::getenv("SWF_AS_DEBUG") && name == "active" &&
+            obj.kind == VKind::Object && obj.obj && obj.obj->className.find("Tween") != std::string::npos) {
+            static int ac = 0;
+            if (ac++ < 80) {
+                std::string stored = "<absent>";
+                auto it = obj.obj->props.find("active");
+                if (it != obj.obj->props.end()) stored = it->second.toString();
+                std::fprintf(stderr, "[active-r] obj=%p cls=%s mi=%u pc=%zu stored='%s' got='%s'\n",
+                             (void*)obj.obj.get(), obj.obj->className.c_str(),
+                             c.body.methodIndex, c.in.pos(),
+                             stored.c_str(), r.toString().c_str());
+            }
+        }
         c.push(r); });
     fvmOps().add(0x61, [](ExecCtx& c) {  // setproperty: obj,[ns],[name],value -> (空)
         uint32_t mn = c.in.u30();
         Value val = c.pop();
         std::string name = takeRuntimeName(c, mn);
         Value obj = c.pop();
-        if (obj.kind == VKind::Object && obj.obj) c.vm.setProperty(obj.obj, name, val); });
+        // SWF_STATIC_DBG：追踪静态变量（如 gs.TweenLite 的 timingSprite / _timer）
+        // 写入时绑定到了哪个对象。这些变量只在 classObj.props 上"声明"（staticMembers），
+        // 但 findproperty 兜底/误绑会把值写到 globals 或临时对象上，读取时
+        // getlex 命中声明者却取不到值 -> undefined，ticker 注册被静默丢弃。
+        if (std::getenv("SWF_STATIC_DBG") &&
+            (name == "timingSprite" || name == "_timer" || name == "instance")) {
+            if (obj.kind == VKind::Object && obj.obj)
+                std::fprintf(stderr, "[static-write] %s -> kind=%d cls='%s' obj=%p 值kind=%d 值=%s\n",
+                             name.c_str(), (int)obj.obj->kind, obj.obj->className.c_str(),
+                             static_cast<void*>(obj.obj.get()), (int)val.kind, val.toString().c_str());
+            else
+                std::fprintf(stderr, "[static-write] %s -> 接收者非对象 kind=%d\n", name.c_str(), (int)obj.kind);
+        }
+        if (obj.kind == VKind::Object && obj.obj) c.vm.setProperty(obj.obj, name, val);
+        // [active-w2]：setproperty 分支的 active 写入
+        if (std::getenv("SWF_AS_DEBUG") && name == "active" &&
+            obj.kind == VKind::Object && obj.obj && obj.obj->className.find("Tween") != std::string::npos) {
+            static int aws = 0;
+            if (aws++ < 80)
+                std::fprintf(stderr, "[active-w2] obj=%p cls=%s val='%s'\n",
+                             (void*)obj.obj.get(), obj.obj->className.c_str(), val.toString().c_str());
+        }
+        if (std::getenv("SWF_DIC_DBG") && obj.kind == VKind::Object && obj.obj &&
+            obj.obj->className.find("Dictionary") != std::string::npos)
+            std::fprintf(stderr, "[dic-set] key='%s' 值kind=%d 值=%s 当前条目=%zu\n",
+                         name.c_str(), (int)val.kind, val.toString().c_str(),
+                         obj.obj->props.size()); });
     fvmOps().add(0x68, [](ExecCtx& c) {  // initproperty: obj,[ns],[name],value -> (空)
         uint32_t mn = c.in.u30();
         Value val = c.pop();
@@ -379,6 +488,15 @@ inline void registerFvmOps() {
                     if (m.name == nm && (m.kind == Member::Slot || m.kind == Member::Const)) { obj.obj->slots[nm] = val; found = true; break; }
                 if (found) break;
             }
+        }
+        // [active-w]：定位 GS 构造器中 this.active 的写入值与对象身份。
+        if (std::getenv("SWF_AS_DEBUG") && nm == "active" &&
+            obj.kind == VKind::Object && obj.obj && obj.obj->className.find("Tween") != std::string::npos) {
+            static int aw = 0;
+            if (aw++ < 80)
+                std::fprintf(stderr, "[active-w] obj=%p cls=%s mi=%u pc=%zu val='%s'\n",
+                             (void*)obj.obj.get(), obj.obj->className.c_str(),
+                             c.body.methodIndex, c.in.pos(), val.toString().c_str());
         } });
     fvmOps().add(0x6c, [](ExecCtx& c) {  // getslot
         uint32_t slot = c.in.u30(); Value obj = c.pop();
@@ -454,6 +572,9 @@ inline void registerFvmOps() {
         uint32_t init = abc.instances[sup->instanceIndex].iinit;
         if (init >= abc.methods.size()) return;
         int bi = abc.methods[init].bodyIndex;
+        if (std::getenv("SWF_DIC_DBG") && sup->name.find("Tween") != std::string::npos)
+            std::fprintf(stderr, "[super] %s -> %s iinit mi=%u bi=%d args=%zu\n",
+                         obj->className.c_str(), sup->name.c_str(), init, bi, cargs.size());
         if (bi >= 0 && bi < static_cast<int>(abc.methodBodies.size()))
             c.vm.exec(abc.methodBodies[bi], cargs, obj);
     });
@@ -518,10 +639,17 @@ inline void registerFvmOps() {
         for(uint32_t k=0;k<argc;++k) cargs[argc-1-k]=c.pop();
         const auto& A=c.vm.abcFile();
         if(mi<A.methods.size()){
+            // SWF_AS_OPS：callstatic 直接 exec 不走 invokeValue，是 trace 盲点
+            // （TweenMax.to 这类静态方法调用全靠它观察）。
+            bool tracedHere = false;
+            if (const char* flt = std::getenv("SWF_AS_OPS"))
+                if (A.methods[mi].name.find(flt) != std::string::npos)
+                    g_traceOpsActive = true, tracedHere = true;
             int bi=A.methods[mi].bodyIndex;
             if(bi>=0&&bi<static_cast<int>(A.methodBodies.size()))
                 c.push(c.vm.exec(A.methodBodies[bi],cargs,nullptr));
             else c.push(Value::undefined());
+            if(tracedHere) g_traceOpsActive = false;
         } else c.push(Value::undefined()); });
     fvmOps().add(0x42, [](ExecCtx& c) {   // construct
         uint32_t argc=c.in.u30(); std::vector<Value> cargs(argc);
@@ -541,8 +669,38 @@ inline void registerFvmOps() {
         for(uint32_t k=0;k<argc;++k) cargs[argc-1-k]=c.pop();
         std::string mname=takeRuntimeName(c, mn);
         Value objv=c.pop();
+        if (std::getenv("SWF_AS_DEBUG") && mname == "ease" && objv.kind == VKind::Object &&
+            objv.obj && objv.obj->className.find("Tween") != std::string::npos) {
+            static int ec2 = 0;
+            if (ec2++ < 12) {
+                std::string argsDump;
+                for (const auto& a : cargs) argsDump += a.toString() + ",";
+                // ease 属性对象的身份：kind + className + 函数性质（$method/$native）
+                auto ep = objv.obj->props.find("ease");
+                std::string easeInfo = "<无 ease 属性>";
+                if (ep != objv.obj->props.end() && ep->second.kind == VKind::Object && ep->second.obj) {
+                    const auto& eo = *ep->second.obj;
+                    easeInfo = "kind=" + std::to_string((int)eo.kind) + " cls='" + eo.className + "'";
+                    auto at2 = [&eo](const char* k) -> const Value* {
+                        auto it = eo.props.find(k);
+                        return (it != eo.props.end()) ? &it->second : nullptr;
+                    };
+                    if (const Value* mv = at2("$method")) easeInfo += " $method=" + std::to_string(mv->u);
+                    if (const Value* nv = at2("$native")) easeInfo += " $native='" + nv->toString() + "'";
+                    if (const Value* tv = at2("$this"))
+                        easeInfo += " $this.cls='" + (tv->obj ? tv->obj->className : std::string("?")) + "'";
+                    if (eo.cls) easeInfo += " cls链='" + eo.cls->name + "'";
+                }
+                std::fprintf(stderr, "[ease-call] tween=%s argc=%zu args=[%s] ease={%s}\n",
+                             objv.obj->className.c_str(), cargs.size(), argsDump.c_str(), easeInfo.c_str());
+            }
+        }
         if(objv.kind==VKind::Object&&objv.obj){
             Value r=c.vm.callMethod(objv.obj,mname,cargs);
+            if (std::getenv("SWF_AS_DEBUG") && mname == "ease" && objv.obj->className.find("Tween") != std::string::npos) {
+                static int ec3 = 0;
+                if (ec3++ < 12) std::fprintf(stderr, "[ease-call-ret] %s\n", r.toString().c_str());
+            }
             if(mname=="addChild"&&objv.obj->display&&!objv.obj->display->parent){
                 bool dup=false;
                 for(auto& s:c.vm.stage) if(s.get()==objv.obj->display.get()){dup=true;break;}
@@ -557,6 +715,79 @@ inline void registerFvmOps() {
         for(uint32_t k=0;k<argc;++k) cargs[argc-1-k]=c.pop();
         std::string mname=takeRuntimeName(c, mn);
         Value objv=c.pop();
+        if (std::getenv("SWF_DIC_DBG") && mname == "render") {
+            std::string extra = "-";
+            if (objv.kind == VKind::Object && objv.obj) {
+                auto tp = objv.obj->props.find("tweens");
+                if (tp != objv.obj->props.end() && tp->second.kind == VKind::Object && tp->second.obj) {
+                    auto ln = tp->second.obj->props.find("$length");
+                    extra = "tweens.len=" + std::to_string(ln != tp->second.obj->props.end() ? ln->second.toInt() : -1) +
+                            " props=" + std::to_string(objv.obj->props.size());
+                } else {
+                    extra = "no-tweens-prop props=" + std::to_string(objv.obj->props.size()) +
+                            " cls=" + (objv.obj->cls ? objv.obj->cls->name : "?");
+                }
+                // 首次 render 时 dump 实例全部 props 名与关键值，定位构造器执行到哪一步
+                static thread_local bool s_dumped = false;
+                if (!s_dumped) { s_dumped = true;
+                    std::fprintf(stderr, "[render-dump] 实例=%p cls=%s props:\n",
+                                 (void*)objv.obj.get(),
+                                 objv.obj->cls ? objv.obj->cls->name.c_str() : "?");
+                    for (const auto& kv : objv.obj->props)
+                        std::fprintf(stderr, "    %s = %s\n", kv.first.c_str(), kv.second.toString().c_str());
+                }
+            }
+            std::fprintf(stderr, "[render] self=%s argc=%zu arg0=%s %s\n",
+                         (objv.kind==VKind::Object&&objv.obj)?objv.obj->className.c_str():"?",
+                         cargs.size(),
+                         (cargs.size() > 0) ? cargs[0].toString().c_str() : "-",
+                         extra.c_str());
+            // 首次 render：逐个 dump tweens[] 条目的 start/change/name，
+            // 区分"change 被算成 0"（initTweenVals 读错）与"ratio 恒 0"（render 时间线错）。
+            static thread_local bool s_tweensDumped = false;
+            if (!s_tweensDumped && objv.kind == VKind::Object && objv.obj) {
+                auto tp = objv.obj->props.find("tweens");
+                if (tp != objv.obj->props.end() && tp->second.kind == VKind::Object &&
+                    tp->second.obj && tp->second.obj->kind == ObjKind::Array) {
+                    auto ln = tp->second.obj->props.find("$length");
+                    int n = (ln != tp->second.obj->props.end()) ? ln->second.toInt() : 0;
+                    s_tweensDumped = true;
+                    std::fprintf(stderr, "[tweens-dump] n=%d\n", n);
+                    for (int i = 0; i < n && i < 8; ++i) {
+                        auto ep = tp->second.obj->props.find(std::to_string(i));
+                        if (ep == tp->second.obj->props.end() || ep->second.kind != VKind::Object || !ep->second.obj) {
+                            std::fprintf(stderr, "  [%d] <缺失>\n", i);
+                            continue;
+                        }
+                        const auto& info = *ep->second.obj;
+                        auto at = [&info](const char* k) -> std::string {
+                            auto it = info.props.find(k);
+                            if (it == info.props.end()) return "<无>";
+                            if (it->second.kind == VKind::Object && it->second.obj) {
+                                std::string s = it->second.obj->className;
+                                if (it->second.obj->display) s += "(" + it->second.obj->display->name + ")";
+                                return s;
+                            }
+                            return it->second.toString();
+                        };
+                        std::fprintf(stderr, "  [%d] name=%s target=%s start=%s change=%s isPlugin=%s round=%s\n",
+                                     i, at("name").c_str(), at("target").c_str(), at("start").c_str(),
+                                     at("change").c_str(), at("isPlugin").c_str(), at("round").c_str());
+                    }
+                    // 同时 dump 实例的 startTime/duration/currentTime 与 vars.ease
+                    auto at2 = [&objv](const char* k) -> std::string {
+                        auto it = objv.obj->props.find(k);
+                        if (it == objv.obj->props.end()) return "<无>";
+                        if (it->second.kind == VKind::Object && it->second.obj)
+                            return it->second.obj->className;
+                        return it->second.toString();
+                    };
+                    std::fprintf(stderr, "[tweens-dump] startTime=%s duration=%s currentTime=%s ease=%s\n",
+                                 at2("startTime").c_str(), at2("duration").c_str(),
+                                 at2("currentTime").c_str(), at2("ease").c_str());
+                }
+            }
+        }
         if(objv.kind==VKind::Object&&objv.obj){
             c.vm.callMethod(objv.obj,mname,cargs);
             if(mname=="addChild"&&objv.obj->display&&!objv.obj->display->parent){
@@ -604,6 +835,20 @@ inline void registerFvmOps() {
         for(auto it=c.scope.rbegin();it!=c.scope.rend();++it)
             if(declaresProperty(*it,name)){found=Value::object(*it);break;}
         if(found.isNull()) found=Value::object(c.vm.globalsObj());
+        // SWF_SCOPE_DBG：只打印关键静态变量（gs.TweenLite 的 timingSprite/_timer、
+        // 单例 instance 等），否则重度 AS3 场景日志会爆。
+        if(std::getenv("SWF_SCOPE_DBG") &&
+           (name=="timingSprite"||name=="_timer"||name=="updateAll"||name=="masterList"||name=="instance"||name=="currentTarget"||name=="m_initScaleX"||name=="TweenMax")){
+            std::fprintf(stderr,"[findprop] %s 绑定=%p 链(%zu):",
+                         name.c_str(),(void*)(found.obj?found.obj.get():nullptr),c.scope.size());
+            for(auto it=c.scope.rbegin();it!=c.scope.rend();++it){
+                std::string cn=it->get()->className;
+                std::fprintf(stderr," %p[k%d]%s%s",
+                             (void*)it->get(),(int)it->get()->kind,cn.c_str(),
+                             declaresProperty(*it,name)?"*":"");
+            }
+            std::fprintf(stderr,"\n");
+        }
         c.push(found); };
       fvmOps().add(0x5d,findProp); fvmOps().add(0x5e,findProp); }
     fvmOps().add(0x5f, [](ExecCtx& c) {   // finddef
@@ -615,9 +860,26 @@ inline void registerFvmOps() {
     fvmOps().add(0x60, [](ExecCtx& c) {   // getlex
         uint32_t mn=c.in.u30(); std::string name=takeRuntimeName(c, mn);
         Value found=Value::undefined();
+        std::shared_ptr<Object> hitObj;
         for(auto it=c.scope.rbegin();it!=c.scope.rend();++it)
-            if(declaresProperty(*it,name)){found=c.vm.getProperty(*it,name);break;}
+            if(declaresProperty(*it,name)){hitObj=*it;found=c.vm.getProperty(*it,name);break;}
         if(found.isUndefined()) found=c.vm.getProperty(c.vm.globalsObj(),name);
+        // 同名变量在作用域链里可能有多个持有者，findproperty 与 getlex 各取各的就会
+        // 出现"写得进、读不出"（gs.TweenMax 的 timingSprite 正因此丢失，ticker 永不
+        // 注册，换装悬停无动画）。SWF_SCOPE_DBG 下打印命中对象与链上全部候选
+        // （只针对关键名字，否则重度 AS3 场景日志会爆）。
+        if(std::getenv("SWF_SCOPE_DBG") &&
+           (name=="timingSprite"||name=="_timer"||name=="updateAll"||name=="masterList"||name=="instance"||name=="currentTarget"||name=="m_initScaleX"||name=="TweenMax")){
+            std::fprintf(stderr,"[getlex] %s hit=%p val=%s 链(%zu):",
+                         name.c_str(),(void*)hitObj.get(),found.toString().c_str(),c.scope.size());
+            for(auto it=c.scope.rbegin();it!=c.scope.rend();++it){
+                std::string cn=it->get()->className;
+                std::fprintf(stderr," %p[k%d]%s%s",
+                             (void*)it->get(),(int)it->get()->kind,cn.c_str(),
+                             declaresProperty(*it,name)?"*":"");
+            }
+            std::fprintf(stderr,"\n");
+        }
         c.push(found); });
 
     // ---- 第八批：类型 / 转换 / 局部整数运算 / no-op ----
@@ -653,6 +915,12 @@ inline void registerFvmOps() {
         c.push(Value::boolean(has)); });
     fvmOps().add(0x95, [](ExecCtx& c) {   // typeof
         Value v=c.pop();
+        // 函数对象在本引擎是 VKind::Object + ObjKind::Function，必须先于 Object
+        // 判定返回 "function"。否则 gs.TweenLite 构造器的
+        // `if (typeof(vars.ease) == "function")` 永远失败，ease 回退成 defaultEase
+        // （本 SWF 里是静态 2x−x² 的 Quad 函数），换装悬停弹不出 Elastic 缓动。
+        if (v.kind == VKind::Object && v.obj && v.obj->kind == ObjKind::Function)
+            { c.push(Value::str("function")); return; }
         switch(v.kind){
             case VKind::Undefined: c.push(Value::str("undefined")); break;
             case VKind::Null: c.push(Value::str("object")); break;
@@ -786,7 +1054,7 @@ std::string Value::toString() const {
 // 执行的帧脚本/定时器回调同样可能遇到未知指令，因此每帧结束也要汇总。
 static std::map<int, long> g_unknownOps;
 // SWF_AS_OPS 命中的帧脚本在执行期间打开 opcode 轨迹（跨递归 exec 生效）。
-static bool g_traceOpsActive = false;
+// 注意：定义已提前到文件前部的 fvmOps() 注册区之前（callstatic 处理器需要）。
 static void reportFvmUnknownOps(const char* phase) {
     if (!std::getenv("SWF_AS_DEBUG") || g_unknownOps.empty()) return;
     for (const auto& kv : g_unknownOps)
@@ -1630,6 +1898,17 @@ static std::vector<std::string> enumerableKeys(const std::shared_ptr<Object>& o)
     for (const auto& kv : o->props)
         if (kv.first.empty() || kv.first[0] != '$') keys.push_back(kv.first);
     for (const auto& kv : o->slots) keys.push_back(kv.first);
+    // SWF_DIC_DBG：Dictionary 的 for-in 迭代入口。GS 的 masterList 以对象（补间实例）
+    // 为键；若键被字符串化后丢失或碰撞，这里返回的 keys 为空/重复，updateAll 就会
+    // 静默地遍历零个补间（换装悬停补间不推进即此路径）。
+    if (std::getenv("SWF_DIC_DBG") && o->className.find("Dictionary") != std::string::npos) {
+        static thread_local int s_dicIter = 0;
+        if (s_dicIter++ % 10 == 0) {
+            std::fprintf(stderr, "[dic-iter] %p keys(%zu):", (void*)o.get(), keys.size());
+            for (const auto& k : keys) std::fprintf(stderr, " '%s'", k.c_str());
+            std::fprintf(stderr, "\n");
+        }
+    }
     return keys;
 }
 
@@ -1805,9 +2084,19 @@ static bool declaresProperty(const std::shared_ptr<Object>& o, const std::string
     if (o->classDef) {
         for (const auto& m : o->classDef->instanceMembers) if (m.name == name) return true;
         for (const auto& m : o->classDef->staticMembers) if (m.name == name) return true;
-        for (auto c = o->classDef->superClass; c; c = c->superClass)
+        for (auto c = o->classDef->superClass; c; c = c->superClass) {
             for (const auto& m : c->instanceMembers) if (m.name == name) return true;
+            // 继承的静态成员：父类声明的静态变量对子类（类对象或实例）可见。
+            // gs.TweenMax extends TweenLite，timingSprite/_timer 声明在父类上；
+            // 漏掉这一步时，子类方法体里 getlex timingSprite 会落空回退 globals
+            // 读到 undefined，timingSprite.addEventListener(...) 被 callpropvoid
+            // 静默丢弃，GreenSock ticker 永不注册（换装悬停无动画）。
+            for (const auto& m : c->staticMembers) if (m.name == name) return true;
+        }
     }
+    // 实例对象同样能看到自己类（及父类）的静态成员。
+    for (auto c = o->cls; c; c = c->superClass)
+        for (const auto& m : c->staticMembers) if (m.name == name) return true;
     return false;
 }
 
@@ -1916,6 +2205,10 @@ Value Vm::constructObject(const Value& cls, const std::vector<Value>& cargs) {
         uint32_t init = abc_.instances[cls.obj->instanceIndex].iinit;
         if (init < abc_.methods.size()) {
             int bi = abc_.methods[init].bodyIndex;
+            if (std::getenv("SWF_DIC_DBG") &&
+                (cname == "gs.TweenMax" || cname == "TweenMax" || cname == "gs.TweenLite" || cname == "TweenLite"))
+                std::fprintf(stderr, "[ctor] %s iinit mi=%u bi=%d cargs=%zu\n",
+                             cname.c_str(), init, bi, cargs.size());
             if (bi >= 0 && bi < static_cast<int>(abc_.methodBodies.size()))
                 exec(abc_.methodBodies[bi], cargs, inst);
         }
@@ -2127,7 +2420,34 @@ Value Vm::getPropertyImpl(std::shared_ptr<Object> obj, const std::string& name) 
         }
     }
     // 3) 类成员链（实例成员 -> 静态成员 -> 父类）
-    for (auto c = obj->cls; c; c = c->superClass) {
+    // 类对象本身（gs.easing.Elastic、gs.TweenMax 等）只有 classDef、cls 为空：
+    // 它的静态成员（如 Elastic.easeOut 的 getRatio 函数值）必须从 classDef 自身
+    // 开始查，否则 Elastic.easeOut 解析成 undefined，TweenMax.to 的 ease 变量丢失，
+    // 缓动退化为线性（换装悬停"弹不起来"）。
+    const std::shared_ptr<ClassDef> chainHead =
+        obj->cls ? obj->cls : (obj->kind == ObjKind::Class ? obj->classDef : nullptr);
+    if (std::getenv("SWF_AS_DEBUG") && name == "easeOut" && chainHead &&
+        (obj->kind == ObjKind::Class || (obj->cls && obj->cls->name.find("easing") != std::string::npos))) {
+        static int ec4 = 0;
+        if (ec4++ < 4) {
+            FILE* out = stderr;
+            if (const char* cf = std::getenv("SWF_EASEOUT_FILE")) out = std::fopen(cf, "a");
+            std::fprintf(out, "[easeOut-chain] head=%s members:\n", chainHead->name.c_str());
+            for (auto cc = chainHead; cc; cc = cc->superClass) {
+                std::fprintf(out, "  --- class %s (cinit=%u cinitDone=%d)\n", cc->name.c_str(),
+                             cc->cinitMethod, (int)cc->cinitDone);
+                for (const auto& m : cc->staticMembers)
+                    std::fprintf(out, "    static %s kind=%d mi=%u defval=%s\n", m.name.c_str(),
+                                 (int)m.kind, m.methodIndex, m.defaultValue.toString().c_str());
+                for (const auto& m : cc->instanceMembers)
+                    if (m.kind == Member::Method || m.kind == Member::Getter)
+                        std::fprintf(out, "    inst %s kind=%d mi=%u\n", m.name.c_str(),
+                                     (int)m.kind, m.methodIndex);
+            }
+            if (out != stderr) std::fclose(out);
+        }
+    }
+    for (auto c = chainHead; c; c = c->superClass) {
         for (const auto& m : c->instanceMembers) {
             if (m.name != name) continue;
             if (m.kind == Member::Getter) {
@@ -2153,6 +2473,9 @@ Value Vm::getPropertyImpl(std::shared_ptr<Object> obj, const std::string& name) 
                 if (m.native) fn->props["$native"] = Value::str(name);   // 原生方法（含继承）
                 else fn->props["$method"] = Value::uintv(m.methodIndex);
                 fn->props["$this"] = Value::object(obj);
+                // AVM2：实例方法的 scope 向量同样含声明类静态作用域（方法体可 getlex
+                // 类静态）。与静态分支同理，把声明类类对象作为捕获作用域最外层。
+                if (c->classObject) fn->scope.push_back(c->classObject);
                 return Value::object(fn);
             }
             if (m.kind == Member::Slot || m.kind == Member::Const) return m.defaultValue;
@@ -2160,6 +2483,19 @@ Value Vm::getPropertyImpl(std::shared_ptr<Object> obj, const std::string& name) 
         }
         for (const auto& m : c->staticMembers) {
             if (m.name != name) continue;
+            // 静态 var 的运行时存储：值存在声明类的规范类对象（ClassDef::classObject）
+            // 的 props 里，而不是 trait 默认值上。cinit 里 `timingSprite = new Sprite()`
+            // 经 findproperty+setproperty 写进类对象 props；之后从子类实例（this=
+            // new TweenMax()，cls 链含 TweenLite）getlex timingSprite 时，必须回到
+            // 声明类的类对象取当前值——只返回 trait 的 defaultValue（静态 var 的
+            // undefined）会丢值，Ticker 注册整段落空（换装悬停无动画）。
+            if (m.kind == Member::Slot || m.kind == Member::Const) {
+                if (c->classObject) {
+                    auto it = c->classObject->props.find(name);
+                    if (it != c->classObject->props.end()) return it->second;
+                }
+                return m.defaultValue;
+            }
             if (m.kind == Member::Getter) {
                 if (m.native) return m.native(obj, {});
                 if (m.methodIndex < abc_.methods.size()) {
@@ -2180,6 +2516,14 @@ Value Vm::getPropertyImpl(std::shared_ptr<Object> obj, const std::string& name) 
                 auto fn = newObject(ObjKind::Function, name);
                 fn->props["$method"] = Value::uintv(m.methodIndex);
                 fn->props["$this"] = Value::object(obj);
+                // AVM2：类方法（含静态）的 method_info.scope 向量包含声明类的静态作用域，
+                // 方法体 getlex 类静态（如 gs.easing.Elastic._2PI）走它，与 this 指向谁
+                // 无关（callproperty 调 this.ease(t) 时 this=补间实例，不是类对象）。
+                // 本引擎不解析 scope 向量，把声明类类对象作为捕获作用域最外层，由
+                // Vm::exec 放进作用域链尾（activation 之后、globals 之前）。缺了它
+                // _2PI 解析成 undefined → Elastic 正弦项恒 0 → ease 恒返回 1（换装
+                // 悬停曲线瞬间到位、无弹性振荡）。
+                if (c->classObject) fn->scope.push_back(c->classObject);
                 return Value::object(fn);
             }
         }
@@ -2240,7 +2584,10 @@ void Vm::setProperty(std::shared_ptr<Object> obj, const std::string& name, const
             obj->display->scriptTransform = true;
         if (name == "x") { obj->display->x = v.toNumber(); obj->props[name] = v; return; }
         if (name == "y") { obj->display->y = v.toNumber(); obj->props[name] = v; return; }
-        if (name == "scaleX") { obj->display->scaleX = v.toNumber(); obj->display->hasFull = false; obj->props[name] = v; return; }
+        if (name == "scaleX") {
+            if (std::getenv("SWF_SCALE_DBG"))
+                std::fprintf(stderr, "[scale] %s scaleX=%.4f\n", obj->display->name.c_str(), v.toNumber());
+            obj->display->scaleX = v.toNumber(); obj->display->hasFull = false; obj->props[name] = v; return; }
         if (name == "scaleY") { obj->display->scaleY = v.toNumber(); obj->display->hasFull = false; obj->props[name] = v; return; }
         if (name == "rotation") { obj->display->rotation = v.toNumber(); obj->display->hasFull = false; obj->props[name] = v; return; }
         if (name == "alpha") {
@@ -2393,6 +2740,18 @@ void Vm::setProperty(std::shared_ptr<Object> obj, const std::string& name, const
             obj->props[name] = v; return;
         }
     }
+    // 数组下标写入 arr[i] = v：AS3 语义下 length = max(length, i+1)。
+    // 缺这步会把元素写进 props 而 $length 保持 0，所有按 length 遍历的循环
+    // （例如 GS TweenLite.render 的 for(i=tweens.length-1; i>=0; i--)）永远空转，
+    // 表现为"tween 激活了但属性一个都没被写入"。
+    if (obj->kind == ObjKind::Array && !name.empty() &&
+        name.find_first_not_of("0123456789") == std::string::npos) {
+        long idx = std::atol(name.c_str());
+        if (idx >= 0) {
+            long cur = obj->props.count("$length") ? obj->props["$length"].toInt() : 0;
+            if (idx + 1 > cur) obj->props["$length"] = Value::intg(static_cast<int32_t>(idx + 1));
+        }
+    }
     // 声明为 slot 的成员：同步写入 slots[name]，保证 getslot(按 id) 读到最新值
     for (auto c = obj->cls; c; c = c->superClass) {
         bool found = false;
@@ -2460,6 +2819,53 @@ std::shared_ptr<Object> Vm::boxString(const Value& v) {
 Value Vm::callMethod(std::shared_ptr<Object> obj, const std::string& name, const std::vector<Value>& args) {
     if (!obj) return Value::undefined();
     if (obj->kind == ObjKind::Class && obj->classDef) ensureClassInit(obj->classDef, obj);
+    if (std::getenv("SWF_AS_DEBUG") && name == "to") {
+        // 换装悬停动画的最终落点：确认 TweenMax.to 到底调到了哪个实现
+        // （原生 shim 会打 [tween]，真实 GS ABC to 则走 methodIndex 字节码）。
+        bool nativeFound = false, abcFound = false; int toMi = -1, toBi = -1;
+        if (obj->classDef) for (auto c = obj->classDef; c; c = c->superClass)
+            for (const auto& m : c->staticMembers)
+                if (m.name == "to" && m.kind == Member::Method) {
+                    if (m.native) nativeFound = true;
+                    else if (m.methodIndex < abc_.methods.size()) {
+                        abcFound = true; toMi = (int)m.methodIndex;
+                        toBi = abc_.methods[m.methodIndex].bodyIndex;
+                    }
+                }
+        std::fprintf(stderr, "[to] recv=%p clsDef=%p 类=%s argc=%zu native=%d abc=%d mi=%d bi=%d\n",
+                     (void*)obj.get(), (void*)(obj->classDef ? obj->classDef.get() : nullptr),
+                     obj->className.c_str(), args.size(), (int)nativeFound, (int)abcFound, toMi, toBi);
+        // 实参摘要：args[0]=目标对象，args[1]=duration，args[2]=vars
+        for (size_t ai = 0; ai < args.size(); ++ai) {
+            const Value& av = args[ai];
+            std::string desc;
+            if (av.kind == VKind::Object && av.obj)
+                desc = std::string("obj=") + av.obj->className +
+                       (av.obj->display ? (" disp=" + av.obj->display->name) : "") +
+                       (av.obj->display ? (" cid=" + std::to_string(av.obj->display->characterId)) : "");
+            else desc = av.toString();
+            std::fprintf(stderr, "      arg[%zu] vk=%d %s\n", ai, (int)av.kind, desc.c_str());
+            // vars 对象（arg[2]）：dump 全部键值，确认 newobject 是否正确写入键
+            if (ai == 2 && av.kind == VKind::Object && av.obj) {
+                std::fprintf(stderr, "      [vars] %p props(%zu):\n", (void*)av.obj.get(), av.obj->props.size());
+                for (const auto& kv : av.obj->props)
+                    std::fprintf(stderr, "        '%s' = vk%d %s\n", kv.first.c_str(), (int)kv.second.kind, kv.second.toString().c_str());
+                for (const auto& kv : av.obj->slots)
+                    std::fprintf(stderr, "        (slot) '%s' = vk%d %s\n", kv.first.c_str(), (int)kv.second.kind, kv.second.toString().c_str());
+            }
+        }
+        // 诊断：遍历所有已创建对象，统计所有 gs.TweenMax/TweenLite 类对象与其 ClassDef，
+        // 以及每个 ClassDef 的 classObject 回指，确认是否存在多个同名类对象/分叉 ClassDef。
+        if (std::getenv("SWF_CLASS_DBG")) {
+            for (const auto& o : objects_) {
+                if (!o || o->className.find("Tween") == std::string::npos) continue;
+                std::fprintf(stderr, "  [clsobj] %p kind=%d 类=%s clsDef=%p classObject=%p\n",
+                             (void*)o.get(), (int)o->kind, o->className.c_str(),
+                             (void*)(o->classDef ? o->classDef.get() : nullptr),
+                             (void*)(o->classDef ? o->classDef->classObject.get() : nullptr));
+            }
+        }
+    }
     if (std::getenv("SWF_AS_DEBUG")) {
         std::string cn = obj->className;
         if (obj->classDef) cn = obj->classDef->name;
@@ -2691,6 +3097,11 @@ Value Vm::callMethod(std::shared_ptr<Object> obj, const std::string& name, const
         for (auto c = obj->classDef; c; c = c->superClass) {
             for (const auto& m : c->staticMembers) {
                 if (m.name != name || m.kind != Member::Method) continue;
+                if (std::getenv("SWF_AS_DEBUG") && name == "to") {
+                    int mb = (m.methodIndex < abc_.methods.size()) ? abc_.methods[m.methodIndex].bodyIndex : -999;
+                    std::fprintf(stderr, "[to-resolve] 链=%s native=%d mi=%u bi=%d\n",
+                                 c->name.c_str(), (m.native ? 1 : 0), m.methodIndex, mb);
+                }
                 if (std::getenv("SWF_AS_DEBUG") && (name == "frameHandler" || name == "getFrameIndexByLabel"))
                     std::fprintf(stderr, "[as] %s mi=%u body=%d\n", name.c_str(), m.methodIndex,
                                  (m.methodIndex < abc_.methods.size()) ? abc_.methods[m.methodIndex].bodyIndex : -1);
@@ -2722,8 +3133,14 @@ Value Vm::callMethod(std::shared_ptr<Object> obj, const std::string& name, const
                 if (m.native) return m.native(obj, args);
                 if (m.methodIndex < abc_.methods.size()) {
                     int bi = abc_.methods[m.methodIndex].bodyIndex;
-                    if (bi >= 0 && bi < static_cast<int>(abc_.methodBodies.size()))
+                    if (bi >= 0 && bi < static_cast<int>(abc_.methodBodies.size())) {
+                        if (std::getenv("SWF_AS_DEBUG") && obj->className.find("Tween") != std::string::npos &&
+                            (name == "activate" || name == "initTweenVals" || name == "render"))
+                            std::fprintf(stderr, "[tween-meth] %s.%s 链=%s mi=%u bi=%d argc=%zu\n",
+                                         obj->className.c_str(), name.c_str(), c->name.c_str(),
+                                         m.methodIndex, bi, args.size());
                         return exec(abc_.methodBodies[bi], args, obj);
+                    }
                 }
             }
         }
@@ -2735,6 +3152,13 @@ Value Vm::callMethod(std::shared_ptr<Object> obj, const std::string& name, const
                 if (std::getenv("SWF_AS_CALLS"))
                     std::fprintf(stderr, "[call] %s.%s mi=%u body=%d argc=%zu\n", obj->className.c_str(),
                                  name.c_str(), m.methodIndex,
+                                 (m.methodIndex < abc_.methods.size()) ? abc_.methods[m.methodIndex].bodyIndex : -1,
+                                 args.size());
+                if (std::getenv("SWF_AS_DEBUG") && obj->className.find("Tween") != std::string::npos &&
+                    (name == "activate" || name == "initTweenVals" || name == "render"))
+                    std::fprintf(stderr, "[tween-meth] %s.%s 链=%s mi=%u bi=%d argc=%zu\n",
+                                 obj->className.c_str(), name.c_str(), obj->cls ? obj->cls->name.c_str() : "?",
+                                 m.methodIndex,
                                  (m.methodIndex < abc_.methods.size()) ? abc_.methods[m.methodIndex].bodyIndex : -1,
                                  args.size());
                 if (m.native) return m.native(obj, args);
@@ -2760,7 +3184,8 @@ Value Vm::callMethod(std::shared_ptr<Object> obj, const std::string& name, const
             if (midx < abc_.methods.size()) {
                 int bi = abc_.methods[midx].bodyIndex;
                 if (bi >= 0 && bi < static_cast<int>(abc_.methodBodies.size()))
-                    return exec(abc_.methodBodies[bi], args, obj);
+                    // 传入函数捕获的 scope（含声明类静态作用域），与 invokeValue 一致
+                    return exec(abc_.methodBodies[bi], args, obj, &fn->scope);
             }
         }
         if (fn->props.count("$native")) return invokeValue(dp->second, args, obj);
@@ -4085,6 +4510,10 @@ void Vm::registerNativeClasses() {
             auto co = classObj(tn);
             auto cd = co ? co->classDef : nullptr;
             if (!cd) continue;
+            if (std::getenv("SWF_CLASS_DBG"))
+                std::fprintf(stderr, "  [gs-reg] %s co=%p cd=%p classObject=%p statics=%zu\n",
+                             tn, (void*)co.get(), (void*)cd.get(),
+                             (void*)cd->classObject.get(), cd->staticMembers.size());
             globals_->props[std::string("com.greensock.") + tn] = Value::object(co);
             globals_->props[std::string("gs.") + tn] = Value::object(co);
             auto wrap = [this, buildTween, cd](int mode) -> NativeFn {
@@ -6616,15 +7045,112 @@ Value Vm::exec(const abc::MethodBody& body, const std::vector<Value>& args,
             for (const auto& t : body.traits)
                 std::fprintf(stderr, "   activation trait %s kind=%d slot=%u\n",
                              multinameName(t.name).c_str(), t.kind, t.slotId);
+        if (std::getenv("SWF_AS_DEBUG") && (traceBody == 145 || traceBody == 231) && thisObj) {
+            static int cc145 = 0;
+            if (cc145++ < 80)
+                std::fprintf(stderr, "[ctor-exec] body=%d this=%p args=%zu\n",
+                             traceBody, (void*)thisObj.get(), args.size());
+        }
     }
     auto finish = [&](const char* how) -> Value {
         if (traceExec) std::fprintf(stderr, "[as] leave body=%d %s pc=%zu\n", traceBody, how, in.pos());
         return Value::undefined();
     };
     static const bool fvmInited = (registerFvmOps(), true);
+    // SWF_MI_TABLE：一次性打印 method 表（mi -> bi 映射，bi 为 methodBodies 下标）。
+    // mi 与 bi 是两个不同序号（method_index / method_body_index），探针需要对照。
+    if (std::getenv("SWF_MI_TABLE") && fvmInited) {
+        static bool done = false;
+        if (!done) {
+            done = true;
+            for (std::size_t i = 0; i < abc_.methodBodies.size(); ++i)
+                std::fprintf(stderr, "[mi] mi=%u bi=%u size=%zu\n",
+                             abc_.methodBodies[i].methodIndex, i, abc_.methodBodies[i].code.size());
+        }
+    }
     // SWF_AS_OPS=<子串>：打印匹配方法体实际执行的 opcode 序列（含 pc 与栈深），
     // 用于确认关键帧脚本/构造函数是否真的执行到目标逻辑。
+    // SWF_OPS_LIMIT=<n>：每类匹配只追踪前 n 次执行（updateAll 等每帧方法防止日志爆炸）。
+    // SWF_DUMP_BODY=<n>：首次执行第 n 个 method body 前静态反汇编其完整 opcode 流
+    // （照常执行，仅一次性输出，供人工对照）。
     const char* opsFilter = std::getenv("SWF_AS_OPS");
+    if (const char* dumpEnv = std::getenv("SWF_DUMP_BODY")) {
+        // 逗号分隔（SWF_DUMP_BODY=144,134）：一次性静态反汇编列出的全部 body 到
+        // SWF_DUMP_FILE（或 stderr），不依赖这些 body 在本次运行中是否执行。
+        if (std::strchr(dumpEnv, ',')) {
+            static bool s_batchDumped = false;
+            if (!s_batchDumped) {
+                s_batchDumped = true;
+                FILE* f = nullptr;
+                if (const char* df = std::getenv("SWF_DUMP_FILE")) f = std::fopen(df, "w");
+                FILE* out = f ? f : stderr;
+                const char* q = dumpEnv;
+                while (q && *q) {
+                    int v = std::atoi(q);
+                    if (v >= 0 && v < (int)abc_.methodBodies.size()) {
+                        const auto& db = abc_.methodBodies[v];
+                        std::fprintf(out, "[dump] body=%d mi=%u size=%zu maxStack=%u locals=%u\n",
+                                     v, db.methodIndex, db.code.size(), db.maxStack, db.localCount);
+                        std::size_t pc = 0;
+                        while (pc < db.code.size()) {
+                            avm2::Instruction ins = avm2::decode(db.code.data(), db.code.size(), pc);
+                            if (ins.size == 0) break;
+                            std::fprintf(out, "  pc=%3zu 0x%02X", pc, ins.code);
+                            if (ins.info && ins.info->valid()) std::fprintf(out, " %-14s", ins.info->name);
+                            if (ins.info && ins.info->nameOperand != avm2::kNoOperand &&
+                                ins.info->nameOperand < ins.operands.size()) {
+                                uint32_t mn = static_cast<uint32_t>(ins.operands[ins.info->nameOperand]);
+                                std::fprintf(out, " [%s]",
+                                             (mn < abc_.multinames.size()) ? abc_.str(abc_.multinames[mn].name).c_str() : "?");
+                            }
+                            for (std::size_t k = 1; k < ins.size; ++k)
+                                std::fprintf(out, " %02X", db.code[pc + k]);
+                            std::fprintf(out, "\n");
+                            pc += ins.size;
+                        }
+                    }
+                    const char* nx = std::strchr(q, ',');   // 指向逗号本身或 null
+                    q = nx ? (nx + 1) : nullptr;            // 跳过逗号，避免 strchr 自指
+                }
+                if (f) std::fclose(f);
+            }
+            // 继续正常执行（不 return）
+        }
+        int want = (std::strchr(dumpEnv, ',')) ? -1 : std::atoi(dumpEnv);   // 逗号列表走上面的批量静态 dump
+        if (want >= 0 && want < static_cast<int>(abc_.methodBodies.size()) &&
+            &abc_.methodBodies[static_cast<size_t>(want)] == &body) {
+            static std::unordered_set<int> s_dumpedBodies;
+            if (s_dumpedBodies.insert(want).second) {
+                const auto& db = abc_.methodBodies[static_cast<size_t>(want)];
+                std::fprintf(stderr, "[dump] body=%d mi=%u size=%zu maxStack=%u locals=%u this=%s\n",
+                             want, db.methodIndex, db.code.size(), db.maxStack, db.localCount,
+                             thisObj ? thisObj->className.c_str() : "-");
+                // SWF_DUMP_FILE=<路径>：完整反汇编（含原始操作数字节）写入文件。
+                // stderr 在 120 列终端下长 hex 行会被截断且无法重组，文件输出不受影响。
+                FILE* f = nullptr;
+                if (const char* df = std::getenv("SWF_DUMP_FILE")) f = std::fopen(df, "w");
+                FILE* out = f ? f : stderr;
+                std::size_t pc = 0;
+                while (pc < db.code.size()) {
+                    avm2::Instruction ins = avm2::decode(db.code.data(), db.code.size(), pc);
+                    if (ins.size == 0) break;
+                    std::fprintf(out, "  pc=%3zu 0x%02X", pc, ins.code);
+                    if (ins.info && ins.info->valid()) std::fprintf(out, " %-14s", ins.info->name);
+                    if (ins.info && ins.info->nameOperand != avm2::kNoOperand &&
+                        ins.info->nameOperand < ins.operands.size()) {
+                        uint32_t mn = static_cast<uint32_t>(ins.operands[ins.info->nameOperand]);
+                        std::fprintf(out, " [%s]",
+                                     (mn < abc_.multinames.size()) ? abc_.str(abc_.multinames[mn].name).c_str() : "?");
+                    }
+                    for (std::size_t k = 1; k < ins.size; ++k)
+                        std::fprintf(out, " %02X", db.code[pc + k]);
+                    std::fprintf(out, "\n");
+                    pc += ins.size;
+                }
+                if (f) std::fclose(f);
+            }
+        }
+    }
     std::string opsName;
     bool traceOps = false;
     if (opsFilter) {
@@ -6639,6 +7165,15 @@ Value Vm::exec(const abc::MethodBody& body, const std::vector<Value>& args,
                 traceOps = true;
                 if (opsName.empty()) opsName = "<" + thisObj->className + ">";
             }
+        }
+        // SWF_OPS_LIMIT=<n>：同名匹配只追踪前 n 次执行（updateAll 每帧都跑，防日志爆炸）。
+        if (traceOps) {
+            static std::unordered_map<std::string, int> s_opsExecCount;
+            static const int kDefaultLimit = 3;
+            int limit = kDefaultLimit;
+            if (const char* lEnv = std::getenv("SWF_OPS_LIMIT")) limit = std::atoi(lEnv);
+            int& n = s_opsExecCount[opsName];
+            if (n >= limit) traceOps = false; else ++n;
         }
     }
     if (g_traceOpsActive) traceOps = true;
@@ -6688,8 +7223,30 @@ Value Vm::exec(const abc::MethodBody& body, const std::vector<Value>& args,
                 size_t pp = in.pos();
                 if (pp < body.code.size()) extra += " =" + std::to_string((int)body.code[pp]);
             }
-            std::fprintf(stderr, "[ops] %s pc=%zu op=0x%02X sd=%zu%s\n",
-                         opsName.c_str(), opPc, op, stack.size(), extra.c_str());
+            {
+                std::string lc;
+                for (size_t li = 1; li < locals.size() && li <= 9; ++li)
+                    lc += " l" + std::to_string(li) + "=" + locals[li].toString();
+                std::string st;
+                size_t from = stack.size() > 5 ? stack.size() - 5 : 0;
+                for (size_t si = from; si < stack.size(); ++si) st += " " + stack[si].toString();
+                char opHex[6];
+                std::snprintf(opHex, sizeof(opHex), "0x%02X", op);
+                std::string line = std::string("[ops] ") + opsName + " pc=" + std::to_string(opPc) +
+                    " op=" + opHex + " sd=" + std::to_string(stack.size()) + extra + lc + " stk=[" + st + "]";
+                if (const char* of = std::getenv("SWF_OPS_FILE")) {
+                    static std::FILE* sf = nullptr;
+                    static std::string soff;
+                    if (!sf || soff != of) {
+                        if (sf) std::fclose(sf);
+                        sf = std::fopen(of, "a");
+                        soff = of;
+                    }
+                    if (sf) { std::fputs(line.c_str(), sf); std::fputc('\n', sf); std::fflush(sf); }
+                } else {
+                    std::fprintf(stderr, "%s\n", line.c_str());
+                }
+            }
         }
         // M6：注册表统一分发（所有 AVM2 opcode 均已 command 化）
         if (auto* h = fvmOps().find(op)) {
@@ -6698,6 +7255,12 @@ Value Vm::exec(const abc::MethodBody& body, const std::vector<Value>& args,
             try {
                 (*h)(ec);
             } catch (const AsThrow& t) {
+                // 诊断：记录异常逃逸点。带调用深度的消息用于区分"被 AVM2 catch
+                // 正常消化"与"穿过若干原生 C++ 帧"（后者往往意味着异常被静默吞掉，
+                // 例如 GS 的 to() 中途失败导致补间从未注册进 masterList）。
+                if (std::getenv("SWF_EXC_DBG"))
+                    std::fprintf(stderr, "[exc] depth=%d val=%s (pc=%zu)\n",
+                                 g_execDepth, t.value.toString().c_str(), opPc);
                 const int hIdx = ec.findHandler(opPc, t.value);
                 if (hIdx >= 0) {
                     const auto& eh = body.exceptionHandlers;

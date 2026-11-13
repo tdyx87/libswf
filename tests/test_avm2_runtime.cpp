@@ -775,6 +775,41 @@ int main() {
               "SharedObject.getLocal exposes a data object");
     }
 
+    // ---- GreenSock 的 ticker 注册：new Sprite().addEventListener(Event.ENTER_FRAME) ----
+    // 换装悬停走 gs.TweenMax.to，其内部用 timingSprite = new Sprite() 挂
+    // timingSprite.addEventListener(Event.ENTER_FRAME, updateAll, false, 0, true)
+    // 来推进补间。实测日志里这次调用没有落到原生 addEventListener（全文只有预加载器
+    // 的 2 次 enterFrame 注册），而 dispatch enterFrame 的 listeners 始终为 0 ——
+    // 补间因此永不推进。本测试复刻这条最小路径并逐步定位断点。
+    {
+        const Value sp = make(vm, "Sprite");
+        check(sp.kind == VKind::Object && sp.obj && sp.obj->display,
+              "new Sprite() 得到带 display 的实例");
+
+        // 第一步：Event.ENTER_FRAME 常量必须解析为 "enterFrame" 字符串
+        const Value evCls = global(vm, "Event");
+        check(evCls.kind == VKind::Object && evCls.obj, "Event 类可解析");
+        Value efConst;
+        if (evCls.kind == VKind::Object && evCls.obj)
+            efConst = vm.getProperty(evCls.obj, "ENTER_FRAME");
+        check(efConst.kind == VKind::String && efConst.s == "enterFrame",
+              "Event.ENTER_FRAME 解析为 \"enterFrame\"");
+
+        // 第二步：用该常量注册监听，必须真的落到 obj->listeners["enterFrame"]
+        int fired = 0;
+        const Value fn = nativeFn(vm, "gsUpdateAll",
+            [&fired](const std::vector<Value>&) -> Value { ++fired; return Value::undefined(); });
+        call(vm, sp.obj, "addEventListener",
+             {efConst, fn, Value::boolean(false), Value::intg(0), Value::boolean(true)});
+        auto lit = sp.obj->listeners.find("enterFrame");
+        check(lit != sp.obj->listeners.end() && !lit->second.empty(),
+              "Sprite 上的 ENTER_FRAME 监听已登记到 listeners[enterFrame]");
+
+        // 第三步：tick 时必须被派发（useWeakReference=true 不能把监听丢掉）
+        for (int i = 0; i < 3; ++i) vm.tick();
+        check(fired >= 3, "tick 会派发 timingSprite 的 ENTER_FRAME 监听（ticker 能推进补间）");
+    }
+
     // ---- 嵌套时间轴实例的 stage 可达性（GreenSock ticker 注册的前提）----
     // 换装道具的悬停放大走 gs.TweenMax.to(mc, 1, {scaleX…, ease:Elastic.easeOut})。
     // GreenSock 11 的 addTickListener 是 `s = target.stage; if (s) s.addEventListener(
