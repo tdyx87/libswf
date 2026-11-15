@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -16,8 +17,10 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "swf/Decoder.hpp"
@@ -2711,6 +2714,7 @@ void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Mat
                          const Movie& movie, std::uint8_t* buf, int W, int H,
                          int frameIndex, float alpha, const ColorTransform& inheritedCx);
 
+
 // AVM2 运行时子显示列表：按 depth 顺序绘制，并对 clipDepth 组做与静态
 // renderItemsWithClip 相同的遮罩合成。品牌门户页的标语渐变色带就是靠
 // 白色文字轮廓遮罩裁成彩色字形，缺了这步会溢出成一整条矩形色块。
@@ -3012,6 +3016,388 @@ static void renderGraphicsInto(const fvm::DisplayObject& d, const Matrix& world,
 // 临时诊断：当前 renderFrameWithItems 调用序号（按输出帧计）。
 static int g_dbgRenderCall = 0;
 
+// ---- SWF_OBJ_PROF=1：按 characterId 累计渲染耗时（含子树，inclusive）----
+// 用途：定位整帧 65ms 里哪些显示对象最贵。minDepth 越小表示该角色出现得越靠近
+// 舞台根；同 cid 的嵌套调用会重复计入父侧，读榜时结合 minDepth 判断归属。
+namespace objprof {
+struct Ent { double us = 0; long long n = 0; int minDepth = 1 << 30; };
+std::unordered_map<std::uint32_t, Ent> g_byCid;
+double g_totalUs = 0;
+long long g_frames = 0;
+const bool* enabled() {
+    static bool e = std::getenv("SWF_OBJ_PROF") != nullptr;
+    return &e;
+}
+void report() {
+    if (!*enabled()) return;
+    std::fprintf(stderr, "[objprof] frames=%lld totalAvg=%.2fms/frame\n",
+                 g_frames, g_totalUs / 1000.0 / (g_frames > 0 ? g_frames : 1));
+    std::vector<std::pair<std::uint32_t, const Ent*>> v;
+    for (const auto& kv : g_byCid) v.emplace_back(kv.first, &kv.second);
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second->us > b.second->us; });
+    for (std::size_t i = 0; i < v.size() && i < 40; ++i) {
+        const auto& e = *v[i].second;
+        std::fprintf(stderr, "[objprof] cid=%-5u minDepth=%-3d us=%9.0f avgPerCall=%.1fus n=%lld\n",
+                     v[i].first, e.minDepth, e.us, e.us / (e.n > 0 ? e.n : 1), e.n);
+    }
+}
+    // 分段版：到达 SWF_OBJ_PROF_SECS 指定的帧号（逗号分隔）时输出该段 top 榜并清零。
+    // 用于定位"哪一段游戏的哪棵子树"最贵——整段求和会掩盖场景切换的差异。
+    const std::unordered_set<int>* secMarkers() {
+        static const std::unordered_set<int> m = [] {
+            std::unordered_set<int> s;
+            if (const char* e = std::getenv("SWF_OBJ_PROF_SECS")) {
+                std::stringstream ss(e);
+                std::string tok;
+                while (std::getline(ss, tok, ','))
+                    if (!tok.empty()) s.insert(std::atoi(tok.c_str()));
+            }
+            return s;
+        }();
+        return &m;
+    }
+    void maybeFlushSection(long long frameNo, int topN) {
+        if (!secMarkers()->count(static_cast<int>(frameNo))) return;
+        std::fprintf(stderr, "[objprof] === section frames<=%lld avg=%.2fms/frame ===\n",
+                     frameNo, g_totalUs / 1000.0 / (g_frames > 0 ? g_frames : 1));
+        std::vector<std::pair<std::uint32_t, const Ent*>> v;
+        for (const auto& kv : g_byCid) v.emplace_back(kv.first, &kv.second);
+        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second->us > b.second->us; });
+        for (std::size_t i = 0; i < v.size() && i < static_cast<std::size_t>(topN); ++i) {
+            const auto& e = *v[i].second;
+            std::fprintf(stderr, "[objprof] cid=%-5u minDepth=%-4d us=%9.0f avgPerCall=%.1fus n=%lld\n",
+                         v[i].first, e.minDepth, e.us, e.us / (e.n > 0 ? e.n : 1), e.n);
+        }
+        g_byCid.clear();
+        g_totalUs = 0;
+        g_frames = 0;
+    }
+}  // namespace objprof
+struct ObjProfAtexit { ObjProfAtexit() { std::atexit(objprof::report); } };
+static ObjProfAtexit g_objprofAtexit;
+
+// ============================================================================
+// 逐节点"自身内容"栅格缓存（SWF_RASTER_CACHE=1 启用；进程退出时打印命中统计）
+// ----------------------------------------------------------------------------
+// 游戏场景（Baby_Care_Spa_Salon）实测单帧渲染 65ms（预算 41.7ms）：~55ms 是反复
+// 重栅格化内容静止的显示节点（背景/家具/服装列表等），只有悬停道具的缩放补间在动。
+//
+// 为什么按"节点自身内容"而不是"子树"缓存：renderDisplayObject 自根向叶递归、
+// 逐节点探测；若缓存整棵子树，顶层节点（main，内含动画的 a6）的递归指纹每帧
+// 变化 → 顶层每帧必 miss → 整棵子树每帧重画，子节点缓存永远用不上，零收益。
+// 逐节点缓存则相反：内容静止的兄弟节点每帧命中（只合成包围盒），动画节点的
+// 后代必须重栅格化（它们在动，无法避免）。
+//
+// 缓存内容 = 节点自身内容（角色 + AS3 Graphics + 动态文本，**不含子节点**）
+// 栅格化进一张全帧透明层后裁剪出的紧致包围盒 RGBA（无背景）。
+// 命中 = 用与 plot() 完全相同的 Porter-Duff Normal over 把包围盒合成回主缓冲
+// （over 满足结合律：先画在透明层再合成 == 直接画在主缓冲，浮点/取整误差 ≤1 LSB）。
+//
+// 键 = (节点指针, 内容指纹, world 矩阵 6 浮点, 有效 alpha, 累积 ColorTransform 8 浮点,
+//       帧号)。内容指纹只覆盖自身内容字段（非递归、不含 children）——父级/兄弟
+// 变化不会使它失效；自身变换或内容一旦改变键即不同，缓存不会跨内容复用。
+//
+// 安全性（已逐一核对）：
+//  1. AVM2 运行时显示树跨 tick 复用同一批 DisplayObject 实例
+//     （applyTimelineFrame 按 depth+characterId 沿用 existing），指针可作键。
+//  2. 渲染路径对显示树只读：s_rtClockMode 仅影响帧号选择；嵌套精灵的 children
+//     与播放头由 Player 在 tick 内（syncChildrenTree/advanceTree）更新，
+//     一帧内不变；Video 帧在解码期落定；mask 排除集每帧渲染前重建。
+//  3. 只有走普通分支（无 mask、无滤镜）且 Normal 混合的节点参与缓存：mask/滤镜
+//     分支先行 return（整子树离屏+滤镜，自身内容非平凡），非 Normal 混合进透明层
+//     捕获与直接混合结果不同，均排除在外。
+//  4. 全局失效：每帧渲染入口把内容指纹序列 +1（bumpFrame），帧内容变化（时间轴
+//     帧号推进、gotoAndStop、按钮态等无法逐一建模的变化）使旧条目键不再命中。
+//     静态节点每帧仍命中（其内容不随帧号变化）；帧号变化的节点按新键重建。
+namespace rastercache {
+struct Ent {
+    std::vector<std::uint8_t> rgba;   // 紧致包围盒 RGBA（行主序，宽 = bx1-bx0+1）
+    int bx0 = 0, by0 = 0, bx1 = -1, by1 = -1;
+    long long last = 0;
+};
+struct Key {
+    const fvm::DisplayObject* node = nullptr;
+    std::uint64_t content = 0;        // 自身内容指纹（纯内容，不含帧号）
+    float w0 = 0, w1 = 0, w2 = 0, w3 = 0, w4 = 0, w5 = 0;   // world：sx,r0,r1,sy,tx,ty
+    float alpha = 0;
+    float cx0 = 0, cx1 = 0, cx2 = 0, cx3 = 0, cx4 = 0, cx5 = 0, cx6 = 0, cx7 = 0;
+    int W = 0, H = 0;                 // 缓冲尺寸：缓存 bbox 以缓冲像素为坐标系，GUI 窗口
+                                      // resize 改 vw×vh 后旧 bbox 位置失效 → 须使键失效
+    int fIdx = 0;                     // 角色帧选择：与 renderItemInto 的取帧必须一致，否则
+                                      // 时间轴 2 帧循环下会拿第 0 帧缓存服务第 1 帧
+                                      // （Sprite 用外层帧号，MovieClip 用自身播放头）。
+                                      // 仅 characterId && !timelineBuilt 的节点有效，
+                                      // 纯 AS3 Graphics / 已建时间轴节点恒为 0。
+    bool operator==(const Key& o) const {
+        return node == o.node && content == o.content &&
+               w0 == o.w0 && w1 == o.w1 && w2 == o.w2 && w3 == o.w3 && w4 == o.w4 && w5 == o.w5 &&
+               alpha == o.alpha && cx0 == o.cx0 && cx1 == o.cx1 && cx2 == o.cx2 && cx3 == o.cx3 &&
+               cx4 == o.cx4 && cx5 == o.cx5 && cx6 == o.cx6 && cx7 == o.cx7 && W == o.W && H == o.H && fIdx == o.fIdx;
+    }
+};
+std::size_t keyHash(const Key& k) {
+    static_assert(sizeof(Key) % 4 == 0, "Key 须可整体按 u32 哈希");
+    const auto* w = reinterpret_cast<const std::uint32_t*>(&k);
+    std::uint64_t h = 1469598103934665603ull;
+    for (std::size_t i = 0; i < sizeof(Key) / 4; ++i) {
+        h ^= static_cast<std::uint64_t>(w[i]);
+        h *= 1099511628211ull;
+    }
+    return static_cast<std::size_t>(h);
+}
+struct KeyHash { std::size_t operator()(const Key& k) const { return keyHash(k); } };
+std::unordered_map<Key, Ent, KeyHash> g_map;
+long long g_tickN = 0;
+long long g_bytes = 0;                          // 已用字节（所有条目 rgba 之和）
+const std::size_t kEntryCap = 512;              // 条目数上限
+const std::size_t kByteCap = 48u * 1024u * 1024u; // 字节上限（48MB）：防工作集膨胀
+// 开关：SWF_RASTER_CACHE 未设/空/"0"/"off"/"no" 均视为关闭，其余非空值开启。
+// GUI（swfplayer）在启动时默认置 "1"，故可用 SWF_RASTER_CACHE=0 显式关闭对照。
+const bool* enabled() {
+    static bool e = [] {
+        const char* v = std::getenv("SWF_RASTER_CACHE");
+        if (!v || !*v) return false;
+        return std::strncmp(v, "0", 1) != 0 && std::strcmp(v, "off") != 0 &&
+               std::strcmp(v, "no") != 0;
+    }();
+    return &e;
+}
+long long hits_ = 0, misses_ = 0, emptyMisses_ = 0, evictions_ = 0;
+void report() {
+    if (!*enabled()) return;
+    std::fprintf(stderr, "[rcache] hits=%lld misses=%lld empty=%lld evict=%lld entries=%zu bytes=%lld\n",
+                 hits_, misses_, emptyMisses_, evictions_, g_map.size(), g_bytes);
+}
+struct CacheAtexit { CacheAtexit() { std::atexit(report); } };
+static CacheAtexit g_rcacheAtexit;
+
+// FNV-1a 追加工具（double 按二进制字节、指针按地址、字符串按字节）。
+inline void f64le(std::uint64_t& h, double v) {
+    std::uint64_t b;
+    std::memcpy(&b, &v, 8);
+    for (int i = 0; i < 8; ++i) {
+        h ^= static_cast<std::uint8_t>((b >> (i * 8)) & 0xFFu);
+        h *= 1099511628211ull;
+    }
+}
+inline void fptr(std::uint64_t& h, const void* p) {
+    const auto* b = reinterpret_cast<const std::uint8_t*>(&p);
+    for (int i = 0; i < (int)sizeof(p); ++i) { h ^= b[i]; h *= 1099511628211ull; }
+}
+inline void fstr(std::uint64_t& h, const std::string& s) {
+    for (char ch : s) { h ^= static_cast<std::uint8_t>(ch); h *= 1099511628211ull; }
+    h ^= 0xFFu; h *= 1099511628211ull;
+}
+
+// 自身内容指纹：覆盖 renderDisplayObjectImpl 中"角色/图形/动态文本"用到的全部
+// 可变输入（非递归，children 另行处理）。世界变换与有效 alpha 在 Key 里单列。
+std::uint64_t contentFingerprint(const fvm::DisplayObject& d) {
+    const std::uint64_t FNV = 1469598103934665603ull;
+    std::uint64_t h = FNV;
+    h ^= static_cast<std::uint32_t>(d.characterId); h *= 1099511628211ull;
+    h ^= static_cast<std::uint32_t>(d.kind); h *= 1099511628211ull;
+    f64le(h, d.x); f64le(h, d.y);
+    f64le(h, d.scaleX); f64le(h, d.scaleY); f64le(h, d.rotation); f64le(h, d.alpha);
+    h ^= static_cast<std::uint32_t>(d.hasFull); h *= 1099511628211ull;
+    f64le(h, d.fullA); f64le(h, d.fullB); f64le(h, d.fullC); f64le(h, d.fullD);
+    h ^= static_cast<std::uint32_t>(d.visible); h *= 1099511628211ull;
+    h ^= static_cast<std::uint32_t>(d.buttonState); h *= 1099511628211ull;
+    // ratio 是 float：直接 cast 到 u64 会截断小数（0.1/0.3/0.5 全变 0，只有 1.0 变 1），
+    // Morph 补间整段动画指纹恒定 → 陈旧命中。必须按 4 字节位型哈希。
+    std::uint32_t ratioBits; std::memcpy(&ratioBits, &d.ratio, sizeof(ratioBits));
+    h ^= ratioBits; h *= 1099511628211ull;
+    h ^= static_cast<std::uint32_t>(d.timelineBuilt); h *= 1099511628211ull;
+    // 未构建时间轴的精灵：自身内容 = 角色第 currentFrame 帧的显示列表，帧号必入指纹。
+    // 已构建（timelineBuilt）的节点自身内容只有 graphics/文本，与 currentFrame 无关
+    // （其子树是独立节点、各自带键）。
+    if (!d.timelineBuilt) { h ^= static_cast<std::uint32_t>(static_cast<unsigned>(d.currentFrame)); h *= 1099511628211ull; }
+    f64le(h, d.cxMr); f64le(h, d.cxMg); f64le(h, d.cxMb);
+    f64le(h, d.cxAr); f64le(h, d.cxAg); f64le(h, d.cxAb);
+    h ^= static_cast<std::uint32_t>(static_cast<std::uint64_t>(d.blend)); h *= 1099511628211ull;
+    // AS3 Graphics 命令列表：**逐条哈希**，不能只看指针+条数——AS3 每帧 clear() 后
+    // 重放同一组命令（beginFill/lineStyle/moveTo/... 条数恒定）而数值（宽度/颜色/
+    // 坐标）在变，指针与 size 都不变。进度条/血条正是这种模式：只看条数会拿首帧
+    // 的旧内容永远命中。全列表 FNV 约 68B/条，典型节点几十条 ≈ 微秒级。
+    fptr(h, d.graphics.get());
+    if (d.graphics) {
+        h ^= static_cast<std::uint32_t>(d.graphics->size()); h *= 1099511628211ull;
+        for (const auto& c : *d.graphics) {
+            h ^= static_cast<std::uint32_t>(c.op); h *= 1099511628211ull;
+            f64le(h, c.x); f64le(h, c.y); f64le(h, c.w); f64le(h, c.h);
+            f64le(h, c.r); f64le(h, c.a); f64le(h, c.cx); f64le(h, c.cy);
+            h ^= c.color; h *= 1099511628211ull;
+        }
+    }
+    // 动态文本
+    h ^= static_cast<std::uint32_t>(d.hasText); h *= 1099511628211ull;
+    fstr(h, d.textData);
+    h ^= static_cast<std::uint32_t>(d.textSize); h *= 1099511628211ull;
+    h ^= d.textColor; h *= 1099511628211ull;
+    fstr(h, d.textFont);
+    h ^= static_cast<std::uint32_t>(d.hasTextOverride); h *= 1099511628211ull;
+    fstr(h, d.textOverride);
+    return h;
+}
+
+// 探测：命中 → 直接合成缓存包围盒到 buf，返回 true；未命中 → 返回 false（调用方
+// 用 skipChildren=true 渲染进透明层，再调 finishMiss）。
+bool begin(const fvm::DisplayObject* node, const Matrix& world, float effAlpha,
+           const ColorTransform& cx, int fIdx, const Movie& movie, std::uint8_t* buf,
+           int W, int H) {
+    if (!*enabled() || !node) return false;
+    if (node->blend != BlendMode::Normal) return false;   // 非 Normal 混合：透明层捕获不等价
+    if (node->filters && !node->filters->empty()) return false; // 保险：滤镜走离屏分支
+    // 视频角色的自身内容随 frameIndex 换帧（renderItemInto 按 frameIndex 选已解码帧），
+    // 键里没有帧号 ⇒ 排除，避免用到上一帧的静止画面。
+    if (node->characterId && !node->timelineBuilt) {
+        auto cit = movie.characters.find(node->characterId);
+        if (cit != movie.characters.end() && cit->second &&
+            cit->second->kind == Character::Kind::Video)
+            return false;
+    }
+    Key k;
+    k.node = node;
+    k.content = contentFingerprint(*node);
+    k.w0 = world.sx; k.w1 = world.r0; k.w2 = world.r1;
+    k.w3 = world.sy; k.w4 = world.tx; k.w5 = world.ty;
+    k.alpha = effAlpha;
+    k.cx0 = cx.mr; k.cx1 = cx.mg; k.cx2 = cx.mb; k.cx3 = cx.ma;
+    k.cx4 = cx.ar; k.cx5 = cx.ag; k.cx6 = cx.ab; k.cx7 = cx.aa;
+    k.W = W; k.H = H;
+    auto it = g_map.find(k);
+    if (it == g_map.end()) { ++misses_; return false; }
+    Ent& e = it->second;
+    e.last = ++g_tickN;   // LRU 记号：last 最大者最近使用（淘汰时找最小者）
+    ++hits_;
+    // 命中合成：与 plot() 相同的 Porter-Duff Normal over（按行带并行）。
+    if (e.bx1 >= e.bx0 && e.by1 >= e.by0) {
+        const int bw = e.bx1 - e.bx0 + 1;
+        parallelBands(e.by0, e.by1, [&](int ya, int yb) {
+            for (int y = ya; y <= yb; ++y) {
+                const std::uint8_t* s = &e.rgba[static_cast<std::size_t>(y - e.by0) * bw * 4];
+                std::uint8_t* d = &buf[(static_cast<std::size_t>(y) * W + e.bx0) * 4];
+                for (int x = 0; x < bw; ++x, s += 4, d += 4) {
+                    float sa = s[3] / 255.0f;
+                    if (sa <= 0.0f) continue;
+                    float da = d[3] / 255.0f;
+                    float outA = sa + da * (1.0f - sa);
+                    if (outA <= 0.0f) continue;
+                    d[0] = static_cast<std::uint8_t>((s[0] * sa + d[0] * da * (1.0f - sa)) / outA);
+                    d[1] = static_cast<std::uint8_t>((s[1] * sa + d[1] * da * (1.0f - sa)) / outA);
+                    d[2] = static_cast<std::uint8_t>((s[2] * sa + d[2] * da * (1.0f - sa)) / outA);
+                    d[3] = static_cast<std::uint8_t>(outA * 255.0f);
+                }
+            }
+        });
+    }
+    return true;
+}
+
+// 未命中收尾：扫透明层的 alpha 求紧致包围盒 → 抽出 RGBA 入表（LRU 淘汰超额项）
+// → 合成回主缓冲。层内无像素（空内容）则不入表。
+void finishMiss(const Key& k, const std::uint8_t* layer, int W, int H,
+                std::uint8_t* buf) {
+    float fx0 = 1e9f, fy0 = 1e9f, fx1 = -1e9f, fy1 = -1e9f;
+    bool any = false;
+    {
+        for (int y = 0; y < H; ++y) {
+            const std::uint8_t* row = layer + static_cast<std::size_t>(y) * W * 4;
+            bool r = false;
+            int x = 0;
+            for (; x + 1 < W; x += 2) {
+                std::uint64_t w;
+                std::memcpy(&w, row + static_cast<std::size_t>(x) * 4, 8);
+                if (w & 0xFF000000FF000000ull) { r = true; break; }
+            }
+            if (!r && x < W && row[static_cast<std::size_t>(x) * 4 + 3]) r = true;
+            if (r) {
+                any = true;
+                if (y < fy0) fy0 = y; fy1 = y;
+                int xa = W, xb = -1;
+                int x2 = 0;
+                for (; x2 + 1 < W; x2 += 2) {
+                    std::uint64_t w;
+                    std::memcpy(&w, row + static_cast<std::size_t>(x2) * 4, 8);
+                    if (w & 0x000000FF00000000ull) { if (x2 < xa) xa = x2; if (x2 > xb) xb = x2; }
+                    if (w & 0xFF00000000000000ull) { if (x2 + 1 < xa) xa = x2 + 1; if (x2 + 1 > xb) xb = x2 + 1; }
+                }
+                if (x2 < W && row[static_cast<std::size_t>(x2) * 4 + 3]) { if (x2 < xa) xa = x2; if (x2 > xb) xb = x2; }
+                if (xa < fx0) fx0 = xa; if (xb > fx1) fx1 = xb;
+            }
+        }
+    }
+    if (!any) { ++emptyMisses_; return; }   // 空内容：不入表（不破坏其它条目）
+    Ent e;
+    e.bx0 = std::max(0, static_cast<int>(std::floor(fx0)));
+    e.by0 = std::max(0, static_cast<int>(std::floor(fy0)));
+    e.bx1 = std::min(W - 1, static_cast<int>(std::ceil(fx1)));
+    e.by1 = std::min(H - 1, static_cast<int>(std::ceil(fy1)));
+    const int bw = e.bx1 - e.bx0 + 1;
+    e.rgba.resize(static_cast<std::size_t>(e.by1 + 1 - e.by0) * static_cast<std::size_t>(bw) * 4);
+    for (int y = e.by0; y <= e.by1; ++y)
+        std::memcpy(&e.rgba[static_cast<std::size_t>(y - e.by0) * bw * 4],
+                    layer + (static_cast<std::size_t>(y) * W + e.bx0) * 4,
+                    static_cast<std::size_t>(bw) * 4);
+    // miss 路径同样要把本节点自身内容合成进 buf（与命中路径同一 Normal-over 运算）：
+    // 内容已栅格化进干净透明层 layer，"over" 满足结合律 ⇒ (内容 over 透明) over 背景
+    // 与内容直接 over 背景逐像素一致（浮点重结合误差 ≤1–2/255）。漏掉这一步会让
+    // miss 帧缺失该节点自身内容。
+    parallelBands(e.by0, e.by1, [&](int ya, int yb) {
+        for (int y = ya; y <= yb; ++y) {
+            const std::uint8_t* s = &e.rgba[static_cast<std::size_t>(y - e.by0) * bw * 4];
+            std::uint8_t* d = &buf[(static_cast<std::size_t>(y) * W + e.bx0) * 4];
+            for (int x = 0; x < bw; ++x, s += 4, d += 4) {
+                float sa = s[3] / 255.0f;
+                if (sa <= 0.0f) continue;
+                float da = d[3] / 255.0f;
+                float outA = sa + da * (1.0f - sa);
+                if (outA <= 0.0f) continue;
+                d[0] = static_cast<std::uint8_t>((s[0] * sa + d[0] * da * (1.0f - sa)) / outA);
+                d[1] = static_cast<std::uint8_t>((s[1] * sa + d[1] * da * (1.0f - sa)) / outA);
+                d[2] = static_cast<std::uint8_t>((s[2] * sa + d[2] * da * (1.0f - sa)) / outA);
+                d[3] = static_cast<std::uint8_t>(outA * 255.0f);
+            }
+        }
+    });
+    e.last = ++g_tickN;
+    const std::size_t ebytes = e.rgba.size();
+    // LRU 淘汰：超出条目/字节上限时反复移除最久未用（last 最小）的条目。
+    // 键变化自然使旧条目变冷被淘汰（2 帧循环下每静态节点仅 2 个活跃键）。
+    while (g_map.size() >= kEntryCap ||
+           g_bytes + static_cast<long long>(ebytes) > static_cast<long long>(kByteCap)) {
+        auto victim = g_map.begin();
+        long long oldest = victim->second.last;
+        for (auto it = std::next(victim); it != g_map.end(); ++it)
+            if (it->second.last < oldest) { oldest = it->second.last; victim = it; }
+        g_bytes -= static_cast<long long>(victim->second.rgba.size());
+        g_map.erase(victim);
+        ++evictions_;
+    }
+    g_bytes += static_cast<long long>(ebytes);
+    auto r = g_map.emplace(k, std::move(e));
+    (void)r;
+}
+}  // namespace rastercache
+
+// RAII 作用域计时：SWF_OBJ_PROF 未设置时仅一次 getenv 缓存判断，近零开销。
+struct ObjProfScope {
+    std::uint32_t cid;
+    int depth;
+    std::chrono::steady_clock::time_point t0;
+    bool on;
+    ObjProfScope(int d, std::uint32_t c) : cid(c), depth(d), on(*objprof::enabled()) {
+        if (on) t0 = std::chrono::steady_clock::now();
+    }
+    ~ObjProfScope() {
+        if (!on) return;
+        double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        auto& e = objprof::g_byCid[cid];
+        e.us += us; e.n += 1;
+        if (depth < e.minDepth) e.minDepth = depth;
+        objprof::g_totalUs += us;
+    }
+};
+
 // ---- AS3 运行时遮罩状态（详见 renderDisplayObject 注释）----
 // s_inMaskPass：正在把遮罩对象渲染进裁剪缓冲；此时不得跳过全黑 alpha 渐变形状。
 // g_maskExcluded：被任何 d->mask 引用的对象集合——它们自身不绘制、不可命中。
@@ -3034,7 +3420,7 @@ static void buildMaskExclusions(const std::vector<std::shared_ptr<fvm::DisplayOb
 static void renderDisplayObjectImpl(const std::shared_ptr<fvm::DisplayObject>& d, const Matrix& parent,
                                     const Movie& movie, std::uint8_t* buf, int W, int H,
                                     int frameIndex, float alpha,
-                                    const ColorTransform& inheritedCx) {
+                                    const ColorTransform& inheritedCx, bool skipChildren = false) {
     if (d && g_dbgRenderCall == 180 && std::getenv("SWF_RENDER_DBG") &&
         (d->characterId == 370 || d->characterId == 372)) {
         static int _ln = 0;
@@ -3050,6 +3436,7 @@ static void renderDisplayObjectImpl(const std::shared_ptr<fvm::DisplayObject>& d
         }
     }
     if (!d || !d->visible) return;
+    ObjProfScope profScope(d->depth, d->characterId);
     // 带 clipDepth 的层是遮罩：Flash 只把它当作裁剪区域，自身不绘制。
     // 运行时显示树此前丢了该字段，preloader 头像的黑色渐变遮罩会被画成实心黑块。
     if (d->clipDepth > 0) return;
@@ -3164,7 +3551,10 @@ static void renderDisplayObjectImpl(const std::shared_ptr<fvm::DisplayObject>& d
         renderGraphicsInto(*d, world, buf, W, H, a, d->blend);
     if (d->hasText && !d->textData.empty() && !staticTextReplaced)
         renderDynamicText(*d, world, movie, buf, W, H, a);
-    renderRuntimeChildren(d->children, world, movie, buf, W, H, frameIndex, a, cx);
+    // skipChildren：逐节点栅格缓存的 miss 路径只栅格化"自身内容"（角色/图形/动态文本），
+    // 子树由调用方单独递归（子节点各自参与缓存），避免整棵子树被当作一个不可复用的整体。
+    if (!skipChildren)
+        renderRuntimeChildren(d->children, world, movie, buf, W, H, frameIndex, a, cx);
 }
 
 // PlaceObject3 FilterList 在运行时显示树同样要生效：把对象（含整棵子树）画进
@@ -3262,6 +3652,61 @@ void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Mat
         layer.noteRows(ry0, ry1);
         return;
     }
+    // ---- 逐节点自身内容栅格缓存（普通分支；mask/滤镜分支已先行 return）----
+    // 命中：只合成缓存包围盒；未命中：自身内容画进全帧透明层、裁包围盒入表后合成。
+    // 两种情况子节点都照常单独递归（各自参与缓存）。
+    // 与 renderDisplayObjectImpl 的早退保持一致：不可见 / 裁剪层（clipDepth）自身
+    // 不绘制也不递归子节点；全黑 alpha 渐变遮罩形状在普通通道不绘制——若无这些
+    // 守卫，命中路径会对本应整体跳过的节点误递归子树或误画遮罩形状。
+    if (!d->visible) return;
+    if (d->clipDepth > 0) return;
+    if (!s_inMaskPass && isAlphaMaskShape(*d, movie)) return;
+    // 自身内容 = 角色(未 timelineBuilt) + AS3 Graphics + 动态文本；纯容器（只有子节点）
+    // 没有可缓存内容，走直连 Impl（只递归子树），避免每帧为一空层付出整幅清零+扫描。
+    const bool hasOwnContent = (d->characterId && !d->timelineBuilt) ||
+                               (d->graphics && !d->graphics->empty()) ||
+                               (d->hasText && !d->textData.empty());
+    if (rastercache::enabled() && hasOwnContent) {
+        const Matrix world = parent.post(displayLocalMatrix(*d));
+        const float a = alpha * static_cast<float>(d->alpha);
+        ColorTransform ownCx;
+        ownCx.hasMult = true; ownCx.hasAdd = true;
+        ownCx.mr = static_cast<float>(d->cxMr); ownCx.mg = static_cast<float>(d->cxMg);
+        ownCx.mb = static_cast<float>(d->cxMb); ownCx.ma = 1.0f;
+        ownCx.ar = static_cast<float>(d->cxAr); ownCx.ag = static_cast<float>(d->cxAg);
+        ownCx.ab = static_cast<float>(d->cxAb); ownCx.aa = 0.0f;
+        const ColorTransform cx = inheritedCx.post(ownCx);
+        // 角色帧选择：必须与 renderDisplayObjectImpl 取 renderItemInto 的帧号一致，
+        // 否则时间轴 2 帧循环下会拿第 0 帧缓存服务第 1 帧（多帧 Sprite/Button 角色
+        // 按外层 frameIndex 取帧；MovieClip 用自身播放头）。纯 AS3 Graphics / 动态文本
+        // 与帧号无关，恒取 0 以合并为单一键（压缩工作集）。
+        const bool rendersCharacter = (d->characterId && !d->timelineBuilt);
+        const int fIdx = rendersCharacter
+                             ? ((d->kind == fvm::ObjKind::MovieClip && d->currentFrame > 0)
+                                    ? d->currentFrame : frameIndex)
+                             : 0;
+        if (rastercache::begin(d.get(), world, a, cx, fIdx, movie, buf, W, H)) {
+            renderRuntimeChildren(d->children, world, movie, buf, W, H, frameIndex, a, cx);
+            return;
+        }
+        std::vector<std::uint8_t> layer(static_cast<std::size_t>(W) * H * 4, 0);
+        renderDisplayObjectImpl(d, parent, movie, layer.data(), W, H, frameIndex, alpha,
+                                inheritedCx, /*skipChildren=*/true);
+        // 重建 Key（begin 已按同一算法计算过各分量）
+        rastercache::Key k;
+        k.node = d.get();
+        k.content = rastercache::contentFingerprint(*d);
+        k.w0 = world.sx; k.w1 = world.r0; k.w2 = world.r1;
+        k.w3 = world.sy; k.w4 = world.tx; k.w5 = world.ty;
+        k.alpha = a;
+        k.cx0 = cx.mr; k.cx1 = cx.mg; k.cx2 = cx.mb; k.cx3 = cx.ma;
+        k.cx4 = cx.ar; k.cx5 = cx.ag; k.cx6 = cx.ab; k.cx7 = cx.aa;
+        k.W = W; k.H = H;
+        k.fIdx = fIdx;
+        rastercache::finishMiss(k, layer.data(), W, H, buf);
+        renderRuntimeChildren(d->children, world, movie, buf, W, H, frameIndex, a, cx);
+        return;
+    }
     renderDisplayObjectImpl(d, parent, movie, buf, W, H, frameIndex, alpha, inheritedCx);
 }
 
@@ -3347,6 +3792,7 @@ bool renderFrameWithItems(const Movie& movie, const std::vector<DisplayItem>& it
                           std::vector<std::uint8_t>& out, int& W, int& H,
                           int targetW, int targetH) {
     ++g_dbgRenderCall;
+    if (*objprof::enabled()) objprof::g_frames += 1;
     std::size_t npix = 0;
     Matrix root;
     setupSurface(movie, targetW, targetH, W, H, root, npix);
@@ -3390,6 +3836,7 @@ bool renderFrameWithItems(const Movie& movie, const std::vector<DisplayItem>& it
         renderRuntimeChildren(movie.runtimeStage, rootM, movie, out.data(), W, H,
                               frameIndex, 1.0f, ColorTransform{});
     }
+    if (*objprof::enabled()) objprof::maybeFlushSection(g_dbgRenderCall, 14);
     return true;
 }
 

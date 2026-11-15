@@ -4500,6 +4500,34 @@ void Vm::registerNativeClasses() {
                         t.fromTo[kv.first] = {from, to};
                     }
                 }
+                // GreenSock 默认 overwrite=auto：同一目标上的新补间会终止（kill）旧补间
+                // 中正在推进的相同属性，否则快速 mouseOver/mouseOut 重入时旧补间与
+                // 新补间同时写同一属性，画面来回拉扯且 tween 队列无限增长。
+                if (!t.fromTo.empty()) {
+                    bool dbg = std::getenv("SWF_TWEEN_DBG") != nullptr;
+                    for (auto it = tweens_.begin(); it != tweens_.end();) {
+                        bool sameTarget = it->target && it->target.get() == tg.get();
+                        bool overlap = false;
+                        if (sameTarget) {
+                            for (const auto& kv : t.fromTo) {
+                                if (it->fromTo.count(kv.first)) { overlap = true; break; }
+                            }
+                        }
+                        if (sameTarget && overlap) {
+                            if (dbg) {
+                                std::fprintf(stderr, "[tween-kill] target=%p killedProp=",
+                                             (void*)tg.get());
+                                for (const auto& kv : it->fromTo)
+                                    std::fprintf(stderr, "%s ", kv.first.c_str());
+                                std::fprintf(stderr, "byProp=");
+                                for (const auto& kv : t.fromTo)
+                                    std::fprintf(stderr, "%s ", kv.first.c_str());
+                                std::fprintf(stderr, "\n");
+                            }
+                            it = tweens_.erase(it);
+                        } else ++it;
+                    }
+                }
                 tweens_.push_back(std::move(t));
             }
             handle->props["$target"] = a[0];

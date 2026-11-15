@@ -294,6 +294,11 @@ int main(int argc, char** argv) {
         if (fn) fn();
         FreeLibrary(u32);
     }
+    // 逐节点自身内容栅格缓存：默认开启（SWF_RASTER_CACHE 未设时）。
+    // GUI 每 tick 预算 41.7ms（24fps），游戏场景全量重绘实测 65ms 会逐帧落后；
+    // 缓存把渲染压回预算内（已验证与无缓存逐像素一致、退出时打印命中统计）。
+    // 命令行 swfparser.exe 不启用（离线批处理无实时压力）；外部显式设置可覆盖。
+    if (!std::getenv("SWF_RASTER_CACHE")) _putenv_s("SWF_RASTER_CACHE", "1");
     std::string path;
     std::string logPath;
     bool startPaused = false;

@@ -385,9 +385,14 @@ int main(int argc, char** argv) {
         for (auto& b : buffers) b = std::make_shared<std::vector<std::uint8_t>>();
         std::vector<std::future<bool>> pendingPng(static_cast<std::size_t>(slots));
         for (int step = 0; step < playCount; ++step) {
-            // 悬停：从指定步开始每帧都重设鼠标位置（显示列表每帧重建，按钮态需持续刷新）。
+            // 悬停：只应用"最新生效"的一条（frame 最大的未过期项），每 tick 仅一次
+            // setMouse。多个 --hover 表示"先移到 A、后移到 B"的时间线；若把全部
+            // 生效项逐条重放，同 tick 内会连发 N 次命中事件（进/出交替闪烁），
+            // 与真实 GUI 的单指针语义不符。
+            const ClickSpec* hvLast = nullptr;
             for (const auto& hv : hovers)
-                if (step >= hv.frame) player.setMouse(hv.x, hv.y);
+                if (step >= hv.frame && (!hvLast || hv.frame > hvLast->frame)) hvLast = &hv;
+            if (hvLast) player.setMouse(hvLast->x, hvLast->y);
             // --drag：按下后逐帧移动指针（拖动靠移动驱动），到期释放。
             for (const auto& dg : drags) {
                 if (step < dg.down || step > dg.up) continue;
@@ -625,9 +630,12 @@ int main(int argc, char** argv) {
                     }
                     char fnbuf[512];
                     for (int f = 0; f < playCount; ++f) {
+                        // 与 Player 路径一致：只应用最新生效的一条 hover（每帧一次 setMouse）。
+                        const ClickSpec* hvLast = nullptr;
                         for (const auto& hv : hovers)
-                            if (f >= hv.frame)
-                                for (auto& vm : vms) vm->setMousePosition(hv.x, hv.y);
+                            if (f >= hv.frame && (!hvLast || hv.frame > hvLast->frame)) hvLast = &hv;
+                        if (hvLast)
+                            for (auto& vm : vms) vm->setMousePosition(hvLast->x, hvLast->y);
                         // --drag：按下后逐帧移动指针（拖动靠移动驱动），到期释放
                         for (const auto& dg : drags) {
                             if (f < dg.down || f > dg.up) continue;
