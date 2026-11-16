@@ -294,11 +294,15 @@ int main(int argc, char** argv) {
         if (fn) fn();
         FreeLibrary(u32);
     }
-    // 逐节点自身内容栅格缓存：默认开启（SWF_RASTER_CACHE 未设时）。
-    // GUI 每 tick 预算 41.7ms（24fps），游戏场景全量重绘实测 65ms 会逐帧落后；
-    // 缓存把渲染压回预算内（已验证与无缓存逐像素一致、退出时打印命中统计）。
-    // 命令行 swfparser.exe 不启用（离线批处理无实时压力）；外部显式设置可覆盖。
-    if (!std::getenv("SWF_RASTER_CACHE")) _putenv_s("SWF_RASTER_CACHE", "1");
+    // 逐节点自身内容栅格缓存：默认关闭（SWF_RASTER_CACHE 未设时）。
+    // 修复 enabled() 指针门控（commit 见 swfparser flashplaer）后的实测（Baby_Care_Spa_Salon
+    // 菜单段 600 帧，6 次点击，缓存开关真正生效）：
+    //   OFF = 63.6ms/帧（与无缓存版本 41b11ba 的 63.9ms/帧 持平）
+    //   ON  = 99.7ms/帧（命中率 77%，但 512 条目 cap 下 LRU 抖动 evict=31949，
+    //         且每次命中仍要按紧致包围盒做一遍 over 合成，净开销大于直接光栅化）
+    // 即当前缓存实现在该场景下是负优化，默认保持关闭；外部 SWF_RASTER_CACHE=1 可覆盖。
+    // 若日后把缓存改成"仅内容键 + 局部空间"（动画节点不再每帧 miss）再重新评估默认值。
+    if (!std::getenv("SWF_RASTER_CACHE")) _putenv_s("SWF_RASTER_CACHE", "0");
     std::string path;
     std::string logPath;
     bool startPaused = false;
