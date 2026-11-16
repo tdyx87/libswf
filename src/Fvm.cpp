@@ -140,7 +140,11 @@ static bool looseEquals(const Value& a, const Value& b);
 static bool strictEquals(const Value& a, const Value& b);
 static bool valueIsType(const Value& v, const std::shared_ptr<Object>& t);
 static bool declaresProperty(const std::shared_ptr<Object>& o, const std::string& name);
+static std::shared_ptr<Object> staticVarWriteTarget(const std::shared_ptr<Object>& o, const std::string& name);
 static bool g_traceOpsActive = false;   // SWF_AS_OPS 命中时的 opcode 轨迹开关（callstatic 处理器在文件前部需要）
+// SWF_ADD_CALLER 用的 AS3 调用栈（exec 入口压栈、RAII 出栈），只存 methodIndex；
+// 必须声明在文件前部：addEventListener 原生回调（48xx 行）也要读它。
+static std::vector<uint32_t> g_callStack_;
 // 运行时 multiname：RTQName 只压 ns，RTQNameL/MultinameL 压 name(+ns)。
 static int mnRuntimeStackPops(const abc::AbcFile& abc, uint32_t index);
 static bool mnHasRuntimeNameValue(const abc::AbcFile& abc, uint32_t index);
@@ -835,10 +839,12 @@ inline void registerFvmOps() {
         for(auto it=c.scope.rbegin();it!=c.scope.rend();++it)
             if(declaresProperty(*it,name)){found=Value::object(*it);break;}
         if(found.isNull()) found=Value::object(c.vm.globalsObj());
+        // 静态变量赋值目标重定位（见 staticVarWriteTarget 注释）。
+        if(found.kind==VKind::Object&&found.obj) found=Value::object(staticVarWriteTarget(found.obj,name));
         // SWF_SCOPE_DBG：只打印关键静态变量（gs.TweenLite 的 timingSprite/_timer、
         // 单例 instance 等），否则重度 AS3 场景日志会爆。
         if(std::getenv("SWF_SCOPE_DBG") &&
-           (name=="timingSprite"||name=="_timer"||name=="updateAll"||name=="masterList"||name=="instance"||name=="currentTarget"||name=="m_initScaleX"||name=="TweenMax")){
+           (name=="timingSprite"||name=="_timer"||name=="updateAll"||name=="masterList"||name=="instance"||name=="currentTarget"||name=="m_initScaleX"||name=="TweenMax"||name=="_tlInitted")){
             std::fprintf(stderr,"[findprop] %s 绑定=%p 链(%zu):",
                          name.c_str(),(void*)(found.obj?found.obj.get():nullptr),c.scope.size());
             for(auto it=c.scope.rbegin();it!=c.scope.rend();++it){
@@ -869,9 +875,11 @@ inline void registerFvmOps() {
         // 注册，换装悬停无动画）。SWF_SCOPE_DBG 下打印命中对象与链上全部候选
         // （只针对关键名字，否则重度 AS3 场景日志会爆）。
         if(std::getenv("SWF_SCOPE_DBG") &&
-           (name=="timingSprite"||name=="_timer"||name=="updateAll"||name=="masterList"||name=="instance"||name=="currentTarget"||name=="m_initScaleX"||name=="TweenMax")){
-            std::fprintf(stderr,"[getlex] %s hit=%p val=%s 链(%zu):",
-                         name.c_str(),(void*)hitObj.get(),found.toString().c_str(),c.scope.size());
+           (name=="timingSprite"||name=="_timer"||name=="updateAll"||name=="masterList"||name=="instance"||name=="currentTarget"||name=="m_initScaleX"||name=="TweenMax"||name=="_tlInitted")){
+            int hitKind = hitObj ? (int)hitObj->kind : -1;
+            std::fprintf(stderr,"[getlex] %s hit=%p kind=%d val=%s 链(%zu):",
+                         name.c_str(),(void*)hitObj.get(),hitKind,
+                         found.toString().c_str(),c.scope.size());
             for(auto it=c.scope.rbegin();it!=c.scope.rend();++it){
                 std::string cn=it->get()->className;
                 std::fprintf(stderr," %p[k%d]%s%s",
@@ -2098,6 +2106,31 @@ static bool declaresProperty(const std::shared_ptr<Object>& o, const std::string
     for (auto c = o->cls; c; c = c->superClass)
         for (const auto& m : c->staticMembers) if (m.name == name) return true;
     return false;
+}
+
+// findproperty/findpropstrict 的"赋值目标"静态变量重定位。
+// 方法体作用域链顶是实例（构造器开头的 getlocal0;pushscope 把 this 推上栈），
+// 而 declaresProperty 让实例"可见"其类静态，于是无静态前缀的静态变量赋值
+// （如 GreenSock 实例构造器里的 `_tlInitted = true`）会被 findproperty 绑到
+// 实例而非声明类的类对象——值写进 instance.props，永远到不了 classObject.props
+// （静态 var 的运行时存储）。其后果：每次 new 都读不到该静态，重跑类静态初始化
+// （plugin.activate + timingSprite.addEventListener(ENTER_FRAME, updateAll) +
+// _timer.start()），而每次重跑产生的 updateAll 是全新函数对象、sameListener 判
+// 为不同 → 共享 timingSprite 上每 hover 永久 +1 个 enterFrame 监听 → 换装逐次
+// 变慢。读路径 getlex→getProperty 已正确落回 classObject，只有写目标错了。
+// 修正：命中对象是实例、且名字仅作为静态变量（Slot/Const）存在于类链（而非实例
+// 自身已持有的动态属性/slot/实例成员）时，把绑定改到声明该静态的类对象。
+static std::shared_ptr<Object> staticVarWriteTarget(const std::shared_ptr<Object>& o,
+                                                    const std::string& name) {
+    if (!o || o->kind == ObjKind::Class) return o;      // 类对象本身即静态存储，不动
+    if (o->props.count(name) || o->slots.count(name)) return o;   // 实例已持有该属性
+    for (auto c = o->cls; c; c = c->superClass)          // 实例成员（方法/getter/实例 slot）
+        for (const auto& m : c->instanceMembers) if (m.name == name) return o;
+    for (auto c = o->cls; c; c = c->superClass)          // 静态变量 → 声明类类对象
+        for (const auto& m : c->staticMembers)
+            if (m.name == name)
+                return (c->classObject) ? c->classObject : o;
+    return o;                                            // 纯动态属性，保持实例
 }
 
 // ---------- Vm ----------
@@ -4815,7 +4848,7 @@ void Vm::registerFlashApi() {
         // AS3: addEventListener(type, listener, useCapture=false, priority=0, useWeakReference=false)
         // 捕获监听器单独存 "$cap:<type>"；优先级存 "$prio:<key>"（与监听器一一对应）。
         Member add; add.kind = Member::Method; add.name = "addEventListener";
-        add.native = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
+        add.native = [this](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
             if (!self || a.size() < 2) return Value::undefined();
             const bool capture = a.size() > 2 && a[2].toBool();
             const int priority = a.size() > 3 ? asIntCast(asNumber(a[3])) : 0;
@@ -4826,10 +4859,26 @@ void Vm::registerFlashApi() {
                 if (sameListener(lv, a[1])) return Value::undefined();  // 同一监听器不重复注册
             ls.push_back(a[1]);
             self->listeners["$prio:" + key].push_back(Value::intg(priority));
-            if (std::getenv("SWF_AS_DEBUG"))
-                std::fprintf(stderr, "[as] addEventListener self=%s key=%s capture=%d priority=%d cid=%d\n",
-                             self->className.c_str(), key.c_str(), (int)capture, priority,
+            const char* ed = std::getenv("SWF_EVT_DBG");
+            if (ed || std::getenv("SWF_AS_DEBUG"))
+                std::fprintf(stderr, "[evt] ADD self=%s key=%s lisNow=%d cid=%d\n",
+                             self->className.c_str(), key.c_str(), (int)ls.size(),
                              self->display ? (int)self->display->characterId : -1);
+            if (std::getenv("SWF_ADD_CALLER") &&
+                (key == "enterFrame" || key == "timer")) {
+                static int s_prints = 0;
+                if (s_prints++ < 30) {
+                    std::fprintf(stderr, "[addcaller] key=%s stack=", key.c_str());
+                    for (size_t i = g_callStack_.size(); i-- > 0; ) {
+                        uint32_t mi = g_callStack_[i];
+                        std::string nm;
+                        if (mi < abc_.methods.size()) nm = abc_.methods[mi].name;
+                        if (nm.empty()) nm = "<mi" + std::to_string(mi) + ">";
+                        std::fprintf(stderr, "%s ", nm.c_str());
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+            }
             return Value::undefined();
         };
         c->classDef->instanceMembers.push_back(add);
@@ -4839,7 +4888,16 @@ void Vm::registerFlashApi() {
             const bool capture = a.size() > 2 && a[2].toBool();
             const std::string key = (capture ? "$cap:" : "") + listenerKey(a[0]);
             auto lit = self->listeners.find(key);
-            if (lit == self->listeners.end()) return Value::undefined();
+            const bool evdbg = std::getenv("SWF_EVT_DBG") || std::getenv("SWF_AS_DEBUG");
+            if (lit == self->listeners.end()) {
+                if (evdbg)
+                    std::fprintf(stderr, "[evt] REM-MISS self=%s key=%s\n",
+                                 self->className.c_str(), key.c_str());
+                return Value::undefined();
+            }
+            if (evdbg)
+                std::fprintf(stderr, "[evt] REM self=%s key=%s had=%d\n",
+                             self->className.c_str(), key.c_str(), (int)lit->second.size());
             auto pit = self->listeners.find("$prio:" + key);
             // 未传监听器时清空该类型的全部监听器（并同步优先级表）。
             if (a.size() < 2 || a[1].kind != VKind::Object || !a[1].obj) {
@@ -6486,7 +6544,21 @@ void Vm::runFrameScripts(const std::shared_ptr<DisplayObject>& d) {
 }
 
 // 向所有注册了该类型监听器的对象派发事件（以注册者自身作为回调 this）。
+// SWF_STATE_DBG 下累计各事件类型的 dispatchToAll 耗时（含全表快照 + 监听器查找
+// + 回调执行），tick() 的 [state] 探针每 N 帧读取并清零，用于归因每帧成本。
+static std::map<std::string, double> g_dispatchMs_;
+// tick() 各子阶段的累计耗时（loaderEvents/timers/timerObjects/timeline/
+// frameScripts/drag/tweens/report 等），同样由 [state] 探针读取并清零。
+static std::map<std::string, double> g_phaseMs_;
+// SWF_STATE_DBG 下按方法索引累计执行的 opcode 数，[state] 探针每 N 帧打印 Top12
+// 并清零——用于定位"单个 enterFrame 回调为何每帧 ~11ms"：看哪些方法体在烧 CPU。
+static std::map<uint32_t, std::uint64_t> g_opsByMi_;
+static std::uint64_t g_opsTotal_ = 0;
+
 void Vm::dispatchToAll(const std::string& type) {
+    double dT0 = 0;
+    const bool dt = std::getenv("SWF_STATE_DBG") != nullptr;
+    if (dt) dT0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto ev = std::make_shared<Object>();
     ev->kind = ObjKind::Event;
     ev->className = "Event";
@@ -6526,6 +6598,10 @@ void Vm::dispatchToAll(const std::string& type) {
             invokeValue(lv, {Value::object(ev)}, obj);
             if (mine) g_traceOpsActive = false;
         }
+    }
+    if (dt) {
+        double dNow = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        g_dispatchMs_[type] += (dNow - dT0) * 1000.0;
     }
 }
 
@@ -6617,7 +6693,19 @@ void Vm::fireLoaderEvents() {
 void Vm::tick() {
     const bool dbg = std::getenv("SWF_AS_DEBUG") != nullptr;
     if (dbg) std::fprintf(stderr, "[as] tick begin stage=%zu objects=%zu\n", stage.size(), objects_.size());
+    // SWF_STATE_DBG 下对 tick() 的每个子阶段累计计时，由 [state] 探针每 N 帧读取清零，
+    // 用于定位"反复 hover 后持续变慢"中每帧成本（事件派发已实测 <0.05ms，故重点
+    // 看 timeline/frameScripts/timers/tweens 等非派发阶段）。
+    const bool tphase = std::getenv("SWF_STATE_DBG") != nullptr;
+    auto nowMs = []() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() * 1000.0;
+    };
+    double phT = nowMs();
+    auto phAccum = [this, tphase, nowMs](const char* name, double start) {
+        if (tphase) g_phaseMs_[name] += nowMs() - start;
+    };
     fireLoaderEvents();
+    phAccum("loader", phT); phT = nowMs();
     // 定时器：虚拟时间按舞台帧率推进；到期的回调在帧事件前执行（Flash 语义近似）。
     timerNowMs_ += 1000.0 / (movie_.frameRate > 0 ? movie_.frameRate : 12.0);
     std::vector<int> dueIds;
@@ -6633,6 +6721,7 @@ void Vm::tick() {
         if (dbg) std::fprintf(stderr, "[as] timer fire id=%d\n", t.id);
         invokeValue(t.fn, t.args, nullptr);
     }
+    phAccum("timers", phT); phT = nowMs();
     // flash.utils.Timer：到期的 Timer 只向自身注册的监听器派发，
     // 不能走 dispatchToAll（那会唤醒所有对象上的同名监听器）。
     {
@@ -6658,6 +6747,10 @@ void Vm::tick() {
                 if (o && o.get() == to.get()) { t = &q; break; }
             }
             if (!t || !t->running || t->dueMs > timerNowMs_) continue;
+            if (std::getenv("SWF_EVT_DBG"))
+                std::fprintf(stderr, "[evt] TIMER fire to=%s count=%d rep=%d delay=%f dueMs=%f now=%f\n",
+                             to->className.c_str(), t->currentCount + 1, t->repeatCount,
+                             t->delayMs, t->dueMs, timerNowMs_);
             ++t->currentCount;
             const int cnt = t->currentCount;
             const int rep = t->repeatCount;
@@ -6672,22 +6765,106 @@ void Vm::tick() {
             if (complete) fire(to, "timerComplete");
         }
     }
+    phAccum("timerObjs", phT); phT = nowMs();
     for (auto& d : stage) advanceTimeline(d);
+    phAccum("timeline", phT); phT = nowMs();
     for (auto& d : stage) runFrameScripts(d);
+    phAccum("frameScripts", phT); phT = nowMs();
     // 拖动位置的应用时机必须是时间轴更新之后：applyTimelineFrame 每帧会把子实例的
     // x/y 重置回时间轴矩阵值，若拖动位置只在鼠标事件时更新，播放中的被拖对象会
     // 逐帧在“时间轴位置”和“鼠标位置”之间来回跳（表现为乱晃）。
     updateDragPosition();
+    phAccum("drag", phT); phT = nowMs();
     // 补间属性必须在 enterFrame 监听器之前就位（Flash 的 TweenLite 也基于帧事件）。
     advanceTweens();
+    phAccum("tweens", phT); phT = nowMs();
     if (dbg) std::fprintf(stderr, "[as] advanceTimeline done\n");
     dispatchToAll("enterFrame");
+    phAccum("dispatch", phT); phT = nowMs();
     if (dbg) std::fprintf(stderr, "[as] enterFrame done\n");
     dispatchToAll("frameConstructed");
     if (dbg) std::fprintf(stderr, "[as] frameConstructed done\n");
     dispatchToAll("exitFrame");
     if (dbg) std::fprintf(stderr, "[as] exitFrame done\n");
     reportFvmUnknownOps("tick");
+    phAccum("report", phT);
+    // SWF_STATE_DBG=N：每 N 个 tick 打印运行时状态规模（tween/timer/显示树节点），
+    // 用于复现"反复 hover 后持续变慢"——定位每帧成本随活动累积增长的来源。
+    if (const char* sd = std::getenv("SWF_STATE_DBG")) {
+        const int every = std::atoi(sd);
+        if (every > 0) {
+            static thread_local std::uint64_t s_tickNo = 0;
+            if (++s_tickNo % every == 0) {
+                std::size_t nodes = 0;
+                std::function<void(const std::shared_ptr<DisplayObject>&)> countNodes =
+                    [&](const std::shared_ptr<DisplayObject>& n) {
+                        if (!n) return;
+                        ++nodes;
+                        for (const auto& c : n->children) countNodes(c);
+                    };
+                for (const auto& r : stage) countNodes(r);
+                if (!movie_.runtimeStage.empty())
+                    for (const auto& r : movie_.runtimeStage) countNodes(r);
+                std::size_t listeners = 0;
+                // 按事件类型细分监听器数量：区分「每帧派发的事件类型」上挂的
+                // 监听器是否随 hover 累积（enterFrame/exitFrame/mouseMove 等）。
+                std::map<std::string, std::size_t> byType;
+                for (const auto& o : objects_)
+                    if (o) for (const auto& kv : o->listeners) {
+                        if (kv.first.rfind('$', 0) == 0) continue;   // 跳过 $cap:/$prio: 合成键
+                        listeners += kv.second.size();
+                        byType[kv.first] += kv.second.size();
+                    }
+                // 累计每种事件类型的 dispatchToAll 耗时（由 dispatchToAll 内累加，
+                // SWF_STATE_DBG 打开时）与 tick() 各子阶段耗时（由 tick() 内累加）。
+                // 均为「自上次打印以来」的累计（本配置下 = 20 个 tick 的总和，ms）。
+                std::map<std::string, double> dispMs;
+                for (auto& kv : g_dispatchMs_) dispMs[kv.first] = kv.second;
+                g_dispatchMs_.clear();
+                std::map<std::string, double> phMs;
+                for (auto& kv : g_phaseMs_) phMs[kv.first] = kv.second;
+                g_phaseMs_.clear();
+                std::fprintf(stderr, "[state] tick=%llu tweens=%zu timers=%zu timerObjs=%zu "
+                                     "nodes=%zu objs=%zu listeners=%zu",
+                             (unsigned long long)s_tickNo, tweens_.size(), timers_.size(),
+                             timerObjects_.size(), nodes, objects_.size(), listeners);
+                for (auto& kv : byType)
+                    if (kv.second > 0)
+                        std::fprintf(stderr, " %s=%zu", kv.first.c_str(), kv.second);
+                double totDisp = 0;
+                for (auto& kv : dispMs) {
+                    std::fprintf(stderr, " [disp %s=%.2fms]", kv.first.c_str(), kv.second);
+                    totDisp += kv.second;
+                }
+                std::fprintf(stderr, " dispTotal=%.2fms", totDisp);
+                double totPh = 0;
+                for (auto& kv : phMs) {
+                    std::fprintf(stderr, " [%s=%.2fms]", kv.first.c_str(), kv.second);
+                    totPh += kv.second;
+                }
+                std::fprintf(stderr, " phaseTotal=%.2fms", totPh);
+                // opcode 归因：自上次打印以来（=20 tick）按方法索引累计的指令数 Top12
+                if (!g_opsByMi_.empty()) {
+                    std::vector<std::pair<std::uint32_t, std::uint64_t>> top(g_opsByMi_.begin(), g_opsByMi_.end());
+                    std::sort(top.begin(), top.end(),
+                              [](const std::pair<std::uint32_t, std::uint64_t>& a,
+                                 const std::pair<std::uint32_t, std::uint64_t>& b) {
+                                  return a.second > b.second; });
+                    std::fprintf(stderr, " opsTotal=%llu", (unsigned long long)g_opsTotal_);
+                    for (std::size_t i = 0; i < top.size() && i < 12; ++i) {
+                        std::string nm;
+                        if (top[i].first < abc_.methods.size())
+                            nm = abc_.methods[top[i].first].name;
+                        std::fprintf(stderr, " mi=%u(%s)=%llu", top[i].first, nm.c_str(),
+                                     (unsigned long long)top[i].second);
+                    }
+                    g_opsByMi_.clear();
+                    g_opsTotal_ = 0;
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
 }
 
 // ---------- 鼠标输入与事件派发 ----------
@@ -6896,6 +7073,15 @@ void Vm::dispatchMouseEvent(const std::string& type,
         const auto p = ev->props.find(n);
         return p != ev->props.end() && p->second.toBool();
     };
+    if (std::getenv("SWF_EVT_DBG") &&
+        (type == "mouseOver" || type == "mouseOut")) {
+        std::fprintf(stderr, "[evt] fire %s targets=", type);
+        for (auto& tg : targets)
+            std::fprintf(stderr, "%s(%s,cid=%u) ", tg->className.c_str(),
+                         tg->display ? tg->display->name.c_str() : "-",
+                         tg->display ? (unsigned)tg->display->characterId : 0u);
+        std::fprintf(stderr, "\n");
+    }
     for (std::size_t i = 0; i < targets.size(); ++i) {
         if (stopped("$stopImmediate")) break;
         ev->props["currentTarget"] = Value::object(targets[i]);
@@ -7005,6 +7191,7 @@ Value Vm::exec(const abc::MethodBody& body, const std::vector<Value>& args,
                const std::vector<std::shared_ptr<Object>>* capturedScope) {
     ExecDepthGuard depthGuard;
     if (g_execDepth > kMaxExecDepth) return Value::undefined();
+    const bool opsCount = std::getenv("SWF_STATE_DBG") != nullptr;
     std::vector<Value> stack;
     stack.reserve(body.maxStack + 8);
     std::vector<Value> locals(body.localCount + 8);
@@ -7179,6 +7366,23 @@ Value Vm::exec(const abc::MethodBody& body, const std::vector<Value>& args,
             }
         }
     }
+    // SWF_ADD_CALLER：enterFrame/timer 监听器注册时打印当前 AS3 调用栈，
+    // 用来确认泄漏的监听器是游戏 pulse 代码还是 GreenSock ticker 注册的。
+    // 栈只存 methodIndex（uint32），打点时才解析名字，避免热路径的字符串拷贝。
+    const bool csActive = std::getenv("SWF_ADD_CALLER") != nullptr;
+    if (csActive) g_callStack_.push_back(body.methodIndex);
+    // SWF_CLS_ADR：构造器（locals=1）打印 this 类对象地址，验证同名类是否
+    // 被重复 newclass 出多个类对象（静态状态因此分叉）。
+    if (std::getenv("SWF_CLS_ADR") && thisObj && thisObj->kind == ObjKind::Class) {
+        static std::unordered_map<std::string, int> s_clsSeen;
+        int& n = s_clsSeen[thisObj->className];
+        if (n++ < 6)
+            std::fprintf(stderr, "[clsadr] %s co=%p cd=%p n=%d\n",
+                         thisObj->className.c_str(), (void*)thisObj.get(),
+                         (void*)(thisObj->classDef ? thisObj->classDef.get() : nullptr), n);
+    }
+    struct CSDrop { bool on; ~CSDrop() { if (on && !g_callStack_.empty()) g_callStack_.pop_back(); } };
+    const CSDrop csDrop{csActive};
     std::string opsName;
     bool traceOps = false;
     if (opsFilter) {
@@ -7209,9 +7413,31 @@ Value Vm::exec(const abc::MethodBody& body, const std::vector<Value>& args,
     if (const char* miEnv = std::getenv("SWF_AS_MI")) {
         if (body.methodIndex == static_cast<uint32_t>(std::atoi(miEnv))) { traceOps = true; if (opsName.empty()) opsName = "<mi" + std::string(miEnv) + ">"; }
     }
+    // SWF_TRACE_CALLS=<mi1,mi2,...>：对这些方法索引的前 4 次调用打印入口
+    // （this 类名/实例名 + 参数），用于识别 enterFrame 热回调到底是哪个游戏类。
+    if (const char* tc = std::getenv("SWF_TRACE_CALLS")) {
+        static std::unordered_map<uint32_t, int> s_callsSeen;
+        bool want = false;
+        for (const char* p = tc; *p; ) {
+            char* endp = nullptr;
+            uint32_t v = (uint32_t)std::strtoul(p, &endp, 10);
+            p = endp;
+            if (p && *p == ',') ++p;
+            if (v == body.methodIndex) { want = true; break; }
+        }
+        if (want && ++s_callsSeen[body.methodIndex] <= 4) {
+            std::fprintf(stderr, "[call] mi=%u this=%s%s args=", body.methodIndex,
+                         thisObj ? thisObj->className.c_str() : "-",
+                         thisObj && thisObj->display ? thisObj->display->name.c_str() : "");
+            for (size_t ai = 0; ai < args.size() && ai < 6; ++ai)
+                std::fprintf(stderr, " %s", args[ai].toString().c_str());
+            std::fprintf(stderr, "\n");
+        }
+    }
     size_t guard = 0;
     while (!in.atEnd()) {
         if (++guard > 200000) break;
+        if (opsCount) { ++g_opsTotal_; ++g_opsByMi_[body.methodIndex]; }
         const size_t opPc = in.pos();
         uint8_t op = in.u8();
         if (traceOps) {

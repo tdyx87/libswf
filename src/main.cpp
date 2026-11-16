@@ -411,8 +411,15 @@ int main(int argc, char** argv) {
                 if (kv.first == step) player.keyDown(kv.second);
             auto t0 = Clock::now();
             player.tick();
-            if (perf) tTick += std::chrono::duration<double>(Clock::now() - t0).count();
+            double stepTickMs = 0.0;
+            if (perf) { tTick += std::chrono::duration<double>(Clock::now() - t0).count();
+                        stepTickMs = std::chrono::duration<double>(Clock::now() - t0).count() * 1000.0; }
             std::printf("step=%d frame=%d\n", step, player.currentFrame());
+            // SWF_PERF 下每 20 步打印本步 tick 毫秒与累计 ms/tick，
+            // 观察"随 hover 次数持续变慢"的退化曲线（含 --no-render 纯 AVM2/tick 成本）。
+            if (perf && (step % 20 == 19))
+                std::fprintf(stderr, "[step] n=%d tick=%.2fms avgTick=%.2fms\n",
+                             step + 1, stepTickMs, tTick / (step + 1) * 1000.0);
             if (noRender) continue;
             const std::size_t s = static_cast<std::size_t>(step % slots);
             auto& cur = buffers[s];
@@ -425,7 +432,15 @@ int main(int argc, char** argv) {
             int W = 0, H = 0;
             auto t2 = Clock::now();
             const bool ok = player.render(*cur, W, H, targetW, targetH);
-            if (perf) tRender += std::chrono::duration<double>(Clock::now() - t2).count();
+            if (perf) {
+                double stepRenderMs = std::chrono::duration<double>(Clock::now() - t2).count() * 1000.0;
+                tRender += std::chrono::duration<double>(Clock::now() - t2).count();
+                if (step % 50 == 49)
+                    std::fprintf(stderr, "[step] n=%d tick=%.1fms render=%.1fms "
+                                         "avgTick=%.1fms avgRender=%.1fms\n",
+                                 step + 1, stepTickMs, stepRenderMs,
+                                 tTick / (step + 1) * 1000.0, tRender / (step + 1) * 1000.0);
+            }
             if (ok) {
                 std::snprintf(fnbuf, sizeof(fnbuf), "%s/p_%04d.png", outDir.c_str(), step);
                 pendingPng[s] = writePngAsync(fnbuf, cur, W, H);
