@@ -3666,7 +3666,10 @@ void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Mat
     const bool hasOwnContent = (d->characterId && !d->timelineBuilt) ||
                                (d->graphics && !d->graphics->empty()) ||
                                (d->hasText && !d->textData.empty());
-    if (rastercache::enabled() && hasOwnContent) {
+    // 门控必须解引用：enabled() 返回 const bool*，指针在布尔上下文中永真，
+    // 不解引用会让 SWF_RASTER_CACHE 开关失效（每个有自身内容的节点每帧都走
+    // miss 路径：4MB 层分配 + 全帧 alpha 扫描 + 合成），表现为 5.5× 渲染回退。
+    if (*rastercache::enabled() && hasOwnContent) {
         const Matrix world = parent.post(displayLocalMatrix(*d));
         const float a = alpha * static_cast<float>(d->alpha);
         ColorTransform ownCx;
@@ -3811,8 +3814,11 @@ bool renderFrameWithItems(const Movie& movie, const std::vector<DisplayItem>& it
         Matrix rootM; rootM.sx = root.sx; rootM.sy = root.sy;
         rootM.tx = root.tx; rootM.ty = root.ty;
         if (std::getenv("SWF_RENDER_DBG")) {
-            if (g_dbgRenderCall == 30 || g_dbgRenderCall == 180) {
+            if (g_dbgRenderCall == 30 || g_dbgRenderCall == 180 ||
+                (std::getenv("SWF_RTREE_EVERY") &&
+                 g_dbgRenderCall % std::atoi(std::getenv("SWF_RTREE_EVERY")) == 0)) {
                 int n386 = 0, n378 = 0, n370 = 0, n372 = 0, nodes = 0, negDepth = 0;
+                int nFilt = 0, nMask = 0, nBlend = 0;
                 std::map<int, int> hist;
                 std::function<void(const fvm::DisplayObject&, int)> scan =
                     [&](const fvm::DisplayObject& o, int lv) {
@@ -3823,14 +3829,43 @@ bool renderFrameWithItems(const Movie& movie, const std::vector<DisplayItem>& it
                         if (o.characterId == 378) ++n378;
                         if (o.characterId == 370) ++n370;
                         if (o.characterId == 372) ++n372;
+                        if (o.filters && !o.filters->empty()) ++nFilt;
+                        if (o.mask) ++nMask;
+                        if (o.blend != BlendMode::Normal) ++nBlend;
                         if (lv > 9) return;
                         for (const auto& c : o.children) if (c) scan(*c, lv + 1);
                     };
                 for (const auto& r : movie.runtimeStage) if (r) scan(*r, 0);
-                std::fprintf(stderr, "[rtree] call=%d roots=%zu nodes=%d negDepth=%d c386=%d c378=%d c370=%d c372=%d\n",
-                             g_dbgRenderCall, movie.runtimeStage.size(), nodes, negDepth, n386, n378, n370, n372);
+                std::fprintf(stderr, "[rtree] call=%d roots=%zu nodes=%d negDepth=%d filt=%d mask=%d blend=%d c386=%d c378=%d c370=%d c372=%d\n",
+                             g_dbgRenderCall, movie.runtimeStage.size(), nodes, negDepth, nFilt, nMask, nBlend, n386, n378, n370, n372);
                 for (const auto& kv : hist)
                     std::fprintf(stderr, "[hist] cid=%d n=%d\n", kv.first, kv.second);
+                // SWF_TREE_FULL：逐节点结构明细（graphics 命令数/文本长/子数/帧/缩放），
+                // 用于两版本同帧结构 diff，定位"画面相同但渲染成本不同"的节点。
+                if (std::getenv("SWF_TREE_FULL")) {
+                    std::function<void(const fvm::DisplayObject&, int)> scan2 =
+                        [&](const fvm::DisplayObject& o, int lv) {
+                            std::size_t gcmd = (o.graphics && !o.graphics->empty())
+                                                   ? o.graphics->size() : 0;
+                            std::fprintf(stderr,
+                                         "[tnode] call=%d lv=%d cid=%u name=%s kids=%zu gcmd=%zu "
+                                         "txt=%zu frame=%d sx=%.4f sy=%.4f x=%.3f y=%.3f a=%.4f "
+                                         "clip=%u built=%d kind=%d blend=%d vis=%d hasFull=%d "
+                                         "rot=%.4f fa=%.7f fb=%.7f fc=%.7f fd=%.7f "
+                                         "mr=%.7f mg=%.7f mb=%.7f ar=%.7f ag=%.7f ab=%.7f\n",
+                                         g_dbgRenderCall, lv, static_cast<unsigned>(o.characterId),
+                                         o.name.c_str(), o.children.size(), gcmd,
+                                         o.textData.size(), o.currentFrame, o.scaleX, o.scaleY,
+                                         o.x, o.y, (double)o.alpha, o.clipDepth,
+                                         (int)o.timelineBuilt, (int)o.kind, (int)o.blend,
+                                         (int)o.visible, (int)o.hasFull,
+                                         o.rotation, o.fullA, o.fullB, o.fullC, o.fullD,
+                                         (double)o.cxMr, (double)o.cxMg, (double)o.cxMb,
+                                         (double)o.cxAr, (double)o.cxAg, (double)o.cxAb);
+                            for (const auto& c : o.children) if (c) scan2(*c, lv + 1);
+                        };
+                    for (const auto& r : movie.runtimeStage) if (r) scan2(*r, 0);
+                }
             }
         }
         renderRuntimeChildren(movie.runtimeStage, rootM, movie, out.data(), W, H,
