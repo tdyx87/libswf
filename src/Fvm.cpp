@@ -166,7 +166,18 @@ static std::string takeRuntimeName(ExecCtx& c, uint32_t mn) {
     const bool nameOnStack = mnHasRuntimeNameValue(A, mn);
     for (int k = 0; k < pops; ++k) {
         Value v = c.pop();
-        if (k == 0 && nameOnStack) name = v.toString();
+        if (k == 0 && nameOnStack) {
+            // 对象键（Dictionary/动态下标，键为对象）必须用对象身份，不能用
+            // toString()：所有实例的默认 toString 都是 "[object <类名>]"，多个键
+            // 会折叠成同一个字符串。GreenSock 的 masterList 以补间实例为键，键折叠
+            // 后只保留最后一个补间，正在执行的补间（如移出服装的缩小补间）在下一个
+            // 补间创建时被丢弃、无人再推进 —— 慢移每件动画正常（1s 弹性补间先跑完），
+            // 快速移出则服装停在放大状态（用户报告的"鼠标快速移出都变大了"）。
+            if (v.kind == VKind::Object && v.obj)
+                name = "o" + std::to_string(reinterpret_cast<uintptr_t>(v.obj.get()));
+            else
+                name = v.toString();
+        }
     }
     return name;
 }
