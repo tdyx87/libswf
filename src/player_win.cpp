@@ -39,8 +39,18 @@ int g_stageW = 550, g_stageH = 400;
 bool g_playing = true;
 bool g_diag = false;   // --log 生效时打印窗口层诊断（坐标映射、鼠标事件）
 long long g_totalTicks = 0;   // 单调 tick 计数（心跳日志用，不受掉帧归零影响）
-long long g_tickUs = 0;       // 心跳周期内 Player::tick 累计耗时（微秒）
-long long g_renderUs = 0;     // 心跳周期内 renderToDC 累计耗时（微秒）
+// ---- FPS 叠加与绘制门控（静态帧跳过，见 Player::render 的 sceneFingerprint）----
+// 栅格化移进主循环（rasterizeFrame），WM_PAINT 只做 1:1 贴图（blitFrame）。
+// 跳过帧（指纹命中）时 g_bgra 与上一帧逐像素相同，且渲染器输出未变，
+// 故 BGRA 转换与窗口重绘都可省略。以下统计量由主循环的 24-tick 心跳更新，
+// WM_PAINT 只读取（同一 UI 线程，无竞争）。
+volatile long long g_fps = 0;   // 心跳窗口内实际 fps（wall 口径，非目标帧率）
+double g_wallMs = 0, g_cpuMs = 0, g_rastMs = 0;  // ms/帧：wall / (tick+栅格化) / 栅格化
+LARGE_INTEGER g_hbT0{};
+long long g_hbTicks = 0, g_hbTickUs = 0, g_hbRenderUs = 0;
+bool g_needRast = true;             // 初始/窗口尺寸变化 → 强制按新视口栅格化
+int g_clientW = 0, g_clientH = 0;   // 客户区尺寸（WM_SIZE/WM_PAINT 维护）
+int g_bgraW = 0, g_bgraH = 0, g_bgraOx = 0, g_bgraOy = 0;   // 最近一次视口
 FILE* g_log = nullptr; // 独立文件句柄：FreeConsole 后 stdout 写入不可靠，诊断走此句柄
 std::string g_title;
 
@@ -153,39 +163,71 @@ void stageViewport(int clientW, int clientH, int& w, int& h, int& ox, int& oy) {
     oy = (clientH - h) / 2;
 }
 
-// 把当前帧按视口尺寸重新光栅化并 1:1 贴到 DC。
+// 把当前帧按视口尺寸重新光栅化（主循环调用）。
 // 关键在于把 w/h 交给渲染器：矢量边缘与字形轮廓按新分辨率重新扫描填充，
 // 而不是先生成舞台尺寸的小位图再用 StretchDIBits 拉伸（那样放大窗口必然像素化）。
-void renderToDC(HDC hdc, int clientW, int clientH) {
+// 静态帧跳过：Player::render 在输入集指纹不变时直接复用旧缓冲（见 Render.cpp 的
+// sceneFingerprint），此时 g_rgba 与上一帧逐像素相同——g_bgra 无需重算，
+// 调用方经 g_player.lastRenderRasterized() 得知本帧是否真正光栅化。
+// 返回本帧光栅化耗时（微秒），供主循环累入 24-tick 心跳统计。
+long long rasterizeFrame() {
     LARGE_INTEGER f, t0, t1;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&t0);
     int vw = 0, vh = 0, ox = 0, oy = 0;
-    stageViewport(clientW, clientH, vw, vh, ox, oy);
+    stageViewport(g_clientW, g_clientH, vw, vh, ox, oy);
+    g_bgraW = vw; g_bgraH = vh; g_bgraOx = ox; g_bgraOy = oy;
     int w = 0, h = 0;
-    if (!g_player.render(g_rgba, w, h, vw, vh) || w <= 0 || h <= 0) return;
-    if (g_bgra.size() != g_rgba.size()) g_bgra.resize(g_rgba.size());
-    // RGBA -> BGRA（GDI 32bpp DIB 为 BGRA 顺序），并强制不透明。
-    for (std::size_t i = 0; i + 3 < g_rgba.size(); i += 4) {
-        g_bgra[i + 0] = g_rgba[i + 2];
-        g_bgra[i + 1] = g_rgba[i + 1];
-        g_bgra[i + 2] = g_rgba[i + 0];
-        g_bgra[i + 3] = 0xFF;
+    if (!g_player.render(g_rgba, w, h, vw, vh) || w <= 0 || h <= 0) {
+        LARGE_INTEGER t1;
+        QueryPerformanceCounter(&t1);
+        return (t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart;   // 渲染失败也返回耗时
     }
+    if (g_player.lastRenderRasterized()) {
+        if (g_bgra.size() != g_rgba.size()) g_bgra.resize(g_rgba.size());
+        // RGBA -> BGRA（GDI 32bpp DIB 为 BGRA 顺序），并强制不透明。
+        for (std::size_t i = 0; i + 3 < g_rgba.size(); i += 4) {
+            g_bgra[i + 0] = g_rgba[i + 2];
+            g_bgra[i + 1] = g_rgba[i + 1];
+            g_bgra[i + 2] = g_rgba[i + 0];
+            g_bgra[i + 3] = 0xFF;
+        }
+    }
+    // 跳过帧：g_bgra 已是正确像素（Player::render 复用旧缓冲时 g_rgba 逐字节相同）
+    QueryPerformanceCounter(&t1);
+    return (t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart;
+}
+
+// WM_PAINT 专用：把最近一次光栅化结果 1:1 贴到 DC（不再包含光栅化本身），
+// 并在左上角叠加 FPS/耗时读数。跳过的帧可以完全不调用 InvalidateRect，
+// 故本函数只在真正有新像素或需要刷新叠加文字时执行。
+void blitFrame(HDC hdc, int cw, int ch) {
+    if (g_bgra.empty() || g_bgraW <= 0) return;
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;   // 负值 = top-down，与 RGBA 行序一致
+    bi.bmiHeader.biWidth = g_bgraW;
+    bi.bmiHeader.biHeight = -g_bgraH;   // 负值 = top-down，与 RGBA 行序一致
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
-    RECT rc{0, 0, clientW, clientH};
+    RECT rc{0, 0, cw, ch};
     FillRect(hdc, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));  // letterbox
     // 源与目标尺寸一致：1:1 贴图，不做任何插值/拉伸。
-    StretchDIBits(hdc, ox, oy, w, h, 0, 0, w, h,
-                  g_bgra.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
-    QueryPerformanceCounter(&t1);
-    g_renderUs += (t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart;
+    StretchDIBits(hdc, g_bgraOx, g_bgraOy, g_bgraW, g_bgraH, 0, 0,
+                  g_bgraW, g_bgraH, g_bgra.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+    // FPS 叠加（主循环心跳每 24 tick 刷新一次 g_fps/g_wallMs 等，这里只读取）：
+    // 左上角黑底白字，SYSTEM_FIXED_FONT（GDI 内置，无需字体加载）。
+    HFONT oldFont = (HFONT)SelectObject(hdc, GetStockObject(SYSTEM_FIXED_FONT));
+    SetBkColor(hdc, RGB(0, 0, 0));
+    SetTextColor(hdc, RGB(255, 255, 255));
+    char overlay[128];
+    std::snprintf(overlay, sizeof(overlay),
+                  "FPS: %lld  wall %.1fms  tick %.1f  rast %.1f  skip %zu%%",
+                  g_fps, g_wallMs, g_cpuMs - g_rastMs, g_rastMs,
+                  g_player.sceneCalls() ? 100 * g_player.sceneSkips() / g_player.sceneCalls() : 0);
+    RECT orct{4, 4, 460, 24};
+    DrawTextA(hdc, overlay, -1, &orct, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(hdc, oldFont);
 }
 
 // 客户区像素坐标 -> 舞台坐标（左上原点）。必须走与渲染相同的 Show All 视口，
@@ -213,14 +255,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RECT rc;
             GetClientRect(hwnd, &rc);
             int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+            g_clientW = cw > 0 ? cw : 1;
+            g_clientH = ch > 0 ? ch : 1;
             ScopedDC mem(CreateCompatibleDC(paint.hdc));
             ScopedBitmap bmp(CreateCompatibleBitmap(paint.hdc, cw > 0 ? cw : 1, ch > 0 ? ch : 1));
             if (!mem.h || !bmp.h) return 0;
             ScopedSelect sel(mem, bmp.h);
-            renderToDC(mem, cw, ch);
+            blitFrame(mem, cw, ch);   // 仅 1:1 贴图 + FPS 叠加；光栅化在主循环做
             BitBlt(paint.hdc, 0, 0, cw, ch, mem, 0, 0, SRCCOPY);
             return 0;   // 析构逆序自动完成 SelectObject/DeleteObject/DeleteDC/EndPaint
         }
+
+        case WM_SIZE:
+            if (wp != SIZE_MINIMIZED) {
+                g_clientW = LOWORD(lp) > 0 ? LOWORD(lp) : 1;
+                g_clientH = HIWORD(lp) > 0 ? HIWORD(lp) : 1;
+                g_needRast = true;    // 视口变化 → 按新尺寸重新光栅化
+            }
+            return 0;
 
         case WM_SETCURSOR:
             if (LOWORD(lp) == HTCLIENT) {   // 客户区内由悬停目标决定光标
@@ -499,6 +551,11 @@ int main(int argc, char** argv) {
                 g_player.mouseUp();
             }
         }
+        // 光栅化（静态帧跳过时 Player::render 直接返回旧缓冲，无整帧光栅化开销）
+        const long long rastUs = rasterizeFrame();
+        // 必须在 recordFrame/maybeAutoSave **之前**读取：两者以舞台原生尺寸 (0,0)
+        // 渲染，会覆盖 lastRenderRasterized。
+        const bool frameRasterized = g_player.lastRenderRasterized();
         // 录制：每 tick 存一帧舞台原生尺寸 PNG
         if (!g_recDir.empty() && recordFrame()) {
             if (g_recCount == 1) dlog("[rec] start -> %s\n", g_recDir.c_str());
@@ -509,17 +566,39 @@ int main(int argc, char** argv) {
         }
         maybeAutoSave();   // 运行时精灵到达目标帧则自动存图
         QueryPerformanceCounter(&t1);
-        InvalidateRect(g_hwnd, nullptr, FALSE);
+        const long long cpuUs = (t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart;
         ++frameIdx;
         ++g_tickCount;
-        g_tickUs += (t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart;
-        // 心跳用单调计数（frameIdx 掉帧超 4 帧会归零，慢速渲染下永远到不了 48）。
-        if (g_diag && ++g_totalTicks % 48 == 0) {
-            dlog("[win] totalTicks=%lld frameIdx=%lld mainFrame=%d tickUs/frame=%lld renderUs/frame=%lld\n",
-                 g_totalTicks, frameIdx, g_player.currentFrame(), g_tickUs / 48, g_renderUs / 48);
-            g_tickUs = 0;
-            g_renderUs = 0;
+        // 24-tick 心跳：刷新 FPS 叠加的统计量（wall = 真实吞吐；cpu = tick+光栅化）。
+        // 用单调计数（frameIdx 掉帧超 4 帧会归零，慢速渲染下永远到不了周期数）。
+        ++g_hbTicks;
+        {
+            LARGE_INTEGER hnow;
+            QueryPerformanceCounter(&hnow);
+            if (g_hbTicks == 1) g_hbT0 = hnow;
+            if (g_hbTicks % 24 == 0) {
+                const long long hbUs = (hnow.QuadPart - g_hbT0.QuadPart) * 1000000 / freq.QuadPart;
+                g_fps = (hbUs > 0) ? 24LL * 1000000LL / hbUs : 0;
+                g_wallMs = static_cast<double>(hbUs) / 24.0 / 1000.0;
+                g_cpuMs = static_cast<double>(g_hbTickUs) / 24.0 / 1000.0;
+                g_rastMs = static_cast<double>(g_hbRenderUs) / 24.0 / 1000.0;
+                g_hbTickUs = 0;
+                g_hbRenderUs = 0;
+                g_hbT0 = hnow;
+                if (g_diag && ++g_totalTicks % 48 == 0)
+                    dlog("[win] totalTicks=%lld frameIdx=%lld mainFrame=%d wall=%.2fms cpu=%.2fms rast=%.2fms fps=%lld\n",
+                         g_totalTicks, frameIdx, g_player.currentFrame(), g_wallMs, g_cpuMs,
+                         g_rastMs, g_fps);
+            }
         }
+        g_hbTickUs += cpuUs;
+        g_hbRenderUs += rastUs;
+        // 绘制门控：跳过帧的像素与上一帧逐像素相同（Player::render 复用旧缓冲），
+        // 不必重绘；FPS 叠加每 24 tick 刷新一次统计量，窗口尺寸变化（g_needRast）
+        // 与暂停态恢复也必须重绘。代价上限：最坏每 24 tick 多一次 ~1ms 的 1:1 贴图。
+        if (!g_playing || g_needRast || frameRasterized || (g_hbTicks % 24 == 0))
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+        g_needRast = false;
         // 落后超过 4 帧（拖动窗口/渲染卡顿）时重新对齐，避免连续补帧造成瞬间快放。
         if (elapsedUs - targetUs > 4LL * frameUs) {
             base = now;

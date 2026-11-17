@@ -3114,6 +3114,9 @@ struct Ent {
     std::vector<std::uint8_t> rgba;   // 紧致包围盒 RGBA（行主序，宽 = bx1-bx0+1）
     int bx0 = 0, by0 = 0, bx1 = -1, by1 = -1;
     long long last = 0;
+    // bbox 内**每个像素** alpha 恒 255（无洞、无半透明）→ 命中时 "over" 的
+    // 输出逐像素 = 源像素（sa=1 ⇒ out=s），可整行 memcpy 替代 float 混合。
+    bool opaque = false;
 };
 struct Key {
     const fvm::DisplayObject* node = nullptr;
@@ -3149,8 +3152,25 @@ struct KeyHash { std::size_t operator()(const Key& k) const { return keyHash(k);
 std::unordered_map<Key, Ent, KeyHash> g_map;
 long long g_tickN = 0;
 long long g_bytes = 0;                          // 已用字节（所有条目 rgba 之和）
-const std::size_t kEntryCap = 512;              // 条目数上限
-const std::size_t kByteCap = 48u * 1024u * 1024u; // 字节上限（48MB）：防工作集膨胀
+// 上限可经 SWF_RCACHE_ENTRIES / SWF_RCACHE_MB 覆盖（默认 512 条 / 48MB）。
+// 菜单段每 tick 大量节点内容变化 → 小上限引发 LRU 驱逐风暴；游戏段 840 节点仅
+// ~10 个变 → 大上限可容纳全部静止节点工作集，命中率应接近 100%。
+std::size_t kEntryCap() {
+    static std::size_t v = [] {
+        const char* e = std::getenv("SWF_RCACHE_ENTRIES");
+        if (e && *e) { long n = std::atol(e); if (n > 0) return static_cast<std::size_t>(n); }
+        return static_cast<std::size_t>(512);
+    }();
+    return v;
+}
+std::size_t kByteCap() {
+    static std::size_t v = [] {
+        const char* e = std::getenv("SWF_RCACHE_MB");
+        if (e && *e) { long n = std::atol(e); if (n > 0) return static_cast<std::size_t>(n) * 1024u * 1024u; }
+        return static_cast<std::size_t>(48u) * 1024u * 1024u;
+    }();
+    return v;
+}
 // 开关：SWF_RASTER_CACHE 未设/空/"0"/"off"/"no" 均视为关闭，其余非空值开启。
 // GUI（swfplayer）在启动时默认置 "1"，故可用 SWF_RASTER_CACHE=0 显式关闭对照。
 const bool* enabled() {
@@ -3162,11 +3182,11 @@ const bool* enabled() {
     }();
     return &e;
 }
-long long hits_ = 0, misses_ = 0, emptyMisses_ = 0, evictions_ = 0;
+long long hits_ = 0, hitsFast_ = 0, misses_ = 0, emptyMisses_ = 0, evictions_ = 0;
 void report() {
     if (!*enabled()) return;
-    std::fprintf(stderr, "[rcache] hits=%lld misses=%lld empty=%lld evict=%lld entries=%zu bytes=%lld\n",
-                 hits_, misses_, emptyMisses_, evictions_, g_map.size(), g_bytes);
+    std::fprintf(stderr, "[rcache] hits=%lld fast=%lld misses=%lld empty=%lld evict=%lld entries=%zu bytes=%lld\n",
+                 hits_, hitsFast_, misses_, emptyMisses_, evictions_, g_map.size(), g_bytes);
 }
 struct CacheAtexit { CacheAtexit() { std::atexit(report); } };
 static CacheAtexit g_rcacheAtexit;
@@ -3269,9 +3289,22 @@ bool begin(const fvm::DisplayObject* node, const Matrix& world, float effAlpha,
     Ent& e = it->second;
     e.last = ++g_tickN;   // LRU 记号：last 最大者最近使用（淘汰时找最小者）
     ++hits_;
-    // 命中合成：与 plot() 相同的 Porter-Duff Normal over（按行带并行）。
     if (e.bx1 >= e.bx0 && e.by1 >= e.by0) {
         const int bw = e.bx1 - e.bx0 + 1;
+        // 快路：缓存 bbox 全不透明 且 本节点有效 alpha=1、无颜色变换（键里
+        // alpha 与 cx 均为恒等）。此时 Porter-Duff "over" 的每个输出像素 = 源
+        // 像素（sa=1 ⇒ out= s），逐字节等价于直接取缓存行 → 整行 memcpy。
+        // 这是实心填充形状（按钮底、面板、背景条）的合成主形态；float 混合
+        // 每像素 ~10 次浮点运算 vs memcpy 每 4B 零运算，是缓存转正的关键。
+        if (e.opaque) {
+            for (int y = e.by0; y <= e.by1; ++y)
+                std::memcpy(&buf[(static_cast<std::size_t>(y) * W + e.bx0) * 4],
+                            &e.rgba[static_cast<std::size_t>(y - e.by0) * bw * 4],
+                            static_cast<std::size_t>(bw) * 4);
+            ++hitsFast_;
+            return true;
+        }
+        // 慢路：与 plot() 相同的 Porter-Duff Normal over（按行带并行）。
         parallelBands(e.by0, e.by1, [&](int ya, int yb) {
             for (int y = ya; y <= yb; ++y) {
                 const std::uint8_t* s = &e.rgba[static_cast<std::size_t>(y - e.by0) * bw * 4];
@@ -3334,10 +3367,22 @@ void finishMiss(const Key& k, const std::uint8_t* layer, int W, int H,
     e.by1 = std::min(H - 1, static_cast<int>(std::ceil(fy1)));
     const int bw = e.bx1 - e.bx0 + 1;
     e.rgba.resize(static_cast<std::size_t>(e.by1 + 1 - e.by0) * static_cast<std::size_t>(bw) * 4);
-    for (int y = e.by0; y <= e.by1; ++y)
-        std::memcpy(&e.rgba[static_cast<std::size_t>(y - e.by0) * bw * 4],
-                    layer + (static_cast<std::size_t>(y) * W + e.bx0) * 4,
-                    static_cast<std::size_t>(bw) * 4);
+    e.opaque = true;
+    for (int y = e.by0; y <= e.by1; ++y) {
+        const std::uint8_t* src = layer + (static_cast<std::size_t>(y) * W + e.bx0) * 4;
+        std::uint8_t* dst = &e.rgba[static_cast<std::size_t>(y - e.by0) * bw * 4];
+        std::memcpy(dst, src, static_cast<std::size_t>(bw) * 4);
+        // 全不透明判定（每像素 alpha==255；有洞/半透明 ⇒ 落回 float 混合慢路）：
+        // u64 成对检查 alpha 字节，任一行出现 <255 即整体非 opaque。
+        for (int x = 0; x + 1 < bw; x += 2) {
+            std::uint64_t w;
+            std::memcpy(&w, dst + static_cast<std::size_t>(x) * 4, 8);
+            // alpha 字节 = 每像素第 3 字节（u64 小端位 24-31 与 56-63）
+            if ((w & 0xFF000000FF000000ull) != 0xFF000000FF000000ull) { e.opaque = false; break; }
+        }
+        if (e.opaque && (bw & 1) && dst[(bw - 1) * 4 + 3] != 0xFF) e.opaque = false;
+        if (!e.opaque) break;
+    }
     // miss 路径同样要把本节点自身内容合成进 buf（与命中路径同一 Normal-over 运算）：
     // 内容已栅格化进干净透明层 layer，"over" 满足结合律 ⇒ (内容 over 透明) over 背景
     // 与内容直接 over 背景逐像素一致（浮点重结合误差 ≤1–2/255）。漏掉这一步会让
@@ -3363,8 +3408,8 @@ void finishMiss(const Key& k, const std::uint8_t* layer, int W, int H,
     const std::size_t ebytes = e.rgba.size();
     // LRU 淘汰：超出条目/字节上限时反复移除最久未用（last 最小）的条目。
     // 键变化自然使旧条目变冷被淘汰（2 帧循环下每静态节点仅 2 个活跃键）。
-    while (g_map.size() >= kEntryCap ||
-           g_bytes + static_cast<long long>(ebytes) > static_cast<long long>(kByteCap)) {
+    while (g_map.size() >= kEntryCap() ||
+           g_bytes + static_cast<long long>(ebytes) > static_cast<long long>(kByteCap())) {
         auto victim = g_map.begin();
         long long oldest = victim->second.last;
         for (auto it = std::next(victim); it != g_map.end(); ++it)
@@ -3714,6 +3759,261 @@ void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Mat
 }
 
 }  // namespace
+
+// ---- 静态帧跳过：渲染输入集指纹（sceneFingerprint）----
+// renderFrameWithItems 的输出是"渲染输入集"的确定性函数：同一输入集必产出
+// 相同像素。Player::render 逐 tick 重算本指纹，与上一帧相同即复用旧缓冲，
+// 跳过整帧软件光栅化（dress-up 等大量静止帧的主要收益来源）。
+// 完备性原则：多含一项只导致多余重绘（安全），漏一项可能导致陈旧画面（危险）。
+// 因此凡进入 renderFrameWithItems 任一分支且影响输出的输入都必须进指纹：
+//   * 背景色、frameSize（根矩阵）、targetW/H（setupSurface 全部输入）；
+//   * runtimeStage 整棵树：每个节点经 renderDisplayObject/Impl 的全部读取面
+//     （rastercache::contentFingerprint 覆盖自身内容项，世界变换由祖先节点的
+//     变换项经 parent 递推隐含——祖先变了世界必变），外加 children/mask/
+//     filters（contentFingerprint 非递归，须显式补齐）；
+//   * AVM1 遗留分支（runtimeStage 为空时才渲染）的 items 递归；
+//   * frameIndex：当且仅当它确实被消费。消费点（逐一核对）：
+//       - 遗留 Sprite：idx = frameIndex - birthFrame / childFrame = frameIndex；
+//       - 遗留 Video：upper_bound(frameIndex + 1)；
+//       - 运行时节点：renderDisplayObjectImpl 的 fIdx 规则——仅
+//         characterId && !timelineBuilt 且非"带正播放头 MovieClip"的节点
+//         用根帧号取帧（MovieClip 用自身 currentFrame，已进内容指纹）；
+//       - clipDepth 遮罩组不读 frameIndex；mask 子树继承宿主 frameIndex，
+//         由同一规则经 mask 节点自身的 characterId/timelineBuilt/kind 判定。
+//     过度包含（consumed 误判为真）只是每帧重绘、安全；漏判才会陈旧，
+//     故判定按"最宽"口径。
+namespace {
+
+constexpr std::uint64_t kFNV64 = 1469598103934665603ull;
+constexpr std::uint64_t kFNVPrime = 1099511628211ull;
+
+// SWF_FP_DBG 诊断：逐 tick 保存运行时树节点快照（内容指纹 + 身份字段），
+// 指纹变化时输出"新增/消失/内容变化"的节点明细，定位 0% 跳过率的来源
+// （节点指针每帧重建？frameIndex 被消费？还是真实动画）。
+struct FpDbg {
+    struct Snap { std::uint64_t fp = 0; std::uint16_t cid = 0; int kind = 0; int curFrame = 0; bool built = false; };
+    std::map<const fvm::DisplayObject*, Snap> prev, cur;
+    bool on = false;
+    int n = 0;
+    long long stable = 0;   // 连续"树逐节点完全相同"的 tick 数
+    std::uint64_t lastH = 0; bool haveH = false; long long hChanged = 0;
+    FpDbg() { const char* v = std::getenv("SWF_FP_DBG"); on = v && v[0] != '0' && v[0] != '\0'; }
+};
+FpDbg g_fpdbg;
+
+inline void sfp(std::uint64_t& h, std::uint64_t v) { h ^= v; h *= kFNVPrime; }
+inline void sfp32(std::uint64_t& h, std::uint32_t v) { h ^= v; h *= kFNVPrime; }
+inline void sfdbl(std::uint64_t& h, double v) {
+    std::uint64_t b; std::memcpy(&b, &v, 8); sfp(h, b);
+}
+inline void sfptr(std::uint64_t& h, const void* p) {
+    const auto* b = reinterpret_cast<const std::uint8_t*>(&p);
+    for (int i = 0; i < static_cast<int>(sizeof(p)); ++i) { h ^= b[i]; h *= kFNVPrime; }
+}
+inline void sfstr(std::uint64_t& h, const std::string& s) {
+    for (char ch : s) { h ^= static_cast<std::uint8_t>(ch); h *= kFNVPrime; }
+    h ^= 0xFFu; h *= kFNVPrime;   // 与 rastercache::fstr 一致：定界，避免前缀歧义
+}
+
+void sfpFilter(std::uint64_t& h, const Filter& f) {
+    sfp32(h, static_cast<std::uint32_t>(f.kind));
+    sfp(h, static_cast<std::uint64_t>(f.color.r) << 24 | static_cast<std::uint64_t>(f.color.g) << 16 |
+          static_cast<std::uint64_t>(f.color.b) << 8 | f.color.a);
+    sfp(h, static_cast<std::uint64_t>(f.highlight.r) << 24 | static_cast<std::uint64_t>(f.highlight.g) << 16 |
+          static_cast<std::uint64_t>(f.highlight.b) << 8 | f.highlight.a);
+    float v;
+    std::memcpy(&v, &f.blurX, 4); sfp32(h, *reinterpret_cast<std::uint32_t*>(&v));
+    std::memcpy(&v, &f.blurY, 4); sfp32(h, *reinterpret_cast<std::uint32_t*>(&v));
+    std::memcpy(&v, &f.angle, 4); sfp32(h, *reinterpret_cast<std::uint32_t*>(&v));
+    std::memcpy(&v, &f.distance, 4); sfp32(h, *reinterpret_cast<std::uint32_t*>(&v));
+    std::memcpy(&v, &f.strength, 4); sfp32(h, *reinterpret_cast<std::uint32_t*>(&v));
+    sfp32(h, static_cast<std::uint32_t>(f.inner) | (static_cast<std::uint32_t>(f.knockout) << 1) |
+            (static_cast<std::uint32_t>(f.onTop) << 2) | (static_cast<std::uint32_t>(f.passes) << 3));
+    sfp32(h, static_cast<std::uint32_t>(f.gradientColors.size()));
+    for (const auto& c : f.gradientColors)
+        sfp(h, static_cast<std::uint64_t>(c.r) << 24 | static_cast<std::uint64_t>(c.g) << 16 |
+              static_cast<std::uint64_t>(c.b) << 8 | c.a);
+    sfp32(h, static_cast<std::uint32_t>(f.gradientRatios.size()));
+    for (auto r : f.gradientRatios) sfp32(h, r);
+    sfp32(h, f.gradientType);
+    sfp32(h, static_cast<std::uint32_t>(f.convMatrix.size()));
+    for (float cf : f.convMatrix) {
+        std::memcpy(&v, &cf, 4); sfp32(h, *reinterpret_cast<std::uint32_t*>(&v));
+    }
+    sfp32(h, static_cast<std::uint32_t>(f.convW) | (static_cast<std::uint32_t>(f.convH) << 12));
+    std::memcpy(&v, &f.convDivisor, 4); sfp32(h, *reinterpret_cast<std::uint32_t*>(&v));
+    std::memcpy(&v, &f.convBias, 4); sfp32(h, *reinterpret_cast<std::uint32_t*>(&v));
+    sfp(h, static_cast<std::uint64_t>(f.convColor.r) << 24 | static_cast<std::uint64_t>(f.convColor.g) << 16 |
+          static_cast<std::uint64_t>(f.convColor.b) << 8 | f.convColor.a);
+    sfp32(h, static_cast<std::uint32_t>(f.convClamp) | (static_cast<std::uint32_t>(f.convPreserveAlpha) << 1));
+    for (float cm : f.colorMatrix) {
+        std::memcpy(&v, &cm, 4); sfp32(h, *reinterpret_cast<std::uint32_t*>(&v));
+    }
+}
+
+void sfpLegacyItem(std::uint64_t& h, const DisplayItem& it) {
+    sfp32(h, it.depth);
+    sfptr(h, it.character.get());
+    sfp32(h, it.characterId);
+    // 静态 matrix 或运行时覆盖（hasRt 时 matrix 不参与，rt* 接管）
+    sfdbl(h, it.matrix.sx); sfdbl(h, it.matrix.sy); sfdbl(h, it.matrix.r0);
+    sfdbl(h, it.matrix.r1); sfdbl(h, it.matrix.tx); sfdbl(h, it.matrix.ty);
+    sfp32(h, static_cast<std::uint32_t>(it.cxform.hasMult) | (static_cast<std::uint32_t>(it.cxform.hasAdd) << 1));
+    sfdbl(h, it.cxform.mr); sfdbl(h, it.cxform.mg); sfdbl(h, it.cxform.mb); sfdbl(h, it.cxform.ma);
+    sfdbl(h, it.cxform.ar); sfdbl(h, it.cxform.ag); sfdbl(h, it.cxform.ab); sfdbl(h, it.cxform.aa);
+    sfp32(h, it.clipDepth);
+    sfp32(h, static_cast<std::uint32_t>(it.birthFrame));
+    float rb; std::memcpy(&rb, &it.ratio, 4);
+    sfp32(h, *reinterpret_cast<std::uint32_t*>(&rb));
+    sfp32(h, static_cast<std::uint64_t>(it.blend) & 0xFFFFFFFFu);
+    sfp32(h, static_cast<std::uint32_t>(it.hasMask));
+    sfp32(h, static_cast<std::uint32_t>(it.filters.size()));
+    for (const auto& f : it.filters) sfpFilter(h, f);
+    sfstr(h, it.name);
+    sfp32(h, static_cast<std::uint32_t>(it.clipInited));
+    sfptr(h, it.clipVars.get());
+    sfp32(h, static_cast<unsigned>(it.buttonState));
+    sfp32(h, static_cast<std::uint32_t>(it.hasRt));
+    sfdbl(h, it.rtX); sfdbl(h, it.rtY); sfdbl(h, it.rtScaleX); sfdbl(h, it.rtScaleY);
+    sfdbl(h, it.rtRotation); sfdbl(h, it.rtAlpha);
+    sfp32(h, static_cast<std::uint32_t>(it.rtVisible));
+    sfp32(h, static_cast<unsigned>(it.rtFrame));
+    sfp32(h, static_cast<std::uint32_t>(it.rtPlaying));
+    sfp32(h, static_cast<std::uint32_t>(it.hasTextOverride));
+    sfstr(h, it.textOverride);
+    sfp32(h, static_cast<std::uint32_t>(it.spInit) | (static_cast<std::uint32_t>(it.spStopped) << 1));
+    sfp32(h, static_cast<std::uint32_t>(it.dynamic));
+    sfstr(h, it.maskName);
+    sfp32(h, static_cast<std::uint32_t>(it.maskSource));
+    sfp32(h, static_cast<std::uint32_t>(it.children.size()));
+    for (const auto& c : it.children) sfpLegacyItem(h, c);
+}
+
+// 运行时节点：contentFingerprint 覆盖 renderDisplayObjectImpl 自身内容的全部读取面
+// （变换/alpha/cx/visible/buttonState/ratio/timelineBuilt/currentFrame/graphics/文本/blend）。
+// 这里补齐其非递归部分：children、mask、filters，并登记 frameIndex 消费。
+// 早退守卫（!visible / clipDepth>0 / isAlphaMaskShape）只影响"画不画"，不影响
+// "输入集"：画与不画的分支由已哈希字段（visible/clipDepth/characterId）决定，
+// 同输入同分支，无需额外项。
+void sfpRuntimeNode(std::uint64_t& h, const std::shared_ptr<fvm::DisplayObject>& d,
+                    bool& consumed) {
+    if (!d) return;
+    sfptr(h, d.get());
+    h = rastercache::contentFingerprint(*d);
+    if (g_fpdbg.on) {
+        FpDbg::Snap s;
+        s.fp = h; s.cid = d->characterId; s.kind = static_cast<int>(d->kind);
+        s.curFrame = d->currentFrame; s.built = d->timelineBuilt;
+        g_fpdbg.cur[d.get()] = s;
+    }
+    // fIdx 规则：characterId && !timelineBuilt 且非"带正播放头 MovieClip"的节点
+    // 按根帧号取帧（renderDisplayObjectImpl L3497-3499）。宽口径：mask 子树
+    // 同样继承根帧号，经其自身字段走同一判定。
+    if (d->characterId && !d->timelineBuilt &&
+        !(d->kind == fvm::ObjKind::MovieClip && d->currentFrame > 0))
+        consumed = true;
+    sfp32(h, static_cast<std::uint32_t>(d->children.size()));
+    // AS3 mask：宿主画完按遮罩 alpha 裁剪；遮罩形状自身不绘制、由
+    // renderDisplayObjectImpl(d->mask, ...) 以 root frameIndex 绘制，故其
+    // 整棵子树（含字符帧选择）都是渲染输入。
+    if (d->mask) {
+        sfptr(h, d->mask.get());
+        sfpRuntimeNode(h, d->mask, consumed);
+    }
+    if (d->filters) {
+        sfp32(h, static_cast<std::uint32_t>(d->filters->size()));
+        for (const auto& f : *d->filters) sfpFilter(h, f);
+    }
+    for (const auto& c : d->children) sfpRuntimeNode(h, c, consumed);
+}
+
+}  // namespace
+
+std::uint64_t sceneFingerprint(const Movie& movie, const std::vector<DisplayItem>& legacyItems,
+                               int frameIndex, int targetW, int targetH) {
+    if (g_fpdbg.on) g_fpdbg.cur.clear();
+    std::uint64_t h = kFNV64;
+    sfp(h, static_cast<std::uint64_t>(movie.backgroundColor.r) << 24 |
+          static_cast<std::uint64_t>(movie.backgroundColor.g) << 16 |
+          static_cast<std::uint64_t>(movie.backgroundColor.b) << 8 |
+          movie.backgroundColor.a);
+    sfdbl(h, static_cast<double>(movie.frameSize.x0)); sfdbl(h, static_cast<double>(movie.frameSize.y0));
+    sfdbl(h, static_cast<double>(movie.frameSize.x1)); sfdbl(h, static_cast<double>(movie.frameSize.y1));
+    sfp32(h, static_cast<std::uint32_t>(targetW));
+    sfp32(h, static_cast<std::uint32_t>(targetH));
+
+    bool consumed = false;
+    if (movie.runtimeStage.empty()) {
+        // AVM1 遗留路径：renderItemsWithClip(items, ...)。Sprite 的
+        // idx = frameIndex - birthFrame / childFrame = frameIndex 与 Video 的
+        // upper_bound(frameIndex + 1) 恒消费根帧号。
+        // runtimeStage 非空时 items 被渲染器整体忽略（renderFrameWithItems
+        // L3811 门控），但 Player 每 tick 仍会重建它——此时不得参与指纹，
+        // 否则指纹每帧必变、跳过率归零。
+        if (!legacyItems.empty()) {
+            consumed = true;
+            sfp32(h, static_cast<std::uint32_t>(legacyItems.size()));
+            for (const auto& it : legacyItems) sfpLegacyItem(h, it);
+        }
+    } else {
+        sfp32(h, static_cast<std::uint32_t>(movie.runtimeStage.size()));
+        for (const auto& r : movie.runtimeStage) sfpRuntimeNode(h, r, consumed);
+    }
+    sfp32(h, static_cast<std::uint32_t>(consumed));
+    if (consumed) sfp32(h, static_cast<unsigned>(frameIndex));
+    if (g_fpdbg.on) {
+        ++g_fpdbg.n;
+        int added = 0, gone = 0, changed = 0;
+        for (const auto& kv : g_fpdbg.cur) {
+            auto it = g_fpdbg.prev.find(kv.first);
+            if (it == g_fpdbg.prev.end()) ++added;
+            else if (it->second.fp != kv.second.fp) ++changed;
+        }
+        for (const auto& kv : g_fpdbg.prev)
+            if (!g_fpdbg.cur.count(kv.first)) ++gone;
+        const bool identical = (g_fpdbg.n > 1) && added == 0 && gone == 0 && changed == 0;
+        g_fpdbg.stable = identical ? g_fpdbg.stable + 1 : 0;
+        if (g_fpdbg.n == 2)
+            std::fprintf(stderr, "[fpdbg] init nodes=%zu consumed=%d\n",
+                         g_fpdbg.cur.size(), (int)consumed);
+        const bool hSame = g_fpdbg.haveH && h == g_fpdbg.lastH;
+        if (!hSame) ++g_fpdbg.hChanged;
+        g_fpdbg.lastH = h; g_fpdbg.haveH = true;
+        if (g_fpdbg.n % 24 == 0) {
+            std::fprintf(stderr,
+                         "[fpdbg] t=%d nodes=%zu hSame=%d added=%d gone=%d changed=%d consumed=%d hchanged=%lld\n",
+                         g_fpdbg.n, g_fpdbg.cur.size(), (int)hSame, added, gone, changed,
+                         (int)consumed, g_fpdbg.hChanged);
+            int shown = 0;
+            for (const auto& kv : g_fpdbg.cur) {
+                if (shown >= 12) break;
+                auto it = g_fpdbg.prev.find(kv.first);
+                if (it == g_fpdbg.prev.end()) {
+                    std::fprintf(stderr, "  +new ptr=%p cid=%u kind=%d cf=%d built=%d\n",
+                                 (const void*)kv.first, (unsigned)kv.second.cid, kv.second.kind,
+                                 kv.second.curFrame, (int)kv.second.built);
+                    ++shown;
+                } else if (it->second.fp != kv.second.fp) {
+                    std::fprintf(stderr, "  ~chg ptr=%p cid=%u kind=%d cf=%d->%d built=%d->%d\n",
+                                 (const void*)kv.first, (unsigned)kv.second.cid, kv.second.kind,
+                                 it->second.curFrame, kv.second.curFrame, (int)it->second.built,
+                                 (int)kv.second.built);
+                    ++shown;
+                }
+            }
+            for (const auto& kv : g_fpdbg.prev) {
+                if (shown >= 12) break;
+                if (!g_fpdbg.cur.count(kv.first)) {
+                    std::fprintf(stderr, "  -gone ptr=%p cid=%u\n", (const void*)kv.first,
+                                 (unsigned)kv.second.cid);
+                    ++shown;
+                }
+            }
+        }
+        g_fpdbg.prev.swap(g_fpdbg.cur);
+    }
+    return h;
+}
 
 // 渲染单个 AVM2 运行时显示对象（含其子树）到 RGBA 缓冲。公开入口（测试/内嵌使用）：
 // Graphics 命令回放、运行时文本与子树递归均在匿名命名空间的 renderDisplayObject 中完成。

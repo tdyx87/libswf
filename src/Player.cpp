@@ -538,9 +538,47 @@ void Player::tick() {
 
 bool Player::render(std::vector<std::uint8_t>& rgba, int& W, int& H,
                     int targetW, int targetH) {
+    // 必须在重算指纹**之前**同步：syncTextFields 会改写遗留文本框的 textOverride，
+    // 它是渲染输入的一部分（哈希要覆盖"即将渲染"的状态而非旧状态）。
     syncTextFields();
-    return renderFrameWithItems(movie_, curItems_, frame_ - 1, rgba, W, H,
-                                targetW, targetH);
+    // 静态帧跳过：renderFrameWithItems 的输出是输入集的确定性函数（同输入必同
+    // 像素），指纹与上一帧相同且尺寸一致时直接复用旧缓冲。跳过的代价是一次
+    // ~4MB memcpy（<1ms），相对整帧光栅化（~60ms）可忽略。
+    // SWF_SCENE_SKIP=0 可整体关闭（排障/像素对比用；此游戏整场景永不静止，
+    // 跳过率实测 0%，开关对性能无影响）。
+    static bool skipEnabled = [] {
+        const char* v = std::getenv("SWF_SCENE_SKIP");
+        return !v || !(v[0] == '0');
+    }();
+    const std::uint64_t fp = skipEnabled
+        ? sceneFingerprint(movie_, curItems_, frame_ - 1, targetW, targetH) : 0;
+    if (skipEnabled) {
+        ++sceneFpCalls_;
+        if (haveSceneFp_ && fp == lastSceneFp_ && lastW_ > 0) {
+        ++sceneFpSkips_;
+        lastRasterized_ = false;
+        rgba = lastRgba_;
+        W = lastW_;
+        H = lastH_;
+        static bool dbgOn = [] { const char* v = std::getenv("SWF_SCENE_HASH");
+                                 return v && v[0] != '0' && v[0] != '\0'; }();
+        if (dbgOn && (sceneFpSkips_ % 100 == 1 || sceneFpSkips_ == 1))
+            std::fprintf(stderr, "[skip] frame=%d skips=%llu calls=%llu rate=%.1f%% fp=%016llx\n",
+                         frame_, (unsigned long long)sceneFpSkips_, (unsigned long long)sceneFpCalls_,
+                         100.0 * (double)sceneFpSkips_ / (double)sceneFpCalls_,
+                         (unsigned long long)fp);
+        return true;
+    }
+    }   // skipEnabled
+    if (!renderFrameWithItems(movie_, curItems_, frame_ - 1, rgba, W, H, targetW, targetH))
+        return false;
+    lastRgba_ = rgba;
+    lastW_ = W;
+    lastH_ = H;
+    lastSceneFp_ = fp;
+    haveSceneFp_ = true;
+    lastRasterized_ = true;
+    return true;
 }
 
 void Player::play() {

@@ -53,6 +53,12 @@ public:
     // 传 0 或不传则输出舞台原生尺寸（CLI 导出 PNG / 像素断言）。
     bool render(std::vector<std::uint8_t>& rgba, int& W, int& H,
                 int targetW = 0, int targetH = 0);
+    // 静态帧跳过统计（窗口 FPS 叠加/日志用）：render 调用总数与复用旧缓冲的次数。
+    std::size_t sceneCalls() const { return sceneFpCalls_; }
+    std::size_t sceneSkips() const { return sceneFpSkips_; }
+    // 上一次 render 是否真正光栅化（false = 指纹命中、复用旧缓冲）。
+    // 窗口端用它决定是否需要重刷客户区（跳过的帧无需 InvalidateRect）。
+    bool lastRenderRasterized() const { return lastRasterized_; }
 
     void setMouse(double x, double y); void mouseDown(); void mouseUp(); void keyDown(int vk); void keyUp(int vk);
 
@@ -82,6 +88,16 @@ private:
     AudioOut audio_;
     bool playing_ = true;
     int frame_ = 1;
+    // 静态帧跳过（sceneFingerprint）：渲染输出是输入集的确定性函数，指纹与上一
+    // 帧相同且尺寸一致时直接复用 lastRgba_，省掉整帧软件光栅化。尺寸必须参与
+    // 比较：recordFrame/maybeAutoSave 以原生尺寸 (0,0) 渲染，与窗口目标尺寸产生
+    // 不同指纹，不会互相误复用。
+    std::uint64_t lastSceneFp_ = 0;
+    bool haveSceneFp_ = false;
+    std::vector<std::uint8_t> lastRgba_;
+    int lastW_ = 0, lastH_ = 0;
+    std::uint64_t sceneFpCalls_ = 0, sceneFpSkips_ = 0;
+    bool lastRasterized_ = false;
     int stageW_ = 550, stageH_ = 400;
     double mouseX_ = 0, mouseY_ = 0;
     bool mouseDown_ = false;

@@ -57,4 +57,15 @@ void renderRuntimeObject(const std::shared_ptr<fvm::DisplayObject>& d, const Mat
                          const Movie& movie, std::uint8_t* buf, int W, int H,
                          int frameIndex, float alpha = 1.0f);
 
+// 静态帧跳过：计算"渲染输入集"的指纹。renderFrameWithItems 的输出是该输入集的
+// 确定性函数（同输入必同像素），因此 Player::render 在指纹与上一帧相同时可安全
+// 复用旧缓冲，省掉整帧软件光栅化。
+// 覆盖：backgroundColor、frameSize（根矩阵）、targetW/H、runtimeStage 整棵树
+// （逐节点内容项 + 子节点/mask/filters 指针）、以及 frameIndex 当且仅当它确实
+// 被渲染器消费（与 renderDisplayObjectImpl 的 fIdx 规则一致：运行时树中仅
+// !timelineBuilt 且非"带正播放头 MovieClip"的节点按根帧号取帧；AVM1 遗留分支
+// 的 Sprite/Video 帧选择恒依赖根帧号）。
+std::uint64_t sceneFingerprint(const Movie& movie, const std::vector<DisplayItem>& legacyItems,
+                               int frameIndex, int targetW, int targetH);
+
 }  // namespace swf
