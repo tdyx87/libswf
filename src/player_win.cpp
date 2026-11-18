@@ -48,9 +48,16 @@ volatile long long g_fps = 0;   // 心跳窗口内实际 fps（wall 口径，非
 double g_wallMs = 0, g_cpuMs = 0, g_rastMs = 0;  // ms/帧：wall / (tick+栅格化) / 栅格化
 LARGE_INTEGER g_hbT0{};
 long long g_hbTicks = 0, g_hbTickUs = 0, g_hbRenderUs = 0;
-bool g_needRast = true;             // 初始/窗口尺寸变化 → 强制按新视口栅格化
+bool g_needRast = true;             // 初始强制首帧光栅化
 int g_clientW = 0, g_clientH = 0;   // 客户区尺寸（WM_SIZE/WM_PAINT 维护）
 int g_bgraW = 0, g_bgraH = 0, g_bgraOx = 0, g_bgraOy = 0;   // 最近一次视口
+// 光栅化固定按舞台原生分辨率（g_stageW×g_stageH），与 Flash Player 一致：
+// Flash 的 Show All 也是按影片分辨率渲染、显示端缩放。此前光栅化尺寸随窗口
+// 视口走——窗口大于原生分辨率时软件光栅化像素量平方级增长（1080p 窗口下
+// 1720×1032 ≈ 1.8× 像素 → 单帧 ~120ms → 窗口路径普遍 8-9fps，而 headless
+// 原生 1280×768 实测 13.9fps）。现固定原生光栅化，GDI StretchDIBits 负责
+// 显示端缩放（CPU 成本 ~1-2ms，GDI 内部优化）。
+int g_rastW = 0, g_rastH = 0;
 FILE* g_log = nullptr; // 独立文件句柄：FreeConsole 后 stdout 写入不可靠，诊断走此句柄
 std::string g_title;
 
@@ -174,11 +181,14 @@ long long rasterizeFrame() {
     LARGE_INTEGER f, t0, t1;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&t0);
+    // 光栅化尺寸 = 舞台原生分辨率（不随窗口变化）；显示视口另算，用于
+    // blit 定位/缩放与鼠标映射（两者必须走同一 stageViewport，保持对齐）。
     int vw = 0, vh = 0, ox = 0, oy = 0;
     stageViewport(g_clientW, g_clientH, vw, vh, ox, oy);
     g_bgraW = vw; g_bgraH = vh; g_bgraOx = ox; g_bgraOy = oy;
+    g_rastW = g_stageW; g_rastH = g_stageH;
     int w = 0, h = 0;
-    if (!g_player.render(g_rgba, w, h, vw, vh) || w <= 0 || h <= 0) {
+    if (!g_player.render(g_rgba, w, h, g_rastW, g_rastH) || w <= 0 || h <= 0) {
         LARGE_INTEGER t1;
         QueryPerformanceCounter(&t1);
         return (t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart;   // 渲染失败也返回耗时
@@ -198,23 +208,25 @@ long long rasterizeFrame() {
     return (t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart;
 }
 
-// WM_PAINT 专用：把最近一次光栅化结果 1:1 贴到 DC（不再包含光栅化本身），
+// WM_PAINT 专用：把最近一次光栅化结果贴到 DC（不再包含光栅化本身），
 // 并在左上角叠加 FPS/耗时读数。跳过的帧可以完全不调用 InvalidateRect，
 // 故本函数只在真正有新像素或需要刷新叠加文字时执行。
+// 源 = 舞台原生分辨率（g_rastW×g_rastH，固定），目标 = 窗口视口
+// （g_bgraW×g_bgraH，随窗口缩放）：光栅化成本与窗口大小解耦，
+// 显示端缩放交给 GDI StretchDIBits（~1-2ms）。
 void blitFrame(HDC hdc, int cw, int ch) {
-    if (g_bgra.empty() || g_bgraW <= 0) return;
+    if (g_bgra.empty() || g_bgraW <= 0 || g_rastW <= 0) return;
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = g_bgraW;
-    bi.bmiHeader.biHeight = -g_bgraH;   // 负值 = top-down，与 RGBA 行序一致
+    bi.bmiHeader.biWidth = g_rastW;
+    bi.bmiHeader.biHeight = -g_rastH;   // 负值 = top-down，与 RGBA 行序一致
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
     RECT rc{0, 0, cw, ch};
     FillRect(hdc, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));  // letterbox
-    // 源与目标尺寸一致：1:1 贴图，不做任何插值/拉伸。
     StretchDIBits(hdc, g_bgraOx, g_bgraOy, g_bgraW, g_bgraH, 0, 0,
-                  g_bgraW, g_bgraH, g_bgra.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+                  g_rastW, g_rastH, g_bgra.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
     // FPS 叠加（主循环心跳每 24 tick 刷新一次 g_fps/g_wallMs 等，这里只读取）：
     // 左上角黑底白字，SYSTEM_FIXED_FONT（GDI 内置，无需字体加载）。
     HFONT oldFont = (HFONT)SelectObject(hdc, GetStockObject(SYSTEM_FIXED_FONT));
@@ -270,7 +282,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp != SIZE_MINIMIZED) {
                 g_clientW = LOWORD(lp) > 0 ? LOWORD(lp) : 1;
                 g_clientH = HIWORD(lp) > 0 ? HIWORD(lp) : 1;
-                g_needRast = true;    // 视口变化 → 按新尺寸重新光栅化
+                // 光栅化尺寸固定为舞台原生分辨率，resize 只需刷新视口几何
+                // （rasterizeFrame 内重算，指纹相同 → 走跳过路径 ~1ms）+ 重绘。
+                g_needRast = true;
             }
             return 0;
 
