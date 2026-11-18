@@ -1743,9 +1743,24 @@ struct ScratchBuf {
 // 把单个显示列表项（shape / bitmap / sprite / morph / text / edittext / button）渲染进 buf。
 // alpha：累积的对象级透明度；bm：混合模式（运行时 DisplayObject.blend / PlaceObject3 blend）。
 // 运行时覆盖（AVM1 SetProperty / EditText 输入）：item.hasRt 时以 rt* 字段合成矩阵/透明度。
+namespace filtercache {
+// applyFilters 内一次合成调用的完整快照（滤镜子树缓存 miss 时按序存入、hit 时
+// 重放）。定义置于 applyFilters 之前（capture 直接写入）；头部注释在下方
+// filtercache 块。
+struct Composite {
+    int op = 0;              // 0 = compositeOverRect，1 = compositeColorA
+    int x0 = 0, y0 = 0, sw = 0, sh = 0;
+    std::vector<std::uint8_t> pix;   // op0：窗口 RGBA（blur/build 后）；op1：alpha 平面
+    unsigned char cr = 0, cg = 0, cb = 0, ca = 0;   // op1：滤镜颜色
+    float strength = 0.0f;           // op1
+};
+}  // namespace filtercache
+// capture（可空）：滤镜子树缓存的 miss 路径传入——记录每次合成调用的输入快照，
+// 命中时用相同函数/顺序/参数重放（见 filtercache 头部注释）。
 static void applyFilters(const std::vector<Filter>& filters, std::vector<std::uint8_t>& layer,
                          std::uint8_t* buf, int W, int H, std::size_t npix,
-                         int* outRowY0 = nullptr, int* outRowY1 = nullptr);
+                         int* outRowY0 = nullptr, int* outRowY1 = nullptr,
+                         std::vector<filtercache::Composite>* capture = nullptr);
 //
 // s_rtClockMode：AVM2 运行时显示树的"整段角色静态绘制"路径置位。
 // 回退分支里的 spInit/spStopped 是 AVM1 Player 运行态字段；AVM2 路径每帧新建 di，
@@ -1816,6 +1831,11 @@ void renderItemInto(const DisplayItem& item, const Matrix& root,
             if (!sub->filters.empty()) {
                 rperf::Timer tmr(0);
                 const std::size_t npf = static_cast<std::size_t>(W) * H;
+                // 滤镜子树缓存**不适用**于此路径（实测，2026-11）：按钮记录挂滤镜的
+                // 按钮普遍内嵌逐帧动画（p5 扫光 / 悬停脉冲），内容真实地每帧变化，
+                // DisplayItem 键无法跨帧命中（512MB 上限实验 hits 不随容量提升，
+                // miss 风暴反致 render +5.4s）。要消除这 20.5s 只能降低单次重算
+                // 成本——方案 B 的 GPU 高斯模糊。此路径保持基线原样。
                 ScratchBuf layer(npf * 4, W * 4);
                 renderItemInto(*sub, world, dict, layer.data(), W, H, frameIndex, alpha, bm, cx);
                 int ry0 = 0, ry1 = -1;
@@ -2345,8 +2365,18 @@ static void buildGradientGlow(const std::uint8_t* layer, std::uint8_t* out, int 
 // 都要整幅前缀和（实测播放从 ~15ms/帧 恶化到数百 ms/帧）。
 static void applyFilters(const std::vector<Filter>& filters, std::vector<std::uint8_t>& layer,
                          std::uint8_t* buf, int W, int H, std::size_t npix,
-                         int* outRowY0, int* outRowY1) {
-    if (filters.empty()) { compositeOver(layer.data(), buf, npix); return; }
+                         int* outRowY0, int* outRowY1,
+                         std::vector<filtercache::Composite>* capture) {
+    if (filters.empty()) {
+        compositeOver(layer.data(), buf, npix);
+        if (capture) {   // 无滤镜的调用方（嵌套/静态路径）同样可缓存：整层即输入
+            filtercache::Composite c;
+            c.op = 0; c.x0 = 0; c.y0 = 0; c.sw = W; c.sh = H;
+            c.pix.assign(layer.begin(), layer.end());
+            capture->push_back(std::move(c));
+        }
+        return;
+    }
     // 1) 内容包围盒 + 恒色判定（单遍融合）：
     //    先用 u64 alpha 掩码快速定位非空行；再在非空行内逐字解码，一次同时得到
     //    x 范围与非零 alpha 像素的 RGB min/max（供 Blur 恒色快路用），避免多次全扫。
@@ -2484,11 +2514,25 @@ static void applyFilters(const std::vector<Filter>& filters, std::vector<std::ui
                 buildShadowA(s.data(), glowA.data(), sw, sh, offx, offy);   // 仅取(偏移)源 alpha
                 blurPlane(glowA.data(), sw, sh, bs.sx, bs.sy, bs.quality);
                 compositeColorA(glowA.data(), f.color, str, buf, W, x0, y0, sw, sh);
+                if (capture) {
+                    filtercache::Composite c;
+                    c.op = 1; c.x0 = x0; c.y0 = y0; c.sw = sw; c.sh = sh;
+                    c.cr = f.color.r; c.cg = f.color.g; c.cb = f.color.b; c.ca = f.color.a;
+                    c.strength = str;
+                    c.pix.assign(glowA.begin(), glowA.end());
+                    capture->push_back(std::move(c));
+                }
             } else {
                 glow.assign(snpix * 4, 0);
                 buildShadow(s.data(), glow.data(), sw, sh, f.color, offx, offy, str);
                 blurBuffer(glow.data(), sw, sh, bs.sx, bs.sy, bs.quality);
                 compositeOverRect(glow.data(), buf, W, x0, y0, sw, sh);   // 阴影衬底先合成（在对象之后）
+                if (capture) {
+                    filtercache::Composite c;
+                    c.op = 0; c.x0 = x0; c.y0 = y0; c.sw = sw; c.sh = sh;
+                    c.pix.assign(glow.begin(), glow.end());
+                    capture->push_back(std::move(c));
+                }
             }
         } else if (f.kind == FilterKind::ColorMatrix) {
             applyColorMatrix(s, f.colorMatrix);       // s 即窗口全尺寸，原位修改
@@ -2507,6 +2551,16 @@ static void applyFilters(const std::vector<Filter>& filters, std::vector<std::ui
             blurBuffer(hi.data(), sw, sh, bs.sx, bs.sy, bs.quality);
             compositeOverRect(sh1.data(), buf, W, x0, y0, sw, sh);
             compositeOverRect(hi.data(), buf, W, x0, y0, sw, sh);
+            if (capture) {
+                filtercache::Composite a;
+                a.op = 0; a.x0 = x0; a.y0 = y0; a.sw = sw; a.sh = sh;
+                a.pix.assign(sh1.begin(), sh1.end());
+                capture->push_back(std::move(a));
+                filtercache::Composite b;
+                b.op = 0; b.x0 = x0; b.y0 = y0; b.sw = sw; b.sh = sh;
+                b.pix.assign(hi.begin(), hi.end());
+                capture->push_back(std::move(b));
+            }
         } else if (f.kind == FilterKind::GradientGlow || f.kind == FilterKind::GradientBevel) {
             double rad = f.angle * 3.141592653589793 / 180.0;
             int offx = static_cast<int>(f.distance / 20.0 * std::cos(rad));
@@ -2520,12 +2574,30 @@ static void applyFilters(const std::vector<Filter>& filters, std::vector<std::ui
                 buildGradientGlow(s.data(), g2.data(), sw, sh, f, -offx, -offy);
                 blurBuffer(g2.data(), sw, sh, bs.sx, bs.sy, bs.quality);
                 compositeOverRect(g2.data(), buf, W, x0, y0, sw, sh);
+                if (capture) {
+                    filtercache::Composite g2c;
+                    g2c.op = 0; g2c.x0 = x0; g2c.y0 = y0; g2c.sw = sw; g2c.sh = sh;
+                    g2c.pix.assign(g2.begin(), g2.end());
+                    capture->push_back(std::move(g2c));
+                }
             }
             blurBuffer(g.data(), sw, sh, bs.sx, bs.sy, bs.quality);
             compositeOverRect(g.data(), buf, W, x0, y0, sw, sh);
+            if (capture) {
+                filtercache::Composite gc;
+                gc.op = 0; gc.x0 = x0; gc.y0 = y0; gc.sw = sw; gc.sh = sh;
+                gc.pix.assign(g.begin(), g.end());
+                capture->push_back(std::move(gc));
+            }
         }
     }
     compositeOverRect(s.data(), buf, W, x0, y0, sw, sh);   // 对象本体最后合成
+    if (capture) {
+        filtercache::Composite c;
+        c.op = 0; c.x0 = x0; c.y0 = y0; c.sw = sw; c.sh = sh;
+        c.pix.assign(s.begin(), s.end());
+        capture->push_back(std::move(c));
+    }
 }
 
 // 渲染一组显示列表项；遇到 clipDepth 图层时，把其 depth+1..clipDepth 范围内的子项
@@ -2612,6 +2684,7 @@ void renderItemsWithClip(const std::vector<DisplayItem>& items, const Matrix& ro
             if (it.character) {
                 if (!it.filters.empty()) {
                     // 带滤镜：先渲染到离屏层，应用滤镜（投影/模糊/辉光），再合成回主缓冲
+                    // （DisplayItem 级滤镜子树缓存实测不适用——同按钮路径注释。）
                     rperf::Timer tmr(1);
                     ScratchBuf layer(npix * 4, W * 4);
                     renderItemInto(it, root, dict, layer.data(), W, H, frameIndex, alpha, it.blend, inheritedCx);
@@ -3089,6 +3162,140 @@ static ObjProfAtexit g_objprofAtexit;
 // 后代必须重栅格化（它们在动，无法避免）。
 //
 // 缓存内容 = 节点自身内容（角色 + AS3 Graphics + 动态文本，**不含子节点**）
+// ============================================================================
+// 滤镜子树缓存（方案 A 主项）：带滤镜的显示对象把"整棵子树离屏栅格 + 滤镜核"
+// 整段缓存，命中时跳过模糊/阴影/发光的全部重算（实测占渲染 28s/96s ≈ 29%，
+// 其中 btnFilt 21.1s 全是按钮上逐帧重复的高斯模糊）。
+//
+// 正确性 = 逐位等价的构造性保证（不依赖"误差 ≤1LSB"类论证）：
+//  miss 时把 applyFilters 内部每个合成调用（compositeOverRect / compositeColorA）
+//  的**精确输入**（blur/build 后的小缓冲快照 + 完整参数）按序存入条目；
+//  hit 时用与 miss 帧完全相同的函数、相同顺序、相同参数重放这些调用到当前 buf。
+//  Porter-Duff over 对 buf 的作用是逐像素独立的：fresh 帧里它作用在当帧 buf 上，
+//  replay 帧里它作用在该帧 buf 上——两侧源像素与运算序列逐位一致，输出逐位一致。
+//  唯一前提：子树输入（离屏层内容 + 滤镜参数 + 缓冲尺寸）没变，这正是缓存键。
+//
+// 与逐节点 rastercache 的区别（为何那个失败、这个成立）：rastercache 命中后
+//  需要把整块内容 over 进 buf，命中区像素密集（面板/按钮底色），合成成本 ≈
+//  重画成本（实测净亏 5-20%）。滤镜输出是**稀疏**的（对象本体 + 光晕/阴影，
+//  bbox 内大量 alpha=0 像素直接 continue），重算却要跑整个高斯核
+//  （O(npix·passes·r)）——计算成本 ≫ 合成成本，缓存净赚。
+//
+// 键 = (节点指针, 子树内容指纹, world 6 浮点, 有效 alpha, 累积 cxform 8 浮点,
+//       滤镜序列指纹, W, H)。子树指纹与场景指纹 sceneFingerprint 的
+//  sfpRuntimeNode 规则完全同构：节点自身 contentFingerprint + children 递归 +
+//  mask 子树（mask 经宿主离屏路径参与滤镜输入）+ frameIndex 条件消费
+//  （characterId && !timelineBuilt 且非带正播放头 MovieClip ⇒ 消费根帧号，
+//  与 renderDisplayObjectImpl 的 fIdx 规则一致；mask 子树继承宿主 frameIndex）。
+//  指纹不含"父节点之下"的内容——滤镜只作用于自身子树，兄弟节点无关。
+//
+// 保守排除（排除只是少缓存，不影响正确性）：
+//  - 子树内任何节点带 AS3 mask（其裁剪结果依赖宿主离屏路径与帧号，不缓存）；
+//  - 子树内任何节点 blend != Normal（混合进透明层捕获与直接混合不等价）；
+//  - 节点自身 blend != Normal（同上，且滤镜后合成也走非 Normal）；
+//  - 节点自身或子树带 filters 的节点之外……不，嵌套滤镜的**输入**仍是纯子树
+//    渲染结果，applyFilters 对它线性（blur/矩阵/卷积只读输入）——可缓存；
+//  - Video 角色节点（帧解码期才落定，键无法感知）；
+//  - g_maskExcluded 引用的节点（renderDisplayObject 入口已 return，到不了这里）。
+//
+// 实测（1600 步 dress-up 基准，2026-11，tag-plan-a）：
+//  - AVM2 节点级缓存（本实现）：hits=2222（80.8%）render 94.77→90.84s（−4.3%，
+//    2.55ms/帧），像素 A/B 0/1600 逐位一致。净收益有限的原因：本游戏带
+//    AVM2 d->filters 的节点仅 ~1.9 个/帧且多为小窗口。
+//  - DisplayItem 级扩展（静态路径 / 按钮记录路径，曾实现后**回退**）：按钮
+//    普遍内嵌逐帧动画（p5 扫光 / 悬停脉冲），内容真实地每帧变化 ⇒ 键无法跨帧
+//    命中（512MB/4096 条上限实验：hits 不随容量提升，miss 风暴 + LRU 抖动，
+//    render 反 +5.4s）。btnFilt 20.5s（渲染最大单项）属此类，CPU 缓存原理性
+//    无解——消除它只能降低单次重算成本（方案 B 的 GPU 高斯模糊）。
+//
+// 开关：SWF_FILTER_CACHE 未设/"0"/"off"/"no" 关闭，其余非空值开启。
+//       上限 SWF_FCACHE_ENTRIES（默认 256）/ SWF_FCACHE_MB（默认 64）。
+namespace filtercache {
+// struct Composite 定义在 applyFilters 之前（capture 直接写入；完整注释见其头部）。
+
+struct Ent {
+    std::vector<Composite> ops;
+    long long last = 0;
+};
+
+// node = 滤镜宿主 DisplayObject*（AVM2 运行时节点，跨帧稳定）。
+struct Key {
+    const fvm::DisplayObject* node = nullptr;
+    std::uint64_t subtree = 0;       // 子树内容指纹（递归）
+    std::uint64_t filters = 0;       // 滤镜序列指纹
+    float w0 = 0, w1 = 0, w2 = 0, w3 = 0, w4 = 0, w5 = 0;
+    float alpha = 0;
+    float cx0 = 0, cx1 = 0, cx2 = 0, cx3 = 0, cx4 = 0, cx5 = 0, cx6 = 0, cx7 = 0;
+    int W = 0, H = 0;
+    bool operator==(const Key& o) const {
+        return node == o.node && subtree == o.subtree && filters == o.filters &&
+                w0 == o.w0 && w1 == o.w1 && w2 == o.w2 && w3 == o.w3 &&
+                w4 == o.w4 && w5 == o.w5 && alpha == o.alpha &&
+                cx0 == o.cx0 && cx1 == o.cx1 && cx2 == o.cx2 && cx3 == o.cx3 &&
+                cx4 == o.cx4 && cx5 == o.cx5 && cx6 == o.cx6 && cx7 == o.cx7 &&
+                W == o.W && H == o.H;
+    }
+};
+std::size_t keyHash(const Key& k) {
+    static_assert(sizeof(Key) % 4 == 0, "Key 须可整体按 u32 哈希");
+    const auto* w = reinterpret_cast<const std::uint32_t*>(&k);
+    std::uint64_t h = 1469598103934665603ull;
+    for (std::size_t i = 0; i < sizeof(Key) / 4; ++i) {
+        h ^= static_cast<std::uint64_t>(w[i]);
+        h *= 1099511628211ull;
+    }
+    return static_cast<std::size_t>(h);
+}
+struct KeyHash { std::size_t operator()(const Key& k) const { return keyHash(k); } };
+
+std::unordered_map<Key, Ent, KeyHash> g_map;
+long long g_tickN = 0;
+long long g_bytes = 0;
+long long hits_ = 0, misses_ = 0, evictions_ = 0, skipMask_ = 0, skipBlend_ = 0, skipVideo_ = 0;
+
+std::size_t kEntryCap() {
+    static std::size_t v = [] {
+        const char* e = std::getenv("SWF_FCACHE_ENTRIES");
+        if (e && *e) { long n = std::atol(e); if (n > 0) return static_cast<std::size_t>(n); }
+        return static_cast<std::size_t>(256);
+    }();
+    return v;
+}
+std::size_t kByteCap() {
+    static std::size_t v = [] {
+        const char* e = std::getenv("SWF_FCACHE_MB");
+        if (e && *e) { long n = std::atol(e); if (n > 0) return static_cast<std::size_t>(n) * 1024u * 1024u; }
+        return static_cast<std::size_t>(64u) * 1024u * 1024u;
+    }();
+    return v;
+}
+// 开关：**默认 ON**（tag-plan-a 起）。依据：1600 步基准 render 94.77→90.84s
+// （−4.3%）且像素 A/B 0/1600 逐位一致（构造性重放，无误差容差项）。
+// SWF_FILTER_CACHE="0"/"off"/"no" 回退基线（其余非空值 = ON）。
+const bool* enabled() {
+    static bool e = [] {
+        const char* v = std::getenv("SWF_FILTER_CACHE");
+        if (!v || !*v) return true;
+        return std::strncmp(v, "0", 1) != 0 && std::strcmp(v, "off") != 0 &&
+               std::strcmp(v, "no") != 0;
+    }();
+    return &e;
+}
+void report() {
+    if (!*enabled()) return;
+    std::fprintf(stderr, "[fcache] hits=%lld misses=%lld evict=%lld entries=%zu bytes=%lld "
+                         "skip(mask=%lld blend=%lld video=%lld)\n",
+                 hits_, misses_, evictions_, g_map.size(), g_bytes,
+                 skipMask_, skipBlend_, skipVideo_);
+}
+struct CacheAtexit { CacheAtexit() { std::atexit(report); } };
+static const CacheAtexit g_fcAtexit;   // 进程退出时打印 [fcache] 统计
+}  // namespace filtercache
+
+// AS3 运行时遮罩状态（声明上移至此供滤镜子树指纹使用；注释见下方"AS3 运行时
+// 遮罩状态"段）。s_inMaskPass：正在把遮罩对象渲染进裁剪缓冲。
+static thread_local bool s_inMaskPass = false;
+
 // 栅格化进一张全帧透明层后裁剪出的紧致包围盒 RGBA（无背景）。
 // 命中 = 用与 plot() 完全相同的 Porter-Duff Normal over 把包围盒合成回主缓冲
 // （over 满足结合律：先画在透明层再合成 == 直接画在主缓冲，浮点/取整误差 ≤1 LSB）。
@@ -3424,6 +3631,170 @@ void finishMiss(const Key& k, const std::uint8_t* layer, int W, int H,
 }
 }  // namespace rastercache
 
+// 全局作用域声明：g_maskExcluded 在本文件更下方定义，fcMaskExcluded 也定义于
+// 该处（全局）；filtercache 内的子树指纹经此调用。
+bool fcMaskExcluded(const fvm::DisplayObject* p);
+
+// ---- 滤镜子树缓存实现（声明见上方 filtercache 命名空间头部注释）----
+namespace filtercache {
+namespace {
+constexpr std::uint64_t kFNV64Fc = 1469598103934665603ull;
+constexpr std::uint64_t kFNVPrimeFc = 1099511628211ull;
+inline void fcFNV(std::uint64_t& h, std::uint64_t v) { h ^= v; h *= kFNVPrimeFc; }
+inline void fcFNV32(std::uint64_t& h, std::uint32_t v) { h ^= v; h *= kFNVPrimeFc; }
+inline void fcFNVd(std::uint64_t& h, double v) {
+    std::uint64_t b; std::memcpy(&b, &v, 8); fcFNV(h, b);
+}
+inline void fcFNVf(std::uint64_t& h, float v) {
+    std::uint32_t b; std::memcpy(&b, &v, 4); fcFNV32(h, b);
+}
+inline void fcFNVstr(std::uint64_t& h, const std::string& s) {
+    for (char ch : s) { h ^= static_cast<std::uint8_t>(ch); h *= kFNVPrimeFc; }
+    h ^= 0xFFu; h *= kFNVPrimeFc;
+}
+inline void fcFNVptr(std::uint64_t& h, const void* p) {
+    const auto* b = reinterpret_cast<const std::uint8_t*>(&p);
+    for (int i = 0; i < static_cast<int>(sizeof(p)); ++i) { h ^= b[i]; h *= kFNVPrimeFc; }
+}
+}  // namespace
+
+// 单滤镜序列指纹（Filter 的全部可变字段，口径与场景指纹 sfpFilter 一致）。
+void fcFpFilter(std::uint64_t& h, const Filter& f) {
+    fcFNV32(h, static_cast<std::uint32_t>(f.kind));
+    fcFNV(h, static_cast<std::uint64_t>(f.color.r) << 24 |
+             static_cast<std::uint64_t>(f.color.g) << 16 |
+             static_cast<std::uint64_t>(f.color.b) << 8 | f.color.a);
+    fcFNV(h, static_cast<std::uint64_t>(f.highlight.r) << 24 |
+             static_cast<std::uint64_t>(f.highlight.g) << 16 |
+             static_cast<std::uint64_t>(f.highlight.b) << 8 | f.highlight.a);
+    fcFNVf(h, f.blurX); fcFNVf(h, f.blurY); fcFNVf(h, f.angle);
+    fcFNVf(h, f.distance); fcFNVf(h, f.strength);
+    fcFNV32(h, static_cast<std::uint32_t>(f.inner) | (static_cast<std::uint32_t>(f.knockout) << 1) |
+             (static_cast<std::uint32_t>(f.onTop) << 2) | (static_cast<std::uint32_t>(f.passes) << 3));
+    fcFNV32(h, static_cast<std::uint32_t>(f.gradientColors.size()));
+    for (const auto& c : f.gradientColors)
+        fcFNV(h, static_cast<std::uint64_t>(c.r) << 24 | static_cast<std::uint64_t>(c.g) << 16 |
+                static_cast<std::uint64_t>(c.b) << 8 | c.a);
+    fcFNV32(h, static_cast<std::uint32_t>(f.gradientRatios.size()));
+    for (auto r : f.gradientRatios) fcFNV32(h, static_cast<std::uint32_t>(r));
+    fcFNV32(h, f.gradientType);
+    fcFNV32(h, static_cast<std::uint32_t>(f.convMatrix.size()));
+    for (float cf : f.convMatrix) fcFNVf(h, cf);
+    fcFNV32(h, static_cast<std::uint32_t>(f.convW) | (static_cast<std::uint32_t>(f.convH) << 12));
+    fcFNVf(h, f.convDivisor); fcFNVf(h, f.convBias);
+    fcFNV(h, static_cast<std::uint64_t>(f.convColor.r) << 24 | static_cast<std::uint64_t>(f.convColor.g) << 16 |
+             static_cast<std::uint64_t>(f.convColor.b) << 8 | f.convColor.a);
+    fcFNV32(h, static_cast<std::uint32_t>(f.convClamp) | (static_cast<std::uint32_t>(f.convPreserveAlpha) << 1));
+    for (float cm : f.colorMatrix) fcFNVf(h, cm);
+}
+void fcFpFilters(std::uint64_t& h, const std::vector<Filter>& fs) {
+    fcFNV32(h, static_cast<std::uint32_t>(fs.size()));
+    for (const auto& f : fs) fcFpFilter(h, f);
+}
+
+// 子树内容指纹：与 sceneFingerprint 的 sfpRuntimeNode 规则同构（节点自身
+// contentFingerprint + children 递归 + mask 子树继承宿主 frameIndex +
+// characterId&&!timelineBuilt 且非带正播放头 MovieClip ⇒ consumed 根帧号）。
+// 不含父节点之下内容——滤镜只作用于自身子树。
+// fcMaskExcluded 前向声明在全局作用域（g_maskExcluded 定义在文件下方）。
+void fcFpNode(std::uint64_t& h, const std::shared_ptr<fvm::DisplayObject>& d, bool& consumed) {
+    if (!d) { fcFNV32(h, 0); return; }
+    fcFNVptr(h, d.get());
+    if (fcMaskExcluded(d.get())) fcFNV32(h, 1);   // 节点自身被某对象引用为遮罩 ⇒ 子树渲染语义变化
+    fcFNV(h, rastercache::contentFingerprint(*d));
+    // contentFingerprint 不含 clipDepth（它不在节点内容里，但会跳过子节点渲染
+    // ——renderDisplayObjectImpl L3487：clipDepth>0 时子节点不画）。同一子树结构下
+    // 某节点 clipDepth 从 0 变 >0 会使滤镜输入变化，必须显式进指纹。
+    fcFNV32(h, static_cast<std::uint32_t>(d->clipDepth));
+    if (d->characterId && !d->timelineBuilt &&
+        !(d->kind == fvm::ObjKind::MovieClip && d->currentFrame > 0))
+        consumed = true;
+    fcFNV32(h, static_cast<std::uint32_t>(d->children.size()));
+    if (d->mask) { fcFNVptr(h, d->mask.get()); fcFpNode(h, d->mask, consumed); }
+    if (d->filters) fcFpFilters(h, *d->filters);
+    for (const auto& c : d->children) fcFpNode(h, c, consumed);
+}
+std::uint64_t fcSubtreeFp(const std::shared_ptr<fvm::DisplayObject>& d, int frameIndex) {
+    std::uint64_t h = kFNV64Fc;
+    bool consumed = false;
+    fcFpNode(h, d, consumed);
+    fcFNV32(h, static_cast<std::uint32_t>(consumed));
+    if (consumed) fcFNV32(h, static_cast<unsigned>(frameIndex));
+    // s_inMaskPass（isAlphaMaskShape 跳过开关的上下文位）：renderDisplayObjectImpl
+    // 的早退条件含 !s_inMaskPass——同一节点在"作遮罩渲染"与"正常渲染"两种上下文的
+    // 输出不同。滤镜子树只经 renderDisplayObject 普通分支到达（s_inMaskPass=false），
+    // 恒等 false；仍显式入指纹以防调用上下文演化。
+    fcFNV32(h, static_cast<std::uint32_t>(s_inMaskPass));
+    return h;
+}
+
+// 保守资格检查：返回 false = 不缓存（走原路径，不影响正确性）。
+bool fcEligible(const std::shared_ptr<fvm::DisplayObject>& d, const Movie& movie) {
+    if (!d || !d->filters || d->filters->empty()) return false;
+    if (d->mask) { ++filtercache::skipMask_; return false; }   // 宿主 AS3 遮罩路径整体排除
+    if (d->blend != BlendMode::Normal) { ++filtercache::skipBlend_; return false; }
+    std::vector<const fvm::DisplayObject*> stack{d.get()};
+    while (!stack.empty()) {
+        const fvm::DisplayObject* c = stack.back(); stack.pop_back();
+        if (!c) continue;
+        if (c->mask) { ++filtercache::skipMask_; return false; }   // 子树内 AS3 遮罩：不缓存
+        if (c->blend != BlendMode::Normal) { ++filtercache::skipBlend_; return false; }
+        if (c->characterId && !c->timelineBuilt) {
+            auto it = movie.characters.find(c->characterId);
+            if (it != movie.characters.end() && it->second &&
+                it->second->kind == Character::Kind::Video) {
+                ++filtercache::skipVideo_; return false;   // 视频帧解码期落定
+            }
+        }
+        for (const auto& ch : c->children) stack.push_back(ch.get());
+        if (c->mask) stack.push_back(c->mask.get());
+    }
+    return true;
+}
+
+// 探测：命中 → 按与 miss 帧完全相同的函数/顺序/参数重放合成序列到 buf，返回 true。
+bool fcBegin(const Key& k, std::uint8_t* buf) {
+    auto it = g_map.find(k);
+    if (it == g_map.end()) { ++misses_; return false; }
+    Ent& e = it->second;
+    e.last = ++g_tickN;
+    ++hits_;
+    for (const Composite& c : e.ops) {
+        if (c.op == 0)
+            compositeOverRect(c.pix.data(), buf, k.W, c.x0, c.y0, c.sw, c.sh);
+        else
+            compositeColorA(c.pix.data(), Color{c.cr, c.cg, c.cb, c.ca}, c.strength,
+                            buf, k.W, c.x0, c.y0, c.sw, c.sh);
+    }
+    return true;
+}
+
+// 未命中收尾：入表（LRU 淘汰）并合成回主缓冲。
+void fcFinishMiss(const Key& k, std::vector<Composite>& ops, std::uint8_t* buf) {
+    if (ops.empty()) {   // 空内容：滤镜输出为空，不入表（下帧重算成本极低）
+        return;
+    }
+    long long bytes = 0;
+    for (const Composite& c : ops) bytes += static_cast<long long>(c.pix.size());
+    Ent e;
+    e.ops = std::move(ops);
+    e.last = ++g_tickN;
+    while (g_map.size() >= kEntryCap() ||
+           g_bytes + bytes > static_cast<long long>(kByteCap())) {
+        auto victim = g_map.begin();
+        long long oldest = victim->second.last;
+        for (auto it = std::next(victim); it != g_map.end(); ++it)
+            if (it->second.last < oldest) { oldest = it->second.last; victim = it; }
+        for (const Composite& c : victim->second.ops)
+            g_bytes -= static_cast<long long>(c.pix.size());
+        g_map.erase(victim);
+        ++evictions_;
+    }
+    g_bytes += bytes;
+    g_map.emplace(k, std::move(e));
+}
+}  // namespace filtercache
+
 // RAII 作用域计时：SWF_OBJ_PROF 未设置时仅一次 getenv 缓存判断，近零开销。
 struct ObjProfScope {
     std::uint32_t cid;
@@ -3444,9 +3815,8 @@ struct ObjProfScope {
 };
 
 // ---- AS3 运行时遮罩状态（详见 renderDisplayObject 注释）----
-// s_inMaskPass：正在把遮罩对象渲染进裁剪缓冲；此时不得跳过全黑 alpha 渐变形状。
+// s_inMaskPass 声明已上移至 filtercache 头块之后（滤镜子树指纹需要它）。
 // g_maskExcluded：被任何 d->mask 引用的对象集合——它们自身不绘制、不可命中。
-static thread_local bool s_inMaskPass = false;
 static std::set<const fvm::DisplayObject*> g_maskExcluded;
 
 static void addMaskExclusions(const std::shared_ptr<fvm::DisplayObject>& d) {
@@ -3457,6 +3827,12 @@ static void addMaskExclusions(const std::shared_ptr<fvm::DisplayObject>& d) {
 static void buildMaskExclusions(const std::vector<std::shared_ptr<fvm::DisplayObject>>& roots) {
     g_maskExcluded.clear();
     for (const auto& r : roots) addMaskExclusions(r);
+}
+
+// 滤镜子树缓存：节点是否在本帧被排除（作为某对象的 AS3 遮罩）。
+// 定义在此（g_maskExcluded 之后），满足 filtercache 段的前向声明。
+bool fcMaskExcluded(const fvm::DisplayObject* p) {
+    return g_maskExcluded.count(p) > 0;
 }
 
 // AVM2 运行时显示列表（AS3 构建的场景）的渲染。
@@ -3689,6 +4065,50 @@ void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Mat
     if (d->filters && !d->filters->empty()) {
         rperf::Timer tmr(2);
         const std::size_t npix = static_cast<std::size_t>(W) * H;
+
+        // ---- 滤镜子树缓存：子树内容/滤镜/变换/缓冲尺寸不变 ⇒ 重放合成序列 ----
+        // 命中时逐位等于当帧 fresh 计算（源快照 + 相同函数 + 相同顺序，见
+        // filtercache 头部正确性论证）。不满足资格的子树（含 AS3 遮罩/非 Normal
+        // 混合/Video）返回 false 走原路径，输出不受开关影响。
+        if (*filtercache::enabled() && filtercache::fcEligible(d, movie)) {
+            const Matrix world = parent.post(displayLocalMatrix(*d));
+            const float effA = alpha * static_cast<float>(d->alpha);
+            // 有效 ColorTransform 与 Impl 的构建方式逐字段一致（ancestry post own）
+            ColorTransform cx2;
+            {
+                ColorTransform own;
+                own.hasMult = true; own.hasAdd = true;
+                own.mr = static_cast<float>(d->cxMr); own.mg = static_cast<float>(d->cxMg);
+                own.mb = static_cast<float>(d->cxMb); own.ma = 1.0f;
+                own.ar = static_cast<float>(d->cxAr); own.ag = static_cast<float>(d->cxAg);
+                own.ab = static_cast<float>(d->cxAb); own.aa = 0.0f;
+                cx2 = inheritedCx.post(own);
+            }
+            filtercache::Key k;
+            k.node = d.get();
+            k.subtree = filtercache::fcSubtreeFp(d, frameIndex);
+            std::uint64_t fh = 1469598103934665603ull;
+            filtercache::fcFpFilters(fh, *d->filters);
+            k.filters = fh;
+            k.w0 = world.sx; k.w1 = world.r0; k.w2 = world.r1;
+            k.w3 = world.sy; k.w4 = world.tx; k.w5 = world.ty;
+            k.alpha = effA;
+            k.cx0 = cx2.mr; k.cx1 = cx2.mg; k.cx2 = cx2.mb; k.cx3 = cx2.ma;
+            k.cx4 = cx2.ar; k.cx5 = cx2.ag; k.cx6 = cx2.ab; k.cx7 = cx2.aa;
+            k.W = W; k.H = H;
+            if (filtercache::fcBegin(k, buf)) return;
+            // ---- miss：原路径 + 捕获合成序列 ----
+            std::vector<filtercache::Composite> cap;
+            ScratchBuf layer(npix * 4, W * 4);
+            renderDisplayObjectImpl(d, parent, movie, layer.data(), W, H,
+                                    frameIndex, alpha, inheritedCx);
+            int ry0 = 0, ry1 = -1;
+            applyFilters(*d->filters, layer.vec(), buf, W, H, npix, &ry0, &ry1, &cap);
+            layer.noteRows(ry0, ry1);
+            filtercache::fcFinishMiss(k, cap, buf);   // 未命中且非空才入表（内部处理）
+            return;
+        }
+
         ScratchBuf layer(npix * 4, W * 4);
         renderDisplayObjectImpl(d, parent, movie, layer.data(), W, H,
                                 frameIndex, alpha, inheritedCx);
