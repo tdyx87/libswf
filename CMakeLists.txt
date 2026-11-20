@@ -62,6 +62,7 @@ add_library(swf_render
     src/MovieClipCommands.cpp
     src/Decoder.cpp
     src/Render.cpp
+    src/GpuBlur.cpp
     src/Abc.cpp
     src/Avm2Opcodes.cpp
     src/Fvm.cpp
@@ -87,7 +88,7 @@ endif()
 # 音频实时播放（仅 Windows 用系统 waveOut）；跨平台导出走 WAV 文件。
 # 注意：Media Foundation 已被 FFmpeg 取代，不再链接 mf* 系列库。
 if(WIN32)
-    target_link_libraries(swf_render PUBLIC winmm)
+    target_link_libraries(swf_render PUBLIC winmm d3d11 d3dcompiler)
 endif()
 
 # ---- FFmpeg 跨平台音视频解码后端（替代 Windows-only 的 Media Foundation）----
@@ -275,6 +276,15 @@ if(MSVC)
     target_compile_definitions(test_filter2 PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 add_test(NAME swfparser_filter2 COMMAND test_filter2)
+
+# 方案 B GPU 模糊（D3D11）vs CPU 参照逐位测试
+add_executable(test_gpublur tests/test_gpublur.cpp)
+target_link_libraries(test_gpublur PRIVATE swf_render)
+if(MSVC)
+    target_compile_options(test_gpublur PRIVATE /W3 /utf-8)
+    target_compile_definitions(test_gpublur PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+add_test(NAME swfparser_gpublur COMMAND test_gpublur)
 
 # ScreenVideo(codec 3) 解码测试
 add_executable(test_screenvideo tests/test_screenvideo.cpp)

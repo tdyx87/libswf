@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "swf/Decoder.hpp"
+#include "swf/GpuBlur.hpp"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -1630,7 +1631,7 @@ void renderItemsWithClip(const std::vector<DisplayItem>& items, const Matrix& ro
 
 // —— 渲染热点分段时间计测（SWF_RENDER_PERF=1 时启用，进程退出打印）——
 namespace rperf {
-double g_sec[6] = {0, 0, 0, 0, 0, 0};   // 0=按钮滤镜 1=静态滤镜 2=运行时滤镜 3=遮罩 4=模糊 5=包围盒扫描
+double g_sec[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // 0=按钮滤镜 1=静态滤镜 2=运行时滤镜 3=遮罩 4=模糊(RGBA) 5=包围盒扫描 6=模糊(单通道平面) 7=GPU模糊(H/V+读写回)
 double g_aux[4] = {0, 0, 0, 0};          // 0=滤镜调用次数 1=窗口像素累计 2=最大窗口 3=核功累计
 double g_winKind[8] = {0,0,0,0,0,0,0,0}; // 各 FilterKind 累计窗口像素（DropShadow..ColorMatrix）
 double g_kindPx[8] = {0,0,0,0,0,0,0,0};  // [4]=最大半径 [5]=Σ半径 [6]=Σpasses [7]=最大passes
@@ -1639,10 +1640,10 @@ struct Reporter {
         std::atexit([] {
             if (!std::getenv("SWF_RENDER_PERF")) return;
             std::fprintf(stderr,
-                         "[rperf] btnFilt=%.2fs statFilt=%.2fs rtFilt=%.2fs mask=%.2fs blur=%.2fs bbox=%.2fs\n"
+                         "[rperf] btnFilt=%.2fs statFilt=%.2fs rtFilt=%.2fs mask=%.2fs blur=%.2fs bbox=%.2fs plane=%.2fs gpuBlur=%.2fs\n"
                          "[rperf] calls=%.0f winPx_sum=%.0f winPx_max=%.0f winPx_kind[DS,Blur,Glow,Bevel,GG,GB,Cnv,CM]=%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f\n"
                          "[rperf] radius: max=%.0f sum=%.0f | passes: max=%.0f sum=%.0f\n",
-                         g_sec[0], g_sec[1], g_sec[2], g_sec[3], g_sec[4], g_sec[5],
+                         g_sec[0], g_sec[1], g_sec[2], g_sec[3], g_sec[4], g_sec[5], g_sec[6], g_sec[7],
                          g_aux[0], g_aux[1], g_aux[2],
                          g_winKind[0], g_winKind[1], g_winKind[2], g_winKind[3],
                          g_winKind[4], g_winKind[5], g_winKind[6], g_winKind[7],
@@ -2027,6 +2028,19 @@ static std::vector<float> gaussianKernel(float sigma) {
     return k;
 }
 
+// 方案 B GPU 快路尝试：把两趟卷积交给 GPU（严格浮点，逐位复现目标），
+// 计时槽 7（gpuBlur）。失败（未初始化/尺寸<阈值/驱动错误）返回 false →
+// 调用方执行原 CPU 路径，输出不受影响。
+// SWF_GPUBLUR_STAT=1：调用方在 CPU 回退段累计同构直方图（与 GpuBlur 的 bin
+// 对齐），用于确定 GPU 有净收益的 min_px 交叉点。
+static bool gpublurTry(std::uint8_t* buf, int W, int H,
+                       const std::vector<float>& kx, const std::vector<float>& ky,
+                       bool plane) {
+    rperf::Timer tmr(7);
+    return plane ? gpublur::blurPlane(buf, W, H, kx, ky)
+                 : gpublur::blurRgba(buf, W, H, kx, ky);
+}
+
 // 可分离高斯模糊（RGBA，预乘空间）。sx/sy = 标准差 σ（像素），quality = 逼近迭代次数。
 // 规范 §2.2 方差守恒：n 趟 σ/√n 高斯叠加 = 一趟 σ 高斯（高斯卷积可结合、方差相加
 // n·(σ²/n)=σ²）。因本实现用**真高斯核**而非盒核，多趟迭代在数学上与单趟 σ 等价，
@@ -2071,42 +2085,50 @@ static void blurBufferCore(std::uint8_t* buf, int W, int H, float sx, float sy, 
     const int ry = static_cast<int>(ky.size()) / 2;
     tmpBuf.assign(static_cast<std::size_t>(sw) * sh * 4, 0);
     std::uint8_t* tmp = tmpBuf.data();
-    // 水平：work -> tmp
-    if (rx >= 1) {
-        for (int y = 0; y < sh; ++y) {
-            const std::uint8_t* row = &work[static_cast<std::size_t>(y) * sw * 4];
-            std::uint8_t* o = &tmp[static_cast<std::size_t>(y) * sw * 4];
-            for (int x = 0; x < sw; ++x) {
-                float acc[4] = {0,0,0,0};
-                for (int i = -rx; i <= rx; ++i) {
-                    const int xx = std::min(sw-1, std::max(0, x+i));
-                    const float kv = kx[static_cast<std::size_t>(i+rx)];
-                    const std::uint8_t* s = &row[xx*4];
-                    for (int c=0;c<4;++c) acc[c]+=s[c]*kv;
-                }
-                for (int c=0;c<4;++c) o[x*4+c]=clampU8(static_cast<int>(acc[c]+0.5f));
-            }
-        }
+    // 水平/垂直：work -> tmp -> work。
+    // 方案 B：GPU 做两趟卷积（A→B→A），成功后 tmp 恒为有效副本、work 即结果；
+    // 失败则 tmp 为 work 原样副本，下方 CPU 路径（原样）接管。
+    if (gpublurTry(work, sw, sh, kx, ky, false)) {
+        std::memcpy(tmp, work, static_cast<std::size_t>(sw) * sh * 4);
     } else {
-        std::memcpy(tmp, work, static_cast<std::size_t>(sw)*sh*4);
-    }
-    // 垂直：tmp -> work
-    if (ry >= 1) {
-        for (int y = 0; y < sh; ++y) {
-            std::uint8_t* o = &work[static_cast<std::size_t>(y) * sw * 4];
-            for (int x = 0; x < sw; ++x) {
-                float acc[4] = {0,0,0,0};
-                for (int j = -ry; j <= ry; ++j) {
-                    const int yy = std::min(sh-1, std::max(0, y+j));
-                    const float kv = ky[static_cast<std::size_t>(j+ry)];
-                    const std::uint8_t* s = &tmp[(static_cast<std::size_t>(yy)*sw+x)*4];
-                    for (int c=0;c<4;++c) acc[c]+=s[c]*kv;
+        // CPU 回退（原样路径）
+        // 水平：work -> tmp
+        if (rx >= 1) {
+            for (int y = 0; y < sh; ++y) {
+                const std::uint8_t* row = &work[static_cast<std::size_t>(y) * sw * 4];
+                std::uint8_t* o = &tmp[static_cast<std::size_t>(y) * sw * 4];
+                for (int x = 0; x < sw; ++x) {
+                    float acc[4] = {0,0,0,0};
+                    for (int i = -rx; i <= rx; ++i) {
+                        const int xx = std::min(sw-1, std::max(0, x+i));
+                        const float kv = kx[static_cast<std::size_t>(i+rx)];
+                        const std::uint8_t* s = &row[xx*4];
+                        for (int c=0;c<4;++c) acc[c]+=s[c]*kv;
+                    }
+                    for (int c=0;c<4;++c) o[x*4+c]=clampU8(static_cast<int>(acc[c]+0.5f));
                 }
-                for (int c=0;c<4;++c) o[x*4+c]=clampU8(static_cast<int>(acc[c]+0.5f));
             }
+        } else {
+            std::memcpy(tmp, work, static_cast<std::size_t>(sw)*sh*4);
         }
-    } else {
-        std::memcpy(work, tmp, static_cast<std::size_t>(sw)*sh*4);
+        // 垂直：tmp -> work
+        if (ry >= 1) {
+            for (int y = 0; y < sh; ++y) {
+                std::uint8_t* o = &work[static_cast<std::size_t>(y) * sw * 4];
+                for (int x = 0; x < sw; ++x) {
+                    float acc[4] = {0,0,0,0};
+                    for (int j = -ry; j <= ry; ++j) {
+                        const int yy = std::min(sh-1, std::max(0, y+j));
+                        const float kv = ky[static_cast<std::size_t>(j+ry)];
+                        const std::uint8_t* s = &tmp[(static_cast<std::size_t>(yy)*sw+x)*4];
+                        for (int c=0;c<4;++c) acc[c]+=s[c]*kv;
+                    }
+                    for (int c=0;c<4;++c) o[x*4+c]=clampU8(static_cast<int>(acc[c]+0.5f));
+                }
+            }
+        } else {
+            std::memcpy(work, tmp, static_cast<std::size_t>(sw)*sh*4);
+        }
     }
     // —— 升采样（双线性，规范④）——
     if (d > 1) {
@@ -2202,6 +2224,7 @@ static void buildShadowA(const std::uint8_t* layer, std::uint8_t* plane, int W, 
 static void blurPlane(std::uint8_t* p, int W, int H, float sx, float sy, int quality) {
     if (sx < 0.01f && sy < 0.01f) return;
     (void)quality;
+    rperf::Timer tmr(6);
     int d = 1;
     const float smax = std::max(sx, sy);
     if (smax >= 16.0f) d = 4; else if (smax >= 4.0f) d = 2;
@@ -2225,33 +2248,38 @@ static void blurPlane(std::uint8_t* p, int W, int H, float sx, float sy, int qua
     const int rx = static_cast<int>(kx.size()) / 2;
     const int ry = static_cast<int>(ky.size()) / 2;
     tmpA.assign(static_cast<std::size_t>(sw) * sh, 0);
-    if (rx >= 1) {
-        for (int y = 0; y < sh; ++y) {
-            const std::uint8_t* row = &work[static_cast<std::size_t>(y) * sw];
-            std::uint8_t* o = &tmpA[static_cast<std::size_t>(y) * sw];
-            for (int x = 0; x < sw; ++x) {
-                float acc = 0.0f;
-                for (int i = -rx; i <= rx; ++i) {
-                    const int xx = std::min(sw-1, std::max(0, x+i));
-                    acc += row[xx] * kx[static_cast<std::size_t>(i+rx)];
+    if (gpublurTry(work, sw, sh, kx, ky, true)) {
+        std::memcpy(tmpA.data(), work, static_cast<std::size_t>(sw) * sh);
+    } else {
+        // CPU 回退（原样路径）
+        if (rx >= 1) {
+            for (int y = 0; y < sh; ++y) {
+                const std::uint8_t* row = &work[static_cast<std::size_t>(y) * sw];
+                std::uint8_t* o = &tmpA[static_cast<std::size_t>(y) * sw];
+                for (int x = 0; x < sw; ++x) {
+                    float acc = 0.0f;
+                    for (int i = -rx; i <= rx; ++i) {
+                        const int xx = std::min(sw-1, std::max(0, x+i));
+                        acc += row[xx] * kx[static_cast<std::size_t>(i+rx)];
+                    }
+                    o[x] = clampU8(static_cast<int>(acc + 0.5f));
                 }
-                o[x] = clampU8(static_cast<int>(acc + 0.5f));
             }
-        }
-    } else { std::memcpy(tmpA.data(), work, static_cast<std::size_t>(sw)*sh); }
-    if (ry >= 1) {
-        for (int y = 0; y < sh; ++y) {
-            std::uint8_t* o = &work[static_cast<std::size_t>(y) * sw];
-            for (int x = 0; x < sw; ++x) {
-                float acc = 0.0f;
-                for (int j = -ry; j <= ry; ++j) {
-                    const int yy = std::min(sh-1, std::max(0, y+j));
-                    acc += tmpA[static_cast<std::size_t>(yy)*sw+x] * ky[static_cast<std::size_t>(j+ry)];
+        } else { std::memcpy(tmpA.data(), work, static_cast<std::size_t>(sw)*sh); }
+        if (ry >= 1) {
+            for (int y = 0; y < sh; ++y) {
+                std::uint8_t* o = &work[static_cast<std::size_t>(y) * sw];
+                for (int x = 0; x < sw; ++x) {
+                    float acc = 0.0f;
+                    for (int j = -ry; j <= ry; ++j) {
+                        const int yy = std::min(sh-1, std::max(0, y+j));
+                        acc += tmpA[static_cast<std::size_t>(yy)*sw+x] * ky[static_cast<std::size_t>(j+ry)];
+                    }
+                    o[x] = clampU8(static_cast<int>(acc + 0.5f));
                 }
-                o[x] = clampU8(static_cast<int>(acc + 0.5f));
             }
-        }
-    } else { std::memcpy(work, tmpA.data(), static_cast<std::size_t>(sw)*sh); }
+        } else { std::memcpy(work, tmpA.data(), static_cast<std::size_t>(sw)*sh); }
+    }
     if (d > 1) {
         const float fx = static_cast<float>(sw-1)/static_cast<float>(std::max(1,W-1));
         const float fy = static_cast<float>(sh-1)/static_cast<float>(std::max(1,H-1));
