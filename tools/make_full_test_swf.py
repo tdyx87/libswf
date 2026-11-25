@@ -227,6 +227,9 @@ header += rect(0, 0, 4000, 3000)
 header += struct.pack("<H", 0x0C00)   # 12 fps
 header += struct.pack("<H", 2)         # frameCount=2
 
-with open("testswf/full_test.swf", "wb") as f:
-    f.write(header + body)
-print("wrote testswf/full_test.swf, %d bytes" % (len(header) + len(body)))
+# 只在直接运行时写文件：其他生成脚本会 import 本模块复用辅助函数，
+# 导入时顺带重写 full_test.swf 会造成意外的副作用。
+if __name__ == "__main__":
+    with open("testswf/full_test.swf", "wb") as f:
+        f.write(header + body)
+    print("wrote testswf/full_test.swf, %d bytes" % (len(header) + len(body)))

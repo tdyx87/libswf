@@ -2054,6 +2054,11 @@ static bool valueIsType(const Value& v, const std::shared_ptr<Object>& t) {
     if (sn == "String") return v.kind == VKind::String;
     if (v.kind != VKind::Object || !v.obj) return false;
     if (sn == "Object") return true;
+    // 类对象（ObjKind::Class）是 Class 的实例：`getDefinition(name) as Class`
+    // 必须返回该对象，否则 new cls() 变成 new null()。swf2 的 MusicController.play
+    // 正是走这条路径创建 BgMusic/DianJi，as Class 失败导致整个游戏没有任何声音。
+    if (sn == "Class") return v.obj->kind == ObjKind::Class;
+    if (sn == "Function") return v.obj->kind == ObjKind::Function;
     if (sn == "Array") return v.obj->kind == ObjKind::Array;
     auto shortName = [](const std::string& n) {
         std::size_t p = n.find_last_of(".:");
@@ -2242,7 +2247,13 @@ Value Vm::constructObject(const Value& cls, const std::vector<Value>& cargs) {
         size_t p = cname.rfind('.');
         if (p != std::string::npos) sc = movie_.symbolClasses.find(cname.substr(p + 1));
     }
-    if (sc != movie_.symbolClasses.end() && inst->display) inst->display->characterId = sc->second;
+    if (sc != movie_.symbolClasses.end()) {
+        if (inst->display) inst->display->characterId = sc->second;
+        // 嵌入式声音类（BgMusic / DianJi / Do ...）：实例没有 display，角色 id 就是
+        // DefineSound，直接记到实例上，Sound.play 时不必再靠类名字符串反查。
+        else if (movie_.sounds.find(sc->second) != movie_.sounds.end())
+            inst->props["$soundId"] = Value::intg(sc->second);
+    }
     // 执行实例构造函数
     if (cls.kind == VKind::Object && cls.obj && cls.obj->instanceIndex >= 0 &&
         cls.obj->instanceIndex < static_cast<int>(abc_.instances.size())) {
@@ -3192,7 +3203,7 @@ Value Vm::callMethod(std::shared_ptr<Object> obj, const std::string& name, const
     // 2) 类成员方法（原生优先，其次字节码）——沿父类链，可命中原生基类成员
     for (auto c = obj->cls; c; c = c->superClass) {
         for (const auto& m : c->instanceMembers)
-            if (m.name == name && m.kind == Member::Method) {
+            if (m.name == name && (m.kind == Member::Method || m.kind == Member::Getter)) {
                 if (std::getenv("SWF_AS_CALLS"))
                     std::fprintf(stderr, "[call] %s.%s mi=%u body=%d argc=%zu\n", obj->className.c_str(),
                                  name.c_str(), m.methodIndex,
@@ -3284,6 +3295,11 @@ void Vm::registerNativeClasses() {
         globals_->props[qn] = v;
         return c;
     };
+
+    // AS3 顶层类型 Class：`getDefinition(name) as Class` / `x is Class` 都靠它。
+    // 缺这个全局类对象时 getlex "Class" 得到 undefined，as Class 一律变 null，
+    // 动态 new 出来的声音类（swf2 的 BgMusic/DianJi）全部失效，整个游戏静音。
+    mkClass("Class", ObjKind::Class);
 
     // ---- Object ----
     {
@@ -3964,6 +3980,7 @@ void Vm::registerNativeClasses() {
                            "XMLList", "RegExp", "ByteArray", "Vector", "Dictionary",
                            "SharedObject", "Error", "MouseEvent", "KeyboardEvent",
                            "TextFormat", "Point", "Rectangle", "Matrix", "ColorTransform",
+                           "SoundTransform",
                            "Tween", "TweenLite", "TweenMax", "NetConnection", "NetStream"}) {
         auto c = mkClass(nm, ObjKind::Generic);
         auto cd = c->classDef;
@@ -4725,17 +4742,130 @@ void Vm::registerNativeClasses() {
         }
         if (auto cd = classDefOf("Sound")) {
             globals_->props["flash.media.Sound"] = Value::object(classObj("Sound"));
-            addMethod(cd, "play", [this](std::shared_ptr<Object>,
-                                         const std::vector<Value>&) -> Value {
+            addMethod(cd, "play", [this](std::shared_ptr<Object> self,
+                                         const std::vector<Value>& a) -> Value {
+                // AS3 嵌入式声音（`new BgMusic()` 这类 SymbolClass 导出的类）：类名在
+                // SymbolClass 表里映射到 DefineSound 角色 id（swf2 里 BgMusic=15、
+                // DianJi=16、Do=17 等）。此前这里只 new 一个 SoundChannel 返回，
+                // 从不调用注入的 soundPlay_，所以 AVM2 影片的背景乐/按键音全是静音。
+                auto lookup = [this](const std::string& nm) -> std::uint16_t {
+                    if (nm.empty()) return 0;
+                    std::uint16_t cid = 0;
+                    auto it = movie_.symbolClasses.find(nm);
+                    if (it != movie_.symbolClasses.end()) cid = it->second;
+                    else {
+                        const std::size_t p = nm.rfind('.');
+                        if (p != std::string::npos) {
+                            it = movie_.symbolClasses.find(nm.substr(p + 1));
+                            if (it != movie_.symbolClasses.end()) cid = it->second;
+                        }
+                    }
+                    if (cid == 0 || movie_.sounds.find(cid) == movie_.sounds.end()) return 0;
+                    return cid;
+                };
+                std::uint16_t sid = 0;
+                if (self) {
+                    auto p = self->props.find("$soundId");     // 构造时按 SymbolClass 记下的 id
+                    if (p != self->props.end())
+                        sid = static_cast<std::uint16_t>(p->second.toInt());
+                    if (sid == 0) sid = lookup(self->className);
+                    if (sid == 0 && self->cls) sid = lookup(self->cls->name);
+                    if (sid == 0) {                             // 显式声明的 soundId 兜底
+                        auto q = self->props.find("soundId");
+                        if (q != self->props.end()) {
+                            const std::uint16_t v = static_cast<std::uint16_t>(q->second.toInt());
+                            if (movie_.sounds.find(v) != movie_.sounds.end()) sid = v;
+                        }
+                    }
+                }
+                // Flash 的 loops 是总播放次数：1 = 播一次，2 = 播两次，0 也按一次处理。
+                // AudioOut::queue 的参数是"额外重复次数"，所以这里要减 1——否则游戏里
+                // 一次性按钮音效（Sound.play(0,1)）会被播成两遍。
+                const int plays = (a.size() > 1 && a[1].toInt() > 0) ? a[1].toInt() : 1;
+                if (std::getenv("SWF_AS_SOUND"))
+                    std::fprintf(stderr, "[sound] avm2 play class=%s sid=%u loops=%d\n",
+                                 self ? self->className.c_str() : "",
+                                 static_cast<unsigned>(sid), plays);
+                int handle = 0;
+                if (sid != 0 && soundPlay_) handle = soundPlay_(sid, plays - 1);
                 auto it = globals_->props.find("SoundChannel");
                 if (it == globals_->props.end() || !it->second.obj) return Value::undefined();
-                return constructObject(it->second, {}); });
+                Value ch = constructObject(it->second, {});
+                if (ch.obj) ch.obj->props["__handle"] = Value::intg(handle);
+                return ch; });
         }
         if (auto cd = classDefOf("SoundChannel")) {
             Member g; g.kind = Member::Getter; g.name = "position";
             g.native = [](std::shared_ptr<Object>, const std::vector<Value>&) -> Value {
                 return Value::num(0.0); };
             cd->instanceMembers.push_back(g);
+            // SoundChannel.stop()：按 play() 时拿到的声道句柄停止该段音频。
+            addMethod(cd, "stop", [this](std::shared_ptr<Object> self,
+                                         const std::vector<Value>&) -> Value {
+                if (self && soundStop_) {
+                    auto h = self->props.find("__handle");
+                    if (h != self->props.end()) soundStop_(h->second.toInt());
+                }
+                return Value::undefined(); });
+            // SoundChannel.soundTransform：游戏的 MusicController / MusicButton 通过它
+            // 调音量、静音。之前没有这个类，也没这个属性，赋值只能落到动态属性上，
+            // 音频增益永远不变（表现为"静音按钮没用"）。
+            {
+                Member get; get.kind = Member::Getter; get.name = "soundTransform";
+                get.native = [](std::shared_ptr<Object> self, const std::vector<Value>&) -> Value {
+                    if (!self) return Value::undefined();
+                    auto p = self->props.find("soundTransform");
+                    return p == self->props.end() ? Value::undefined() : p->second; };
+                cd->instanceMembers.push_back(get);
+                Member set; set.kind = Member::Setter; set.name = "soundTransform";
+                set.native = [this](std::shared_ptr<Object> self,
+                                    const std::vector<Value>& a) -> Value {
+                    if (!self || a.empty()) return Value::undefined();
+                    self->props["soundTransform"] = a[0];
+                    auto h = self->props.find("__handle");
+                    if (h == self->props.end() || !soundVolume_) return Value::undefined();
+                    float vol = 1.0f;
+                    if (a[0].kind == VKind::Object && a[0].obj) {
+                        auto v = a[0].obj->props.find("volume");
+                        if (v != a[0].obj->props.end()) vol = static_cast<float>(v->second.toNumber());
+                    } else if (!a[0].isNullOrUndef()) {
+                        vol = static_cast<float>(a[0].toNumber());
+                    }
+                    soundVolume_(h->second.toInt(), vol);
+                    return Value::undefined(); };
+                cd->instanceMembers.push_back(set);
+            }
+        }
+        if (auto cd = classDefOf("SoundTransform")) {
+            globals_->props["flash.media.SoundTransform"] = Value::object(classObj("SoundTransform"));
+            // new SoundTransform(volume = 1, pan = 0)
+            cd->ctor = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
+                if (self) {
+                    double v = a.empty() ? 1.0 : a[0].toNumber();
+                    if (!(v == v)) v = 1.0;                 // NaN 按原音量
+                    if (v < 0.0) v = 0.0;
+                    if (v > 1.0) v = 1.0;
+                    self->props["volume"] = Value::num(v);
+                    self->props["pan"] = Value::num(a.size() > 1 ? a[1].toNumber() : 0.0);
+                }
+                return Value::undefined();
+            };
+            Member g; g.kind = Member::Getter; g.name = "volume";
+            g.native = [](std::shared_ptr<Object> self, const std::vector<Value>&) -> Value {
+                if (!self) return Value::num(1.0);
+                auto p = self->props.find("volume");
+                return p == self->props.end() ? Value::num(1.0) : p->second; };
+            cd->instanceMembers.push_back(g);
+            Member sv; sv.kind = Member::Setter; sv.name = "volume";
+            sv.native = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
+                if (!self || a.empty()) return Value::undefined();
+                double v = a[0].toNumber();
+                if (!(v == v)) v = 1.0;
+                if (v < 0.0) v = 0.0;
+                if (v > 1.0) v = 1.0;
+                self->props["volume"] = Value::num(v);
+                return Value::undefined(); };
+            cd->instanceMembers.push_back(sv);
         }
         if (auto cd = classDefOf("NetConnection")) {
             globals_->props["flash.net.NetConnection"] = Value::object(classObj("NetConnection"));
@@ -7607,6 +7737,26 @@ std::vector<std::shared_ptr<Vm>> runMovieScripts(Movie& movie, int initialFrame)
     for (const auto& abc : movie.abcFiles) {
         auto vm = std::make_shared<Vm>(abc, movie);
         vm->setInitialFrame(initialFrame);
+        vm->run();
+        if (!vm->stage.empty()) movie.runtimeStage = vm->stage;
+        vms.push_back(vm);
+    }
+    return vms;
+}
+
+std::vector<std::shared_ptr<Vm>> runMovieScripts(
+    Movie& movie, int initialFrame,
+    std::function<int(std::uint16_t, int)> playSound,
+    std::function<void(int)> stopSound,
+    std::function<void(int, float)> volumeSound,
+    std::function<void(std::uint16_t, bool, bool)> frameSound) {
+    std::vector<std::shared_ptr<Vm>> vms;
+    if (movie.abcFiles.empty()) return vms;
+    for (const auto& abc : movie.abcFiles) {
+        auto vm = std::make_shared<Vm>(abc, movie);
+        vm->setInitialFrame(initialFrame);
+        vm->setSoundHandlers(std::move(playSound), std::move(stopSound),
+                             std::move(volumeSound), std::move(frameSound));
         vm->run();
         if (!vm->stage.empty()) movie.runtimeStage = vm->stage;
         vms.push_back(vm);

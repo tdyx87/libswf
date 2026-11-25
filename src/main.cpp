@@ -847,27 +847,89 @@ int main(int argc, char** argv) {
         }
 
         if (renderAll) {
+            // 按钮音效（AVM1 DefineButtonSound）只有经由 swf::Player 的 tick() + setMouse/
+            // mouseDown/mouseUp + pollMouseEvents 才能命中。原 --render-all 把每帧当作静态帧
+            // 导出，根本不推进 Player、也不注入鼠标，因此 AS3 舞台上的按钮永远不会 fireButtonEvent。
+            // 这里沿用 swf::Player（与 --play-game 一致），每帧先注入鼠标输入、tick() 再
+            // render() 当前帧并写 PNG——与 --frame N 的渲染语义一致（当前帧画面），只是遍历
+            // 全部时间帧而非停在某一帧。若不传 --click/--hover/--drag，按钮也只是被推进时间轴
+            //（舞台/按钮存在了），但不触发按钮音效（除非有点击）。
+            //
+            // 复用已解析的点击/悬停/拖拽/按键 spec：语义与 --play-game 一致——--click F:X:Y
+            // 在第 F 帧按下、F+2 帧释放；--hover F:X:Y 从第 F 帧起保持指针位置（每帧只应用最新
+            // 生效的一条）；--drag <down>:<up>:<x1>:<y1>:<x2>:<y2> 按下后逐帧位移、到期释放；
+            // --key <frame>:<vk> 在第 frame 步发送一次 keyDown。
+            //
+            // 默认点击：与 --play-game 保持一致——未显式指定 --click 时，默认在第 12 帧点击
+            // 按钮（坐标约 110,110），这样 --render-all swf2.swf --render-all outdir 也能触发按钮音效。
+            swf::Player player;
+            std::string err;
+            if (!player.loadFile(path.c_str(), err)) {
+                std::fprintf(stderr, "load failed: %s\n", err.c_str());
+                return 1;
+            }
+            std::printf("loaded: %dx%d, %d frames, fps=%.1f\n",
+                        player.stageW(), player.stageH(), player.totalFrames(), player.frameRate());
+            if (clicks.empty()) clicks.push_back({12, 110, 110});   // 默认在第 12 帧点击按钮
+            std::map<int, std::pair<double, double>> down, up;
+            for (const auto& c : clicks) {
+                down[c.frame] = {c.x, c.y};
+                up[c.frame + 2] = {c.x, c.y};   // 按住 2 帧后释放
+            }
             std::error_code ec;
             std::filesystem::create_directories(outDir, ec);
-            std::size_t count = 0;
             char fnbuf[512];
-            std::future<bool> pendingPng;
-            for (std::size_t f = 0; f < movie.frames.size(); ++f) {
-                if (f > 0 && firstFrameRuntime) movie.runtimeStage.clear();
-                std::snprintf(fnbuf, sizeof(fnbuf), "frame_%03zu.png", f);
-                std::filesystem::path outp = std::filesystem::path(outDir) / fnbuf;
-                std::vector<std::uint8_t> next;
-                int w = 0, h = 0;
-                if (!swf::renderMovieToBuffer(movie, static_cast<int>(f), next, w, h)) {
-                    std::fprintf(stderr, "render frame %zu failed\n", f);
+            // 与 --play-game 一致：复用缓冲槽轮换来异步 PNG 编码（zlib 是帧序列主要 CPU 开销）。
+            int slots = 4;
+            if (const char* se = std::getenv("SWF_PNG_SLOTS")) {
+                const int v = std::atoi(se);
+                if (v >= 1 && v <= 8) slots = v;
+            }
+            std::vector<std::shared_ptr<std::vector<std::uint8_t>>> buffers(
+                static_cast<std::size_t>(slots));
+            for (auto& b : buffers) b = std::make_shared<std::vector<std::uint8_t>>();
+            std::vector<std::future<bool>> pendingPng(static_cast<std::size_t>(slots));
+            const int total = player.totalFrames();
+            std::size_t count = 0;
+            for (int f = 0; f < total; ++f) {
+                // 悬停：每帧只应用最新生效的一条（frame 最大的未过期项），每 tick 仅一次 setMouse。
+                const ClickSpec* hvLast = nullptr;
+                for (const auto& hv : hovers)
+                    if (f >= hv.frame && (!hvLast || hv.frame > hvLast->frame)) hvLast = &hv;
+                if (hvLast) player.setMouse(hvLast->x, hvLast->y);
+                // --drag：按下后逐帧移动指针（拖动靠移动驱动），到期释放。
+                for (const auto& dg : drags) {
+                    if (f < dg.down || f > dg.up) continue;
+                    double t = (dg.up > dg.down) ? double(f - dg.down) / double(dg.up - dg.down) : 1.0;
+                    double dx = dg.x1 + (dg.x2 - dg.x1) * t;
+                    double dy = dg.y1 + (dg.y2 - dg.y1) * t;
+                    if (f == dg.down) { player.setMouse(dx, dy); player.mouseDown(); }
+                    else if (f == dg.up) { player.setMouse(dx, dy); player.mouseUp(); }
+                    else player.setMouse(dx, dy);
+                }
+                auto d = down.find(f);
+                if (d != down.end()) { player.setMouse(d->second.first, d->second.second); player.mouseDown(); }
+                auto u = up.find(f);
+                if (u != up.end()) { player.setMouse(u->second.first, u->second.second); player.mouseUp(); }
+                for (const auto& kv : keys)
+                    if (kv.first == f) player.keyDown(kv.second);
+                player.tick();   // 推进时间轴 + 派发帧脚本 + AVM2 vm tick
+
+                // 渲染当前帧（玩家当前帧画面），与 --frame N 的语义一致。
+                const std::size_t s = static_cast<std::size_t>(f % slots);
+                auto& cur = buffers[s];
+                if (pendingPng[s].valid()) pendingPng[s].get();   // 上一帧编码完成后再覆盖此槽
+                int W = 0, H = 0;
+                if (!player.render(*cur, W, H, targetW, targetH)) {
+                    std::fprintf(stderr, "render frame %d failed\n", f);
                     return 1;
                 }
-                if (pendingPng.valid()) pendingPng.get();   // 上一帧编码完成后再提交
-                pendingPng = writePngAsync(outp.string(), std::move(next), w, h);
+                std::snprintf(fnbuf, sizeof(fnbuf), "%s/frame_%03d.png", outDir.c_str(), f);
+                pendingPng[s] = writePngAsync(fnbuf, cur, W, H);
                 ++count;
             }
-            if (pendingPng.valid()) pendingPng.get();
-            std::printf("rendered %zu frames -> %s/\n", count, outDir.c_str());
+            for (auto& p : pendingPng) if (p.valid()) p.get();
+            std::printf("rendered %d frames -> %s/\n", total, outDir.c_str());
             return 0;
         }
 

@@ -49,10 +49,18 @@ public:
     std::string spriteSubtreeDump(unsigned cid) const;
 
     void tick();
+    // CLI 的 --frame N 语义（软件/GPU 两个工具共用同一份定义）：从装载状态推进 N 帧。
+    // 返回值是实际推进的帧数；N 超过时间轴长度时截到末帧。
+    int advanceFrames(int n);
     // targetW/targetH > 0：按该设备分辨率重新光栅化（窗口放大时保持矢量/文字清晰）；
     // 传 0 或不传则输出舞台原生尺寸（CLI 导出 PNG / 像素断言）。
     bool render(std::vector<std::uint8_t>& rgba, int& W, int& H,
                 int targetW = 0, int targetH = 0);
+    // 用任意 sink 渲染当前帧（GPU 适配器 / 记录型 sink），不写 RGBA 缓冲。
+    // 只覆盖遗留显示列表：AVM2 运行时舞台（movie.runtimeStage）尚未适配时返回 false。
+    // sink 的 beginFrame 会拿到舞台像素尺寸；背景色由调用方从 backgroundColor() 取。
+    bool renderFrame(IDisplayListSink& sink, int targetW = 0, int targetH = 0);
+    Color backgroundColor() const { return movie_.backgroundColor; }
     // 静态帧跳过统计（窗口 FPS 叠加/日志用）：render 调用总数与复用旧缓冲的次数。
     std::size_t sceneCalls() const { return sceneFpCalls_; }
     std::size_t sceneSkips() const { return sceneFpSkips_; }
@@ -154,6 +162,8 @@ private:
     // 把 _root 变量值同步到绑定了同名 VariableName 的 EditText 实例（含嵌套精灵内的文本框）
     void syncTextFields();
     void playSoundEvent(const SoundEvent& ev);
+    // AVM2 flash.media.Sound：播放嵌入式 DefineSound，返回 AudioOut 声道句柄（0=失败）。
+    int playEmbeddedSound(std::uint16_t soundId, int loops);
     // 鼠标事件派发：把命中项当作按钮，切换 Up/Over/Down 态并执行其 AVM1 动作
     // （Button2 CondAction 条件位：0x01 rollOver 0x02 rollOut 0x04 press 0x08 release 0x40 releaseOutside）
     void pollMouseEvents(bool down);

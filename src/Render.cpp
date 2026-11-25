@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "swf/Decoder.hpp"
+#include "swf/DisplayListSink.hpp"
 #include "swf/GpuBlur.hpp"
 
 #ifdef _WIN32
@@ -872,10 +873,10 @@ void strokeContours(const std::vector<Contour>& contours, const Matrix& M, const
     });
 }
 
-void renderShape(const Shape& shape, const Matrix& world, const ColorTransform& cx,
-                 const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
-                 std::uint8_t* buf, int W, int H, float alphaMul = 1.0f,
-                 BlendMode bm = BlendMode::Normal) {
+void drawShapeSoftware(const Shape& shape, const Matrix& world, const ColorTransform& cx,
+                        const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+                        std::uint8_t* buf, int W, int H, float alphaMul,
+                        BlendMode bm) {
     Matrix Minv; world.invert(Minv);
 
     // 填充
@@ -911,7 +912,9 @@ void renderShape(const Shape& shape, const Matrix& world, const ColorTransform& 
     auto drawStroke = [&](std::size_t i) {
         if (i >= shape.lineStyles.size() || shape.strokePaths[i].empty()) return;
         const LineStyle& ls = shape.lineStyles[i];
-        strokeContours(shape.strokePaths[i], world, ls.color, ls.width, buf, W, H, alphaMul, bm);
+        // 颜色变换作用于对象整体，描边同样上色（与填充/位图一致）。
+        strokeContours(shape.strokePaths[i], world, cx.apply(ls.color), ls.width, buf, W, H,
+                       alphaMul, bm);
     };
     // 按形状记录流中样式路径被刷新的先后绘制（Flash 语义）：后出现的填充会盖住
     // 先出现的描边。形状 27（"开始"）的 StateNewStyles 追加渐变填充，Flash 中
@@ -1466,11 +1469,13 @@ static float kerningUnits(const FontGlyphs& fg, std::uint32_t prev, std::uint32_
     return it == fg.kerning.end() ? 0.0f : static_cast<float>(it->second);
 }
 
-// 渲染时间轴文本框（DefineEditText）：字体/颜色/边界/对齐/边距/缩进/行距
-// 全部取自 SWF 字段，字形缩放按字体的 EM square，度量由上面的算法给出。
-static void renderEditText(const EditText& et, const Matrix& world,
-                           const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
-                           std::uint8_t* buf, int W, int H, float alpha) {
+// 文本框排版（DefineEditText）：字体/边界/对齐/边距/缩进/行距全部取自 SWF 字段，
+// 字形缩放按字体的 EM square，度量由上面的算法给出。
+// 软件光栅器与 GPU sink 共用这一份排版，避免两边的字形位置/字号/折行分叉。
+static void layoutEditTextCore(const EditText& et, const Matrix& world,
+                              const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+                              std::vector<EditTextGlyph>& out) {
+    out.clear();
     // FontID 是 SWF 明确指定的字体角色；找不到就不排版（不再随便挑字典里某个字体）。
     auto fit = dict.find(et.fontId);
     if (fit == dict.end() || !fit->second || !fit->second->font ||
@@ -1489,7 +1494,6 @@ static void renderEditText(const EditText& et, const Matrix& world,
                          - static_cast<float>(et.rightMargin);
     const bool wrap      = et.wordWrap && availW > 0.0f;
     const bool multiline = et.multiline || et.wordWrap;
-    Paint p; p.kind = FillKind::Solid; p.solid = et.color;
 
     struct Cell {
         std::uint32_t code = 0;
@@ -1567,23 +1571,44 @@ static void renderEditText(const EditText& et, const Matrix& world,
             if (c.shape) {
                 Matrix st; st.sx = tm.scale; st.sy = tm.scale; st.tx = x; st.ty = y;
                 if (fg.italic) st.r0 = -kFlashSyntheticItalicShear * tm.scale;
-                Matrix gm = world.post(st);
-                Matrix Minv; gm.invert(Minv);
-                for (std::size_t i = 0; i < c.shape->fillStyles.size(); ++i)
-                    fillStyleOf(*c.shape, i, gm, Minv, p, buf, W, H, alpha, BlendMode::Normal);
-#ifdef _WIN32
+                EditTextGlyph g;
+                g.shape = c.shape; g.font = &fg; g.code = c.code;
+                g.matrix = world.post(st);
+                out.push_back(g);
             } else if (!c.space) {
-                const auto& dg = deviceGlyph(fg.name, c.code, fg.italic, fg.bold);
-                if (dg.found) {
-                    Matrix st; st.sx = tm.deviceScale; st.sy = tm.deviceScale;
-                    st.tx = x; st.ty = y;
-                    Matrix gm = world.post(st);
-                    Matrix Minv; gm.invert(Minv);
-                    fillContours(dg.contours, gm, Minv, p, buf, W, H, alpha, BlendMode::Normal);
-                }
-#endif
+                Matrix st; st.sx = tm.deviceScale; st.sy = tm.deviceScale;
+                st.tx = x; st.ty = y;
+                EditTextGlyph g;
+                g.shape = nullptr; g.font = &fg; g.code = c.code;
+                g.device = world.post(st);
+                out.push_back(g);
             }
             x += c.adv + (c.space ? extra : 0.0f);
+        }
+    }
+}
+
+// 软件光栅：用镂空描边逐字符填充文本框（颜色取自 EditText.color）。
+static void renderEditText(const EditText& et, const Matrix& world,
+                           const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+                           std::uint8_t* buf, int W, int H, float alpha) {
+    std::vector<EditTextGlyph> glyphs;
+    layoutEditTextCore(et, world, dict, glyphs);
+    if (glyphs.empty()) return;
+    Paint p; p.kind = FillKind::Solid; p.solid = et.color;
+    for (const auto& g : glyphs) {
+        if (g.shape) {
+            Matrix Minv; g.matrix.invert(Minv);
+            for (std::size_t i = 0; i < g.shape->fillStyles.size(); ++i)
+                fillStyleOf(*g.shape, i, g.matrix, Minv, p, buf, W, H, alpha, BlendMode::Normal);
+        } else if (g.font) {
+#ifdef _WIN32
+            const auto& dg = deviceGlyph(g.font->name, g.code, g.font->italic, g.font->bold);
+            if (dg.found) {
+                Matrix Minv; g.device.invert(Minv);
+                fillContours(dg.contours, g.device, Minv, p, buf, W, H, alpha, BlendMode::Normal);
+            }
+#endif
         }
     }
 }
@@ -1599,9 +1624,9 @@ static void collectMaskShapes(const Character* ch, const Matrix& m, float ratio,
                               std::vector<std::pair<const Shape*, Matrix>>& out,
                               std::vector<std::shared_ptr<Shape>>& owned) {
     if (!ch) return;
-    auto addMorph = [&](const Character* mc, const Matrix& mm) {
+    auto addMorph = [&](const Character* mc, const Matrix& mm, float morphRatio) {
         if (!mc->morph || !mc->morph->start) return;
-        auto s = std::make_shared<Shape>(interpolateMorph(*mc->morph, ratio));
+        auto s = std::make_shared<Shape>(interpolateMorph(*mc->morph, morphRatio));
         if (s->fillPaths.empty() && s->fillEdges.empty()) return;
         out.push_back({s.get(), mm});
         owned.push_back(std::move(s));
@@ -1609,15 +1634,81 @@ static void collectMaskShapes(const Character* ch, const Matrix& m, float ratio,
     if (ch->kind == Character::Kind::Shape && ch->shape)
         out.push_back({ch->shape.get(), m});
     else if (ch->kind == Character::Kind::Morph)
-        addMorph(ch, m);
+        addMorph(ch, m, ratio);
     else if (ch->kind == Character::Kind::Sprite && !ch->spriteFrames.empty())
         for (const auto& sub : ch->spriteFrames.front().items) {
             if (!sub.character) continue;
             if (sub.character->kind == Character::Kind::Shape && sub.character->shape)
                 out.push_back({sub.character->shape.get(), m.post(sub.matrix)});
             else if (sub.character->kind == Character::Kind::Morph)
-                addMorph(sub.character.get(), m.post(sub.matrix));
+                addMorph(sub.character.get(), m.post(sub.matrix), sub.ratio);
         }
+}
+
+
+// 运行时显示对象（可能含嵌套精灵/子节点）的遮罩形状收集：
+// 与 collectMaskShapes 不同，这里按 DisplayObject 树递归，使用当前帧/当前子树，
+// 而不是只取库元件的首帧，避免 AS3 遮罩/clipDepth 遮罩在动画时退化成静止形状。
+static Matrix displayLocalMatrix(const fvm::DisplayObject& d);
+
+static void collectRuntimeMaskShapes(const fvm::DisplayObject& d, const Movie& movie,
+                                    const Matrix& rel,
+                                    std::vector<std::pair<const Shape*, Matrix>>& out,
+                                    std::vector<std::shared_ptr<Shape>>& owned,
+                                    bool root = true) {
+    if (!d.visible) return;
+    // 仅在递归子节点时跳过 clipDepth 宿主：根对象本身就是遮罩宿主，
+    // 其几何必须被收集；子节点里 clipDepth>0 的对象是嵌套遮罩宿主，
+    // 不应作为外层遮罩几何的一部分（由其所在层级单独处理）。
+    if (!root && d.clipDepth > 0) return;
+    if (d.characterId && !d.timelineBuilt) {
+        auto mi = movie.characters.find(d.characterId);
+        if (mi != movie.characters.end() && mi->second) {
+            std::vector<std::pair<const Shape*, Matrix>> tmp;
+            std::vector<std::shared_ptr<Shape>> tmpOwned;
+            const Character* ch = mi->second.get();
+            if (ch->kind == Character::Kind::Sprite && !ch->spriteFrames.empty()) {
+                int idx = d.currentFrame;
+                if (idx < 0 || idx >= (int)ch->spriteFrames.size()) idx = 0;
+                for (const auto& sub : ch->spriteFrames[(size_t)idx].items) {
+                    if (!sub.character) continue;
+                    if (sub.character->kind == Character::Kind::Shape && sub.character->shape)
+                        tmp.push_back({sub.character->shape.get(), rel.post(sub.matrix)});
+                    else if (sub.character->kind == Character::Kind::Morph) {
+                        if (!sub.character->morph || !sub.character->morph->start) continue;
+                        auto shp = std::make_shared<Shape>(interpolateMorph(*sub.character->morph, sub.ratio));
+                        if (shp->fillPaths.empty() && shp->fillEdges.empty()) continue;
+                        tmp.push_back({shp.get(), rel.post(sub.matrix)});
+                        owned.push_back(std::move(shp));
+                    }
+                }
+            } else {
+                collectMaskShapes(mi->second.get(), Matrix{}, d.ratio, tmp, tmpOwned);
+                for (auto& mk : tmp) {
+                    // collectMaskShapes 返回的是元件局部矩阵，这里折入到相对根矩阵。
+                    // tmp 的 matrix 是 relative to character; compose with rel.
+                    // (rel already identity for direct root, so post is fine)
+                }
+                // Transform collected matrices by rel.
+                std::vector<std::pair<const Shape*, Matrix>> tmp2;
+                for (auto& mk : tmp) {
+                    Matrix m = rel.post(mk.second);
+                    tmp2.push_back({mk.first, m});
+                }
+                tmp.swap(tmp2);
+                for (auto& o : tmpOwned) owned.push_back(std::move(o));
+            }
+            for (auto& mk : tmp) out.push_back(mk);
+        }
+    }
+    // 运行时 graphics 暂不作为遮罩几何（CPU 也不把 graphics 当遮罩层的外轮廓）。
+    if (d.timelineBuilt || !d.children.empty()) {
+        for (const auto& c : d.children) {
+            if (!c) continue;
+            Matrix childRel = rel.post(displayLocalMatrix(*c));
+            collectRuntimeMaskShapes(*c, movie, childRel, out, owned, false);
+        }
+    }
 }
 
 // 渲染一组显示列表项并处理 clipDepth 裁剪组（主时间轴与精灵内部时间轴通用）。
@@ -1768,13 +1859,243 @@ static void applyFilters(const std::vector<Filter>& filters, std::vector<std::ui
 // 这些字段恒为默认值，若不区分，按钮/包装精灵里嵌套的多帧剪辑会被判"未初始化"
 // 而归零到第 0 帧（swf2.swf 元件3_24→Button198→194→193→177/180 的 p5 扫光动画
 // 因此静止）。置位时改按传入的 frameIndex 时钟取内部帧。
+// ---------------------------------------------------------------------------
+// IDisplayListSink 的软件光栅器实现：命令直接落到 CPU RGBA 缓冲。
+// 像素运算全部复用本文件既有函数（fillStyleOf / strokeContours / fillMask /
+// renderEditText / applyFilters），与拆分前的渲染路径逐像素一致。
+// ---------------------------------------------------------------------------
+class SoftwareSink final : public IDisplayListSink {
+public:
+    SoftwareSink(std::uint8_t* buf, int W, int H) : m_buf(buf), m_W(W), m_H(H) {}
+
+    void beginFrame(int width, int height,
+                    const std::map<std::uint16_t, std::shared_ptr<Character>>& dict) override {
+        m_W = width;
+        m_H = height;
+        m_dict = &dict;
+    }
+    void endFrame() override { m_dict = nullptr; }
+
+    void drawFill(const Shape& shape, std::size_t index, const Matrix& world,
+                  const ColorTransform& cx, BlendMode blend, float alpha) override {
+        if (!m_buf || index >= shape.fillStyles.size()) return;
+        if (index >= shape.fillEdges.size() && index >= shape.fillPaths.size()) return;
+
+        Matrix Minv;
+        world.invert(Minv);
+        const FillStyle& fs = shape.fillStyles[index];
+        Paint p;
+        p.kind = fs.kind; p.solid = fs.color; p.cx = cx; p.tiled = fs.tiled;
+        p.spread = fs.spreadMode; p.interp = fs.interpMode;
+        p.winding = shape.usesWinding;
+        if (fs.kind == FillKind::LinearGradient || fs.kind == FillKind::RadialGradient ||
+            fs.kind == FillKind::FocalGradient) {
+            p.grad = fs.gradient;
+            // SWF 的 gradientMatrix 是「渐变空间 -> 形状空间」，采样需用其逆。
+            Matrix g = fs.gradientMatrix;
+            if (!g.invert(p.gmat)) p.gmat = fs.gradientMatrix;
+            p.focalX = fs.focalX; p.focalY = fs.focalY;
+        } else if (fs.kind == FillKind::Bitmap && m_dict) {
+            auto it = m_dict->find(fs.bitmapId);
+            if (it != m_dict->end() && it->second && it->second->bitmap) {
+                p.bmp = it->second->bitmap.get();
+                Matrix b = fs.gradientMatrix;
+                if (!b.invert(p.bmat)) p.bmat = fs.gradientMatrix;
+            }
+        }
+        fillStyleOf(shape, index, world, Minv, p, m_buf, m_W, m_H, alpha, blend);
+    }
+
+    void drawStroke(const Shape& shape, std::size_t index, const Matrix& world,
+                    const ColorTransform& cx, BlendMode blend, float alpha) override {
+        if (!m_buf || index >= shape.lineStyles.size()) return;
+        if (index >= shape.strokePaths.size() || shape.strokePaths[index].empty()) return;
+        const LineStyle& ls = shape.lineStyles[index];
+        // 颜色变换作用于对象整体，描边同样上色（与填充/位图一致）。
+        strokeContours(shape.strokePaths[index], world, cx.apply(ls.color), ls.width, m_buf, m_W,
+                       m_H, alpha, blend);
+    }
+
+    void drawGlyph(const Shape& glyph, const Matrix& world, const Color& color,
+                   const ColorTransform& cx, BlendMode blend, float alpha) override {
+        if (!m_buf) return;
+        Matrix Minv;
+        world.invert(Minv);
+        Paint p;
+        p.kind = FillKind::Solid;
+        p.solid = color;
+        p.cx = cx;
+        for (std::size_t i = 0; i < glyph.fillStyles.size(); ++i)
+            fillStyleOf(glyph, i, world, Minv, p, m_buf, m_W, m_H, alpha, blend);
+    }
+
+    void drawEditText(const EditText& text, const Matrix& world, float alpha) override {
+        if (!m_buf || !m_dict) return;
+        renderEditText(text, world, *m_dict, m_buf, m_W, m_H, alpha);
+    }
+
+    void drawBitmap(const Bitmap& bmp, const Matrix& world,
+                    const ColorTransform& cx, BlendMode blend, float alpha) override {
+        if (!m_buf || bmp.width <= 0 || bmp.height <= 0) return;
+        for (int j = 0; j < bmp.height; ++j) {
+            for (int i = 0; i < bmp.width; ++i) {
+                float lx = static_cast<float>(i * 20), ly = static_cast<float>(j * 20);
+                float dx, dy; world.apply(lx, ly, dx, dy);
+                int px = static_cast<int>(std::round(dx)), py = static_cast<int>(std::round(dy));
+                const std::uint8_t* p4 = &bmp.rgba[static_cast<std::size_t>(j) * bmp.width * 4 + i * 4];
+                Color col = cx.apply(Color(p4[0], p4[1], p4[2], p4[3]));
+                col.a = clampU8(static_cast<int>(col.a * alpha + 0.5f));
+                plot(m_buf, m_W, m_H, px, py, col, blend);
+            }
+        }
+    }
+
+    void pushMask(const std::vector<MaskShape>& masks) override {
+        auto frame = std::make_unique<MaskFrame>();
+        frame->parent = m_buf;
+        frame->masks = masks;
+
+        // 与旧实现相同：只在遮罩形状的设备包围盒内清零/合成。
+        float fbx0 = 1e9f, fby0 = 1e9f, fbx1 = -1e9f, fby1 = -1e9f;
+        for (const MaskShape& mk : masks) {
+            if (!mk.shape) continue;
+            for (const auto& contours : mk.shape->fillPaths)
+                for (const auto& ct : contours)
+                    for (int k = 0; k < static_cast<int>(ct.xs.size()); ++k) {
+                        float X, Y; mk.matrix.apply(ct.xs[k], ct.ys[k], X, Y);
+                        fbx0 = std::min(fbx0, X); fby0 = std::min(fby0, Y);
+                        fbx1 = std::max(fbx1, X); fby1 = std::max(fby1, Y);
+                    }
+        }
+        frame->x0 = std::max(0, static_cast<int>(std::floor(fbx0)));
+        frame->y0 = std::max(0, static_cast<int>(std::floor(fby0)));
+        frame->x1 = std::min(m_W - 1, static_cast<int>(std::ceil(fbx1)));
+        frame->y1 = std::min(m_H - 1, static_cast<int>(std::ceil(fby1)));
+
+        const std::size_t npix = static_cast<std::size_t>(m_W) * m_H;
+        frame->layer.assign(npix * 4, 0);
+        frame->coverage.assign(npix, 0);
+
+        m_buf = frame->layer.data();
+        m_masks.push_back(std::move(frame));
+    }
+
+    void popMask() override {
+        if (m_masks.empty()) return;
+        std::unique_ptr<MaskFrame> frame = std::move(m_masks.back());
+        m_masks.pop_back();
+        m_buf = frame->parent;
+
+        const int bx0 = frame->x0, by0 = frame->y0, bx1 = frame->x1, by1 = frame->y1;
+        if (!m_buf || bx0 > bx1 || by0 > by1) return;
+
+        for (const MaskShape& mk : frame->masks)
+            if (mk.shape)
+                fillMask(mk.shape->fillPaths, mk.matrix, frame->coverage.data(), m_W, m_H);
+
+        const int bw = bx1 - bx0 + 1;
+        const std::uint8_t* layer = frame->layer.data();
+        parallelBands(by0, by1, [&](int ya, int yb) {
+            for (int y = ya; y <= yb; ++y) {
+                std::size_t p = static_cast<std::size_t>(y) * m_W + bx0;
+                for (int x = 0; x < bw; ++x, ++p) {
+                    std::uint8_t mv = frame->coverage[p];
+                    if (!mv) continue;
+                    const std::uint8_t* ls = &layer[p * 4];
+                    std::uint8_t* d = &m_buf[p * 4];
+                    float sa = (ls[3] / 255.0f) * (mv / 255.0f);
+                    if (sa <= 0.0f) continue;
+                    float da = d[3] / 255.0f;
+                    float outA = sa + da * (1.0f - sa);
+                    if (outA <= 0.0f) continue;
+                    d[0] = static_cast<std::uint8_t>((ls[0] * sa + d[0] * da * (1.0f - sa)) / outA);
+                    d[1] = static_cast<std::uint8_t>((ls[1] * sa + d[1] * da * (1.0f - sa)) / outA);
+                    d[2] = static_cast<std::uint8_t>((ls[2] * sa + d[2] * da * (1.0f - sa)) / outA);
+                    d[3] = static_cast<std::uint8_t>(outA * 255.0f);
+                }
+            }
+        });
+    }
+
+    void beginFilteredLayer(const std::vector<Filter>& filters) override {
+        auto frame = std::make_unique<FilterFrame>();
+        frame->parent = m_buf;
+        frame->filters = &filters;
+        // 与拆分前一致：离屏层取自 scratch_pool（只清脏行），避免每帧整屏清零。
+        frame->scratch = std::make_unique<ScratchBuf>(
+            static_cast<std::size_t>(m_W) * m_H * 4, m_W * 4);
+        m_buf = frame->scratch->data();
+        m_filters.push_back(std::move(frame));
+    }
+
+    void endFilteredLayer() override {
+        if (m_filters.empty()) return;
+        std::unique_ptr<FilterFrame> frame = std::move(m_filters.back());
+        m_filters.pop_back();
+        m_buf = frame->parent;
+        if (!m_buf) return;
+        const std::size_t npix = static_cast<std::size_t>(m_W) * m_H;
+        int ry0 = 0, ry1 = -1;
+        applyFilters(*frame->filters, frame->scratch->vec(), m_buf, m_W, m_H, npix, &ry0, &ry1);
+        frame->scratch->noteRows(ry0, ry1);
+    }
+
+private:
+    struct MaskFrame {
+        std::uint8_t* parent = nullptr;
+        std::vector<MaskShape> masks;
+        std::vector<std::uint8_t> layer;
+        std::vector<std::uint8_t> coverage;
+        int x0 = 0, y0 = 0, x1 = -1, y1 = -1;
+    };
+    struct FilterFrame {
+        std::uint8_t* parent = nullptr;
+        const std::vector<Filter>* filters = nullptr;
+        std::unique_ptr<ScratchBuf> scratch;
+    };
+
+    std::uint8_t* m_buf = nullptr;
+    int m_W = 0, m_H = 0;
+    const std::map<std::uint16_t, std::shared_ptr<Character>>* m_dict = nullptr;
+    std::vector<std::unique_ptr<MaskFrame>> m_masks;
+    std::vector<std::unique_ptr<FilterFrame>> m_filters;
+};
+
+// 显示列表遍历（定义见下方）。
+void renderItemIntoSink(IDisplayListSink& sink, const DisplayItem& item, const Matrix& root,
+                        const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+                        int frameIndex, float alpha, BlendMode bm,
+                        const ColorTransform& inheritedCx);
+void renderItemsWithSink(IDisplayListSink& sink, const std::vector<DisplayItem>& items,
+                         const Matrix& root,
+                         const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+                         int frameIndex, float alpha, const ColorTransform& inheritedCx);
+
+// 按 drawOrder 顺序把形状的填充/描边送到 sink（无 drawOrder 时先填充后描边）。
+static void drawShapeToSink(IDisplayListSink& sink, const Shape& shape, const Matrix& world,
+                            const ColorTransform& cx, float alpha, BlendMode bm) {
+    if (!shape.drawOrder.empty()) {
+        for (const auto& op : shape.drawOrder) {
+            if (op.style < 0) continue;
+            if (op.isLine)
+                sink.drawStroke(shape, static_cast<std::size_t>(op.style), world, cx, bm, alpha);
+            else
+                sink.drawFill(shape, static_cast<std::size_t>(op.style), world, cx, bm, alpha);
+        }
+        return;
+    }
+    for (std::size_t i = 0; i < shape.fillStyles.size(); ++i)
+        sink.drawFill(shape, i, world, cx, bm, alpha);
+    for (std::size_t i = 0; i < shape.lineStyles.size(); ++i)
+        sink.drawStroke(shape, i, world, cx, bm, alpha);
+}
+
 static thread_local bool s_rtClockMode = false;
 
-void renderItemInto(const DisplayItem& item, const Matrix& root,
-                    const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
-                    std::uint8_t* buf, int W, int H, int frameIndex, float alpha = 1.0f,
-                    BlendMode bm = BlendMode::Normal,
-                    const ColorTransform& inheritedCx = ColorTransform{}) {
+void renderItemIntoSink(IDisplayListSink& sink, const DisplayItem& item, const Matrix& root,
+                        const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+                        int frameIndex, float alpha, BlendMode bm,
+                        const ColorTransform& inheritedCx) {
     if (item.hasRt && !item.rtVisible) return;      // AVM1 _visible = false
     // 世界矩阵：静态 matrix 或运行时覆盖合成（T(x,y) * R(rot) * S(sx,sy)，单位像素->twips）
     Matrix world;
@@ -1801,11 +2122,11 @@ void renderItemInto(const DisplayItem& item, const Matrix& root,
 
 
     if (item.character->kind == Character::Kind::Shape && item.character->shape) {
-        renderShape(*item.character->shape, world, cx, dict, buf, W, H, alpha, bm);
+        drawShapeToSink(sink, *item.character->shape, world, cx, alpha, bm);
     } else if (item.character->kind == Character::Kind::Morph && item.character->morph) {
         // 变形形状：按当前 ratio 插值后渲染
         Shape interp = interpolateMorph(*item.character->morph, item.ratio);
-        renderShape(interp, world, cx, dict, buf, W, H, alpha, bm);
+        drawShapeToSink(sink, interp, world, cx, alpha, bm);
     } else if (item.character->kind == Character::Kind::Button && item.character->button) {
         // 按钮：按交互态（0=Up 1=Over 2=Down 3=Hit）选桶；Hit 态不渲染（仅命中区域）
         const auto& bd = *item.character->button;
@@ -1831,29 +2152,21 @@ void renderItemInto(const DisplayItem& item, const Matrix& root,
             // 先画进离屏层、应用滤镜、再合成回主缓冲。
             if (!sub->filters.empty()) {
                 rperf::Timer tmr(0);
-                const std::size_t npf = static_cast<std::size_t>(W) * H;
-                // 滤镜子树缓存**不适用**于此路径（实测，2026-11）：按钮记录挂滤镜的
-                // 按钮普遍内嵌逐帧动画（p5 扫光 / 悬停脉冲），内容真实地每帧变化，
-                // DisplayItem 键无法跨帧命中（512MB 上限实验 hits 不随容量提升，
-                // miss 风暴反致 render +5.4s）。要消除这 20.5s 只能降低单次重算
-                // 成本——方案 B 的 GPU 高斯模糊。此路径保持基线原样。
-                ScratchBuf layer(npf * 4, W * 4);
-                renderItemInto(*sub, world, dict, layer.data(), W, H, frameIndex, alpha, bm, cx);
-                int ry0 = 0, ry1 = -1;
-                applyFilters(sub->filters, layer.vec(), buf, W, H, npf, &ry0, &ry1);
-                layer.noteRows(ry0, ry1);
+                // 离屏层 -> 应用滤镜 -> 合成回主缓冲（sink 负责层缓冲的生命周期）。
+                sink.beginFilteredLayer(sub->filters);
+                renderItemIntoSink(sink, *sub, world, dict, frameIndex, alpha, bm, cx);
+                sink.endFilteredLayer();
             } else {
-                renderItemInto(*sub, world, dict, buf, W, H, frameIndex, alpha, bm, cx);
+                renderItemIntoSink(sink, *sub, world, dict, frameIndex, alpha, bm, cx);
             }
         }
     } else if (item.character->kind == Character::Kind::Sprite) {
         // 精灵：递归渲染其运行态内部帧子树（children 由 Player 每帧同步；支持嵌套精灵、
         // 嵌套按钮与各自的独立播放头/按钮态）。
         const auto& sf = item.character->spriteFrames;
-        std::size_t npix = static_cast<std::size_t>(W) * H;
         if (!item.children.empty()) {
             // 用带 clipDepth 处理的渲染器渲染精灵内部帧（支持精灵内遮罩）。
-            renderItemsWithClip(item.children, world, dict, buf, W, H, frameIndex, npix, alpha, cx);
+            renderItemsWithSink(sink, item.children, world, dict, frameIndex, alpha, cx);
             return;
         }
         // 回退（children 尚未同步，例如按钮内部的静态子项）：按放置帧对齐即时取帧。
@@ -1875,7 +2188,7 @@ void renderItemInto(const DisplayItem& item, const Matrix& root,
         // idx=0 当成 frameIndex，永远冻结在第 0 帧。多帧精灵仍按本地帧对齐
         // （内嵌内容的 birthFrame 以本精灵帧号为基准）。
         const int childFrame = sf.size() == 1 ? frameIndex : idx;
-        renderItemsWithClip(sf[static_cast<std::size_t>(idx)].items, world, dict, buf, W, H, childFrame, npix, alpha, cx);
+        renderItemsWithSink(sink, sf[static_cast<std::size_t>(idx)].items, world, dict, childFrame, alpha, cx);
     } else if (item.character->kind == Character::Kind::Text && item.character->text) {
         // 文本：逐字形按文本矩阵+笔位放置，用字形颜色实心填充字形轮廓
         const TextDef& td = *item.character->text;
@@ -1902,34 +2215,19 @@ void renderItemInto(const DisplayItem& item, const Matrix& root,
             // 字体带 Italic 标志：在字形空间叠加合成斜切（x' = x - k*y，再经文本矩阵）。
             if (fg.italic) gm.r0 = (tm.r0 - kFlashSyntheticItalicShear * tm.sx) * gs_;
             gm.tx = gx; gm.ty = gy;
-            Matrix Minv; gm.invert(Minv);
-            Paint p; p.kind = FillKind::Solid; p.solid = tg.color; p.cx = cx;
-            for (std::size_t i = 0; i < gs->fillStyles.size(); ++i) {
-                fillStyleOf(*gs, i, gm, Minv, p, buf, W, H, alpha, bm);
-            }
+            sink.drawGlyph(*gs, gm, tg.color, cx, bm, alpha);
         }
     } else if (item.character->kind == Character::Kind::EditText && item.character->editText) {
         // 文本框：运行时输入覆盖 InitialText
         if (item.hasTextOverride) {
             EditText et = *item.character->editText;   // 拷贝并替换文本
             et.text = item.textOverride;
-            renderEditText(et, world, dict, buf, W, H, alpha);
+            sink.drawEditText(et, world, alpha);
         } else {
-            renderEditText(*item.character->editText, world, dict, buf, W, H, alpha);
+            sink.drawEditText(*item.character->editText, world, alpha);
         }
     } else if (item.character->kind == Character::Kind::Bitmap && item.character->bitmap) {
-        const Bitmap& bmp = *item.character->bitmap;
-        for (int j = 0; j < bmp.height; ++j) {
-            for (int i = 0; i < bmp.width; ++i) {
-                float lx = static_cast<float>(i * 20), ly = static_cast<float>(j * 20);
-                float dx, dy; world.apply(lx, ly, dx, dy);
-                int px = static_cast<int>(std::round(dx)), py = static_cast<int>(std::round(dy));
-                const std::uint8_t* p4 = &bmp.rgba[static_cast<std::size_t>(j) * bmp.width * 4 + i * 4];
-                Color col = cx.apply(Color(p4[0], p4[1], p4[2], p4[3]));
-                col.a = clampU8(static_cast<int>(col.a * alpha + 0.5f));   // 对象级透明度
-                plot(buf, W, H, px, py, col, bm);
-            }
-        }
+        sink.drawBitmap(*item.character->bitmap, world, cx, bm, alpha);
     } else if (item.character->kind == Character::Kind::Video && item.character->video) {
         // 视频流：按当前时间轴帧选择已解码帧（frameNum <= frameIndex+1 的最大者；无则首帧）
         const auto& vs = *item.character->video;
@@ -1937,20 +2235,20 @@ void renderItemInto(const DisplayItem& item, const Matrix& root,
         auto pit = vs.decoded.upper_bound(static_cast<std::uint16_t>(frameIndex + 1));
         if (pit != vs.decoded.begin()) { --pit; frame = pit->second; }
         else if (!vs.decoded.empty()) frame = vs.decoded.begin()->second;
-        if (frame) {
-            for (int j = 0; j < frame->height; ++j) {
-                for (int i = 0; i < frame->width; ++i) {
-                    float lx = static_cast<float>(i * 20), ly = static_cast<float>(j * 20);
-                    float dx, dy; world.apply(lx, ly, dx, dy);
-                    int px = static_cast<int>(std::round(dx)), py = static_cast<int>(std::round(dy));
-                    const std::uint8_t* p4 = &frame->rgba[static_cast<std::size_t>(j) * frame->width * 4 + i * 4];
-                    Color col = cx.apply(Color(p4[0], p4[1], p4[2], p4[3]));
-                    col.a = clampU8(static_cast<int>(col.a * alpha + 0.5f));
-                    plot(buf, W, H, px, py, col, bm);
-                }
-            }
-        }
+        if (frame) sink.drawBitmap(*frame, world, cx, bm, alpha);
     }
+}
+
+// 软件光栅器入口（保持既有签名）：用 SoftwareSink 执行同一条遍历。
+void renderItemInto(const DisplayItem& item, const Matrix& root,
+                    const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+                    std::uint8_t* buf, int W, int H, int frameIndex, float alpha = 1.0f,
+                    BlendMode bm = BlendMode::Normal,
+                    const ColorTransform& inheritedCx = ColorTransform{}) {
+    SoftwareSink sink(buf, W, H);
+    sink.beginFrame(W, H, dict);
+    renderItemIntoSink(sink, item, root, dict, frameIndex, alpha, bm, inheritedCx);
+    sink.endFrame();
 }
 
 // ---- 位图滤镜（PlaceObject3 FilterList）----
@@ -2631,101 +2929,86 @@ static void applyFilters(const std::vector<Filter>& filters, std::vector<std::ui
 // 渲染一组显示列表项；遇到 clipDepth 图层时，把其 depth+1..clipDepth 范围内的子项
 // 渲染到离屏缓冲，并用该图层形状的填充区域作遮罩合成回主缓冲（实现 SWF 裁剪）。
 // 主时间轴与精灵内部时间轴通用（精灵内遮罩由此获得支持）。
-void renderItemsWithClip(const std::vector<DisplayItem>& items, const Matrix& root,
+void renderItemsWithSink(IDisplayListSink& sink, const std::vector<DisplayItem>& items,
+                         const Matrix& root,
                          const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
-                         std::uint8_t* buf, int W, int H, int frameIndex,
-                         std::size_t npix, float alpha,
+                         int frameIndex, float alpha,
                          const ColorTransform& inheritedCx) {
     int n = static_cast<int>(items.size());
     int i = 0;
     while (i < n) {
         const DisplayItem& it = items[i];
         if (it.clipDepth > 0) {
-            // SWF 语义：clipDepth 对象本身仍正常绘制（无填充的"隐形遮罩"自然不画任何像素），
+            // SWF 语义：clipDepth 对象本身仍正常绘制（无填充的“隐形遮罩”自然不画像素），
             // 同时它定义了后续 depth+1..clipDepth 层的裁剪区域。
-            if (it.character) renderItemInto(it, root, dict, buf, W, H, frameIndex, alpha, it.blend, inheritedCx);
-            std::vector<std::pair<const Shape*, Matrix>> maskShapes;
+            if (it.character)
+                renderItemIntoSink(sink, it, root, dict, frameIndex, alpha, it.blend, inheritedCx);
+
+            std::vector<std::pair<const Shape*, Matrix>> rawMasks;
             std::vector<std::shared_ptr<Shape>> ownedMasks;
-            collectMaskShapes(it.character.get(), Matrix{}, it.ratio, maskShapes, ownedMasks);
+            collectMaskShapes(it.character.get(), Matrix{}, it.ratio, rawMasks, ownedMasks);
             int j = i + 1;
             while (j < n && items[j].depth <= it.clipDepth) ++j;
-            if (!maskShapes.empty()) {
-                // 遮罩设备包围盒：缓冲清零与合成只在盒内进行。
-                // 全屏遮罩组若按整幅分配/清零/合成，是慢场景的主要固定开销。
-                Matrix wm = root.post(it.matrix);
-                float fbx0 = 1e9f, fby0 = 1e9f, fbx1 = -1e9f, fby1 = -1e9f;
-                for (const auto& mk : maskShapes) {
-                    Matrix mm = wm.post(mk.second);
-                    for (const auto& contours : mk.first->fillPaths)
-                        for (const auto& ct : contours)
-                            for (int k = 0; k < static_cast<int>(ct.xs.size()); ++k) {
-                                float X, Y; mm.apply(ct.xs[k], ct.ys[k], X, Y);
-                                fbx0 = std::min(fbx0, X); fby0 = std::min(fby0, Y);
-                                fbx1 = std::max(fbx1, X); fby1 = std::max(fby1, Y);
-                            }
+            if (!rawMasks.empty()) {
+                rperf::Timer tmr(3);
+                // 遮罩形状的设备空间矩阵 = 遮罩对象世界矩阵 ∘ 形状局部矩阵。
+                const Matrix wm = root.post(it.matrix);
+                std::vector<MaskShape> masks;
+                masks.reserve(rawMasks.size());
+                for (const auto& mk : rawMasks)
+                    masks.push_back({mk.first, wm.post(mk.second)});
+
+                if (std::getenv("SWF_MASK_DBG")) {
+                    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+                    for (const auto& mk : masks)
+                        for (const auto& group : mk.shape->fillPaths)
+                            for (const auto& ct : group)
+                                for (int k = 0; k < static_cast<int>(ct.xs.size()); ++k) {
+                                    float X, Y; mk.matrix.apply(ct.xs[k], ct.ys[k], X, Y);
+                                    x0 = std::min(x0, X); y0 = std::min(y0, Y);
+                                    x1 = std::max(x1, X); y1 = std::max(y1, Y);
+                                }
+                    std::fprintf(stderr, "[mask] frame=%d clipDepth=%d shapes=%zu items=%d bbox=(%.1f,%.1f)-(%.1f,%.1f)\n",
+                                 frameIndex, static_cast<int>(it.clipDepth), masks.size(), j - i - 1,
+                                 x0, y0, x1, y1);
                 }
-                int bx0 = std::max(0, static_cast<int>(std::floor(fbx0)));
-                int by0 = std::max(0, static_cast<int>(std::floor(fby0)));
-                int bx1 = std::min(W - 1, static_cast<int>(std::ceil(fbx1)));
-                int by1 = std::min(H - 1, static_cast<int>(std::ceil(fby1)));
-                if (bx0 <= bx1 && by0 <= by1) {
-                    static std::vector<std::uint8_t> maskBuf, layerBuf;
-                    if (maskBuf.size() < npix) maskBuf.assign(npix, 0);
-                    if (layerBuf.size() < npix * 4) layerBuf.assign(npix * 4, 0);
-                    std::uint8_t* mask = maskBuf.data();
-                    std::uint8_t* layer = layerBuf.data();
-                    int bw = bx1 - bx0 + 1;
-                    for (int y = by0; y <= by1; ++y) {
-                        std::memset(mask + static_cast<std::size_t>(y) * W + bx0, 0, static_cast<std::size_t>(bw));
-                        std::memset(layer + (static_cast<std::size_t>(y) * W + bx0) * 4, 0,
-                                    static_cast<std::size_t>(bw) * 4);
-                    }
-                    for (const auto& mk : maskShapes)
-                        fillMask(mk.first->fillPaths, wm.post(mk.second), mask, W, H);
-                    for (int q = i + 1; q < j; ++q)
-                        if (items[q].clipDepth == 0 && items[q].character)
-                            renderItemInto(items[q], root, dict, layer, W, H, frameIndex, alpha, items[q].blend, inheritedCx);
-                    parallelBands(by0, by1, [&](int ya, int yb) {
-                        for (int y = ya; y <= yb; ++y) {
-                            std::size_t p = static_cast<std::size_t>(y) * W + bx0;
-                            for (int x = 0; x < bw; ++x, ++p) {
-                                std::uint8_t mv = mask[p];
-                                if (!mv) continue;
-                                const std::uint8_t* s = &layer[p * 4];
-                                std::uint8_t* d = &buf[p * 4];
-                                float sa = (s[3] / 255.0f) * (mv / 255.0f);
-                                if (sa <= 0.0f) continue;
-                                float da = d[3] / 255.0f;
-                                float outA = sa + da * (1.0f - sa);
-                                if (outA <= 0.0f) continue;
-                                d[0] = static_cast<std::uint8_t>((s[0] * sa + d[0] * da * (1.0f - sa)) / outA);
-                                d[1] = static_cast<std::uint8_t>((s[1] * sa + d[1] * da * (1.0f - sa)) / outA);
-                                d[2] = static_cast<std::uint8_t>((s[2] * sa + d[2] * da * (1.0f - sa)) / outA);
-                                d[3] = static_cast<std::uint8_t>(outA * 255.0f);
-                            }
-                        }
-                    });
-                }
+
+                sink.pushMask(masks);
+                for (int q = i + 1; q < j; ++q)
+                    if (items[q].clipDepth == 0 && items[q].character)
+                        renderItemIntoSink(sink, items[q], root, dict, frameIndex, alpha,
+                                           items[q].blend, inheritedCx);
+                sink.popMask();
             }
             i = j;  // 跳过整个裁剪组
         } else {
             if (it.character) {
                 if (!it.filters.empty()) {
-                    // 带滤镜：先渲染到离屏层，应用滤镜（投影/模糊/辉光），再合成回主缓冲
-                    // （DisplayItem 级滤镜子树缓存实测不适用——同按钮路径注释。）
+                    // 带滤镜：先渲染到离屏层，应用滤镜（投影/模糊/辉光），再合成回主缓冲。
                     rperf::Timer tmr(1);
-                    ScratchBuf layer(npix * 4, W * 4);
-                    renderItemInto(it, root, dict, layer.data(), W, H, frameIndex, alpha, it.blend, inheritedCx);
-                    int ry0 = 0, ry1 = -1;
-                    applyFilters(it.filters, layer.vec(), buf, W, H, npix, &ry0, &ry1);
-                    layer.noteRows(ry0, ry1);
+                    sink.beginFilteredLayer(it.filters);
+                    renderItemIntoSink(sink, it, root, dict, frameIndex, alpha, it.blend, inheritedCx);
+                    sink.endFilteredLayer();
                 } else {
-                    renderItemInto(it, root, dict, buf, W, H, frameIndex, alpha, it.blend, inheritedCx);
+                    renderItemIntoSink(sink, it, root, dict, frameIndex, alpha, it.blend, inheritedCx);
                 }
             }
             ++i;
         }
     }
+}
+
+// 软件光栅器入口（保持既有签名，Player/CLI/AVM2 调用点无需改动）。
+void renderItemsWithClip(const std::vector<DisplayItem>& items, const Matrix& root,
+                         const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+                         std::uint8_t* buf, int W, int H, int frameIndex,
+                         std::size_t npix, float alpha,
+                         const ColorTransform& inheritedCx) {
+    (void)npix;
+    SoftwareSink sink(buf, W, H);
+    sink.beginFrame(W, H, dict);
+    renderItemsWithSink(sink, items, root, dict, frameIndex, alpha, inheritedCx);
+    sink.endFrame();
 }
 
 // 栅格化运行时 TextField（AS3 设置的 .text）。复用已解码的字体字形轮廓，
@@ -3891,6 +4174,14 @@ static void renderDisplayObjectImpl(const std::shared_ptr<fvm::DisplayObject>& d
     if (d->clipDepth > 0) return;
     // 正在渲染 AS3 遮罩形状时不可跳过全黑 alpha 渐变层——扫光层本身就是遮罩内容
     if (!s_inMaskPass && isAlphaMaskShape(*d, movie)) return;
+    if (std::getenv("SWF_NODE_DBG") &&
+        (!std::getenv("SWF_NODE_CALL") ||
+         g_dbgRenderCall == std::atoi(std::getenv("SWF_NODE_CALL"))))
+        std::fprintf(stderr, "[cnode] cid=%u kind=%d clip=%u filt=%zu mask=%d txt=%d kids=%zu depth=%d name=%s vis=%d\n",
+                     (unsigned)d->characterId, (int)d->kind, (unsigned)d->clipDepth,
+                     d->filters ? d->filters->size() : 0, (int)(bool)d->mask,
+                     (int)d->hasText, d->children.size(), d->depth, d->name.c_str(),
+                     (int)d->visible);
     // 对象局部变换（parent twips -> parent twips）。
     // 时间轴放置的对象直接沿用 PlaceObject 的完整 2x2（hasFull），保留错切/旋转的
     // 非正交分量；仅 AS3 动态创建/改写 scaleX/scaleY/rotation 的对象才走分解模型。
@@ -4156,9 +4447,9 @@ void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Mat
     if (!s_inMaskPass && isAlphaMaskShape(*d, movie)) return;
     // 自身内容 = 角色(未 timelineBuilt) + AS3 Graphics + 动态文本；纯容器（只有子节点）
     // 没有可缓存内容，走直连 Impl（只递归子树），避免每帧为一空层付出整幅清零+扫描。
-    const bool hasOwnContent = (d->characterId && !d->timelineBuilt) ||
+    const bool hasOwnContent = ((d->characterId && !d->timelineBuilt) ||
                                (d->graphics && !d->graphics->empty()) ||
-                               (d->hasText && !d->textData.empty());
+                               (d->hasText && !d->textData.empty()));
     // 门控必须解引用：enabled() 返回 const bool*，指针在布尔上下文中永真，
     // 不解引用会让 SWF_RASTER_CACHE 开关失效（每个有自身内容的节点每帧都走
     // miss 路径：4MB 层分配 + 全帧 alpha 扫描 + 合成），表现为 5.5× 渲染回退。
@@ -4181,7 +4472,8 @@ void renderDisplayObject(const std::shared_ptr<fvm::DisplayObject>& d, const Mat
                              ? ((d->kind == fvm::ObjKind::MovieClip && d->currentFrame > 0)
                                     ? d->currentFrame : frameIndex)
                              : 0;
-        if (rastercache::begin(d.get(), world, a, cx, fIdx, movie, buf, W, H)) {
+        const bool _rcHit = rastercache::begin(d.get(), world, a, cx, fIdx, movie, buf, W, H);
+        if (_rcHit) {
             renderRuntimeChildren(d->children, world, movie, buf, W, H, frameIndex, a, cx);
             return;
         }
@@ -4347,7 +4639,7 @@ void sfpRuntimeNode(std::uint64_t& h, const std::shared_ptr<fvm::DisplayObject>&
                     bool& consumed) {
     if (!d) return;
     sfptr(h, d.get());
-    h = rastercache::contentFingerprint(*d);
+    sfp(h, rastercache::contentFingerprint(*d));
     if (g_fpdbg.on) {
         FpDbg::Snap s;
         s.fp = h; s.cid = d->characterId; s.kind = static_cast<int>(d->kind);
@@ -4375,7 +4667,296 @@ void sfpRuntimeNode(std::uint64_t& h, const std::shared_ptr<fvm::DisplayObject>&
     for (const auto& c : d->children) sfpRuntimeNode(h, c, consumed);
 }
 
+// ---- 运行时显示树 -> sink（GPU 路径）------------------------------------
+
+static void renderRuntimeChildrenToSink(IDisplayListSink& sink,
+    const std::vector<std::shared_ptr<fvm::DisplayObject>>& children,
+    const Matrix& parent, const Movie& movie,
+    const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+    int frameIndex, float alpha, const ColorTransform& cx);
+
+static void renderRuntimeObjectToSink(IDisplayListSink& sink,
+    const std::shared_ptr<fvm::DisplayObject>& d,
+    const Matrix& parent, const Movie& movie,
+    const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+    int frameIndex, float alpha, const ColorTransform& inheritedCx,
+    bool skipChildren = false);
+
+static void renderRuntimeObjectImplToSink(IDisplayListSink& sink,
+    const std::shared_ptr<fvm::DisplayObject>& d,
+    const Matrix& parent, const Movie& movie,
+    const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+    int frameIndex, float alpha, const ColorTransform& inheritedCx,
+    bool skipChildren = false);
+
+static void renderGraphicsToSink(IDisplayListSink& sink, const fvm::DisplayObject& d,
+                                 const Matrix& world, float alphaMul, BlendMode bm) {
+    if (!d.graphics || d.graphics->empty()) return;
+    auto toTw = [](double v) { return static_cast<float>(v * 20.0); };
+    ColorTransform noCx;
+    struct SubPath { std::vector<std::pair<float,float>> pts; bool closed = false; };
+    std::vector<SubPath> curFillPaths;
+    SubPath curSub;
+    bool fillOn = false; float fillAlpha = 1.0f; Color fillColor(0,0,0,255);
+    float strokeW = 0.0f; float strokeAlpha = 1.0f; Color strokeColor(0,0,0,255);
+    auto drawTransient = [&](const Shape& sh, float aMul) {
+        for (std::size_t i = 0; i < sh.fillStyles.size(); ++i)
+            sink.drawTransientFill(sh, i, world, noCx, bm, aMul);
+        for (std::size_t i = 0; i < sh.lineStyles.size(); ++i)
+            sink.drawTransientStroke(sh, i, world, noCx, bm, aMul);
+    };
+    auto setColor = [](Color& c, std::uint32_t argb) {
+        c = Color((std::uint8_t)((argb>>16)&0xFF),(std::uint8_t)((argb>>8)&0xFF),(std::uint8_t)(argb&0xFF),(std::uint8_t)(argb>>24));
+    };
+    auto closeSubpath = [&]() { if (curSub.pts.size() >= 2) curFillPaths.push_back(curSub); curSub = SubPath{}; };
+    auto flushFill = [&]() {
+        closeSubpath();
+        if (fillOn && !curFillPaths.empty()) {
+            Shape shape; shape.usesWinding = true;
+            FillStyle fs; fs.kind = FillKind::Solid; fs.color = fillColor; shape.fillStyles.push_back(fs);
+            std::vector<Contour> contours;
+            for (auto& sp : curFillPaths) {
+                if (sp.pts.size() < 3) continue;
+                Contour fc; for (auto& p : sp.pts) { fc.xs.push_back(p.first); fc.ys.push_back(p.second); }
+                contours.push_back(std::move(fc));
+            }
+            if (!contours.empty()) { shape.fillPaths.push_back(std::move(contours)); drawTransient(shape, alphaMul * fillAlpha); }
+        }
+        curFillPaths.clear(); fillOn = false;
+    };
+    auto addStrokeSeg = [&](float x0,float y0,float x1,float y1){
+        if(!(strokeW>0.0f)) return; float dx=x1-x0,dy=y1-y0,len=std::sqrt(dx*dx+dy*dy); if(len<=1e-6f) return;
+        float nx=-dy/len*strokeW*0.5f, ny=dx/len*strokeW*0.5f;
+        Shape ss; ss.usesWinding=true; FillStyle fs; fs.kind=FillKind::Solid; fs.color=strokeColor; ss.fillStyles.push_back(fs);
+        Contour fc; fc.xs={x0+nx,x1+nx,x1-nx,x0-nx}; fc.ys={y0+ny,y1+ny,y1-ny,y0-ny}; ss.fillPaths.push_back({fc});
+        drawTransient(ss, alphaMul*strokeAlpha);
+    };
+    auto lineToPt = [&](float x,float y){ if(curSub.pts.empty()){curSub.pts.emplace_back(x,y);return;} auto p=curSub.pts.back(); addStrokeSeg(p.first,p.second,x,y); curSub.pts.emplace_back(x,y); };
+    auto addLoop = [&](const std::vector<std::pair<float,float>>& pts){ if(pts.size()<3) return; SubPath sp; sp.pts=pts; sp.closed=true; curFillPaths.push_back(std::move(sp)); };
+    auto ellipseLoop = [&](float cxp,float cyp,float rx,float ry){ if(rx<=0||ry<=0) return; std::vector<std::pair<float,float>> pts; for(int i=0;i<40;++i){float a=(float)i*6.28318530718f/40; pts.emplace_back(cxp+std::cos(a)*rx,cyp+std::sin(a)*ry);} addLoop(pts); };
+
+    for (const auto& cmd : *d.graphics) {
+        switch (cmd.op) {
+            case fvm::GraphicsCmd::Op::BeginFill: closeSubpath(); curFillPaths.clear(); fillOn=true; setColor(fillColor,cmd.color); fillAlpha=(float)(cmd.color>>24)/255.0f; break;
+            case fvm::GraphicsCmd::Op::EndFill: flushFill(); break;
+            case fvm::GraphicsCmd::Op::LineStyle: strokeW=(cmd.a==cmd.a && cmd.a>0.0)?toTw(cmd.a):0.0f; setColor(strokeColor,cmd.color); strokeAlpha=(float)(cmd.color>>24)/255.0f; break;
+            case fvm::GraphicsCmd::Op::MoveTo: closeSubpath(); curSub.pts.emplace_back(toTw(cmd.x),toTw(cmd.y)); break;
+            case fvm::GraphicsCmd::Op::LineTo: lineToPt(toTw(cmd.x),toTw(cmd.y)); break;
+            case fvm::GraphicsCmd::Op::CurveTo: { float x0=0,y0=0; if(!curSub.pts.empty()){x0=curSub.pts.back().first;y0=curSub.pts.back().second;} for(int i=1;i<=12;++i){float t=(float)i/12,u=1-t; lineToPt(u*u*x0+2*u*t*toTw(cmd.cx)+t*t*toTw(cmd.x), u*u*y0+2*u*t*toTw(cmd.cy)+t*t*toTw(cmd.y));} break; }
+            case fvm::GraphicsCmd::Op::Rect: { closeSubpath(); float x=toTw(cmd.x),y=toTw(cmd.y),x1=toTw(cmd.x+cmd.w),y1=toTw(cmd.y+cmd.h); addLoop({{x,y},{x1,y},{x1,y1},{x,y1}}); break; }
+            case fvm::GraphicsCmd::Op::RoundRect: { closeSubpath(); float x=toTw(cmd.x),y=toTw(cmd.y),x1=toTw(cmd.x+cmd.w),y1=toTw(cmd.y+cmd.h); float r=toTw(cmd.r),rx=std::min(r,(x1-x)*0.5f),ry=std::min(r,(y1-y)*0.5f); if(rx<=0||ry<=0){addLoop({{x,y},{x1,y},{x1,y1},{x,y1}});break;} std::vector<std::pair<float,float>> pts; auto arc=[&](float acx,float acy,float a0,float a1){for(int i=0;i<=8;++i){float a=a0+(a1-a0)*i/8; pts.emplace_back(acx+std::cos(a)*rx,acy+std::sin(a)*ry);}}; arc(x1-rx,y+ry,-1.57079632679f,0); arc(x1-rx,y1-ry,0,1.57079632679f); arc(x+rx,y1-ry,1.57079632679f,3.14159265359f); arc(x+rx,y+ry,3.14159265359f,4.71238898038f); addLoop(pts); break; }
+            case fvm::GraphicsCmd::Op::Circle: closeSubpath(); ellipseLoop(toTw(cmd.x),toTw(cmd.y),toTw(cmd.r),toTw(cmd.r)); break;
+            case fvm::GraphicsCmd::Op::Ellipse: closeSubpath(); ellipseLoop(toTw(cmd.x+cmd.w*0.5),toTw(cmd.y+cmd.h*0.5),toTw(cmd.w*0.5),toTw(cmd.h*0.5)); break;
+        }
+    }
+    flushFill();
+}
+
+static void renderDynamicTextToSink(IDisplayListSink& sink, const fvm::DisplayObject& d,
+                                    const Matrix& world, const Movie& movie, float alpha) {
+    const FontGlyphs* fg = nullptr;
+    if (!d.textFont.empty())
+        for (const auto& kv : movie.characters)
+            if (kv.second && kv.second->font && kv.second->font->name == d.textFont) { fg = kv.second->font.get(); break; }
+    FontGlyphs deviceFont; if (!fg) { deviceFont.name = d.textFont; fg = &deviceFont; }
+    const float fontHeight = static_cast<float>(d.textSize) * 20.0f;
+    if (fontHeight <= 0.0f || d.textData.empty()) return;
+    const TextMetrics tm = textMetrics(*fg, fontHeight);
+    Color col((std::uint8_t)((d.textColor>>16)&0xFF),(std::uint8_t)((d.textColor>>8)&0xFF),(std::uint8_t)(d.textColor&0xFF),(std::uint8_t)((d.textColor>>24)&0xFF));
+    ColorTransform noCx;
+    float penX=0.0f, penY=0.0f; std::uint32_t prev=0;
+    for (std::uint32_t ch : utf8Codes(d.textData)) {
+        if (ch == (std::uint32_t)'\r') continue;
+        if (ch == (std::uint32_t)'\n') { penY += tm.lineH; penX = 0.0f; prev = 0; continue; }
+        int gi=-1; const Shape* gs=nullptr;
+        auto it = fg->codeToGlyph.find((int)ch);
+        if (it != fg->codeToGlyph.end() && it->second >= 0 && it->second < (int)fg->shapes.size()) { gi = it->second; gs = fg->shapes[(size_t)gi].get(); }
+        float deviceAdv = 0.0f;
+        float adv = glyphAdvanceTwips(*fg, gi, gs, deviceAdv, tm) + kerningUnits(*fg, prev, ch) * tm.scale;
+        float gsScale = gs ? tm.scale : tm.deviceScale;
+        if (gs) { Matrix ms; ms.sx=gsScale; ms.sy=gsScale; Matrix mt; mt.tx=penX; mt.ty=penY+tm.ascent; Matrix gm = world.post(ms).post(mt); sink.drawGlyph(*gs, gm, col, noCx, BlendMode::Normal, alpha); }
+        penX += adv; prev = ch;
+    }
+}
+
+static void renderRuntimeObjectImplToSink(IDisplayListSink& sink,
+    const std::shared_ptr<fvm::DisplayObject>& d,
+    const Matrix& parent, const Movie& movie,
+    const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+    int frameIndex, float alpha, const ColorTransform& inheritedCx,
+    bool skipChildren) {
+    if (!d || !d->visible) return;
+    if (d->clipDepth > 0) return;
+    if (isAlphaMaskShape(*d, movie)) return;
+    if (std::getenv("SWF_NODE_DBG"))
+        std::fprintf(stderr, "[gnode] cid=%u kind=%d clip=%u filt=%zu mask=%d txt=%d kids=%zu depth=%d name=%s vis=%d\n",
+                     (unsigned)d->characterId, (int)d->kind, (unsigned)d->clipDepth,
+                     d->filters ? d->filters->size() : 0, (int)(bool)d->mask,
+                     (int)d->hasText, d->children.size(), d->depth, d->name.c_str(),
+                     (int)d->visible);
+    Matrix world = parent.post(displayLocalMatrix(*d));
+    float a = alpha * (float)d->alpha;
+    ColorTransform ownCx; ownCx.hasMult=true; ownCx.hasAdd=true;
+    ownCx.mr=(float)d->cxMr; ownCx.mg=(float)d->cxMg; ownCx.mb=(float)d->cxMb; ownCx.ma=1.0f;
+    ownCx.ar=(float)d->cxAr; ownCx.ag=(float)d->cxAg; ownCx.ab=(float)d->cxAb; ownCx.aa=0.0f;
+    const ColorTransform cx = inheritedCx.post(ownCx);
+    bool staticTextReplaced = false;
+    if (d->characterId && !d->timelineBuilt) {
+        auto it = movie.characters.find(d->characterId);
+        if (it != movie.characters.end() && it->second) {
+            DisplayItem di;
+            di.depth = (std::uint16_t)(d->depth < 0 ? 0xFFFF : d->depth);
+            di.characterId = d->characterId; di.character = it->second;
+            di.buttonState = d->buttonState; di.ratio = d->ratio;
+            di.matrix = Matrix{}; di.cxform = cx;
+            if (d->hasTextOverride) { di.textOverride = d->textOverride; di.hasTextOverride = true; }
+            else if (d->hasText && !d->textData.empty() && it->second->kind == Character::Kind::EditText) { di.textOverride = d->textData; di.hasTextOverride = true; staticTextReplaced = true; }
+            int fIdx = (d->kind == fvm::ObjKind::MovieClip && d->currentFrame > 0) ? d->currentFrame : frameIndex;
+            bool prevRtClock = s_rtClockMode; s_rtClockMode = true;
+            renderItemIntoSink(sink, di, world, dict, fIdx, a, d->blend, ColorTransform{});
+            s_rtClockMode = prevRtClock;
+        }
+    }
+    if (d->graphics && !d->graphics->empty()) renderGraphicsToSink(sink, *d, world, a, d->blend);
+    if (d->hasText && !d->textData.empty() && !staticTextReplaced) renderDynamicTextToSink(sink, *d, world, movie, a);
+    if (!skipChildren) renderRuntimeChildrenToSink(sink, d->children, world, movie, dict, frameIndex, a, cx);
+}
+
+static void renderRuntimeObjectToSink(IDisplayListSink& sink,
+    const std::shared_ptr<fvm::DisplayObject>& d,
+    const Matrix& parent, const Movie& movie,
+    const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+    int frameIndex, float alpha, const ColorTransform& inheritedCx,
+    bool skipChildren) {
+    if (!d) return;
+    if (g_maskExcluded.count(d.get())) return;
+    // clipDepth>0 的对象是遮罩宿主：自身不绘制（其几何只作为裁剪形状），
+    // 由 renderRuntimeChildrenToSink 的 clipDepth 分支单独处理。
+    if (d->clipDepth > 0) return;
+    if (d->mask) {
+        if (std::getenv("SWF_NODE_DBG"))
+            std::fprintf(stderr, "[gmask] host cid=%u mask cid=%u (mask branch)\n",
+                         (unsigned)d->characterId, (unsigned)d->mask->characterId);
+        std::vector<std::pair<const Shape*, Matrix>> rawMasks;
+        std::vector<std::shared_ptr<Shape>> ownedMasks;
+        // 运行时遮罩：按 DisplayObject 树递归收集当前帧的遮罩几何，
+        // 覆盖库元件首帧之外的嵌套精灵/子节点，避免遮罩在动画中退化。
+        collectRuntimeMaskShapes(*d->mask, movie, Matrix{}, rawMasks, ownedMasks);
+        if (std::getenv("SWF_MASK_DBG"))
+            std::fprintf(stderr, "[as3mask] obj=%s cid=%u mask=%s cid=%u shapes=%zu\n",
+                         d->name.c_str(), (unsigned)d->characterId,
+                         d->mask->name.c_str(), (unsigned)d->mask->characterId, rawMasks.size());
+        if (!rawMasks.empty()) {
+            Matrix wm = parent.post(displayLocalMatrix(*d->mask));
+            std::vector<MaskShape> masks; masks.reserve(rawMasks.size());
+            for (const auto& mk : rawMasks) masks.push_back({mk.first, wm.post(mk.second)});
+            if (d->filters && !d->filters->empty()) sink.beginFilteredLayer(*d->filters);
+            sink.pushMask(masks);
+            renderRuntimeObjectImplToSink(sink,d,parent,movie,dict,frameIndex,alpha,inheritedCx,skipChildren);
+            sink.popMask();
+            if (d->filters && !d->filters->empty()) sink.endFilteredLayer();
+            return;
+        }
+        if (std::getenv("SWF_NODE_DBG"))
+            std::fprintf(stderr, "[gmask] host cid=%u mask cid=%u: no mask shapes (mask not applied)\n",
+                         (unsigned)d->characterId, (unsigned)d->mask->characterId);
+    }
+    if (d->filters && !d->filters->empty()) { sink.beginFilteredLayer(*d->filters); renderRuntimeObjectImplToSink(sink,d,parent,movie,dict,frameIndex,alpha,inheritedCx,skipChildren); sink.endFilteredLayer(); return; }
+    renderRuntimeObjectImplToSink(sink,d,parent,movie,dict,frameIndex,alpha,inheritedCx,skipChildren);
+}
+
+static void renderRuntimeChildrenToSink(IDisplayListSink& sink,
+    const std::vector<std::shared_ptr<fvm::DisplayObject>>& children,
+    const Matrix& parent, const Movie& movie,
+    const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+    int frameIndex, float alpha, const ColorTransform& cx) {
+    const int n = (int)children.size();
+    int i = 0;
+    while (i < n) {
+        const auto& c = children[(size_t)i];
+        if (c && c->clipDepth > 0) {
+            int j = i + 1;
+            while (j < n && children[(size_t)j] && children[(size_t)j]->depth >= 0 && children[(size_t)j]->depth <= c->clipDepth) ++j;
+            std::vector<std::pair<const Shape*, Matrix>> rawMasks; std::vector<std::shared_ptr<Shape>> ownedMasks;
+            collectRuntimeMaskShapes(*c, movie, Matrix{}, rawMasks, ownedMasks);
+            renderRuntimeObjectToSink(sink, c, parent, movie, dict, frameIndex, alpha, cx);
+            if (!rawMasks.empty() && j > i + 1) {
+                Matrix wm = parent.post(displayLocalMatrix(*c));
+                std::vector<MaskShape> masks; masks.reserve(rawMasks.size());
+                for (const auto& mk : rawMasks) masks.push_back({mk.first, wm.post(mk.second)});
+                if (std::getenv("SWF_MASK_DBG")) {
+                    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+                    for (const auto& mk : masks)
+                        for (const auto& group : mk.shape->fillPaths)
+                            for (const auto& ct : group)
+                                for (int k = 0; k < static_cast<int>(ct.xs.size()); ++k) {
+                                    float X, Y; mk.matrix.apply(ct.xs[k], ct.ys[k], X, Y);
+                                    x0 = std::min(x0, X); y0 = std::min(y0, Y);
+                                    x1 = std::max(x1, X); y1 = std::max(y1, Y);
+                                }
+                    std::fprintf(stderr, "[rtmask] clipDepth=%u shapes=%zu children=%d bbox=(%.1f,%.1f)-(%.1f,%.1f)\n",
+                                 (unsigned)c->clipDepth, masks.size(), j - i - 1, x0, y0, x1, y1);
+                }
+                sink.pushMask(masks);
+                for (int q = i + 1; q < j; ++q) renderRuntimeObjectToSink(sink, children[(size_t)q], parent, movie, dict, frameIndex, alpha, cx);
+                sink.popMask();
+            } else {
+                for (int q = i + 1; q < j; ++q) renderRuntimeObjectToSink(sink, children[(size_t)q], parent, movie, dict, frameIndex, alpha, cx);
+            }
+            i = j;
+        } else {
+            renderRuntimeObjectToSink(sink, c, parent, movie, dict, frameIndex, alpha, cx);
+            ++i;
+        }
+    }
+}
+
+static void renderRuntimeStageToSinkImpl(IDisplayListSink& sink, const Movie& movie,
+                                         const Matrix& root, int frameIndex) {
+    buildMaskExclusions(movie.runtimeStage);
+    if (std::getenv("SWF_NODE_DBG"))
+        std::fprintf(stderr, "[gmask] excluded=%zu\n", g_maskExcluded.size());
+    renderRuntimeChildrenToSink(sink, movie.runtimeStage, root, movie, movie.characters, frameIndex, 1.0f, ColorTransform{});
+    g_maskExcluded.clear();
+}
+
 }  // namespace
+
+void layoutEditText(const EditText& et, const Matrix& world,
+                    const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+                    std::vector<EditTextGlyph>& out) {
+    layoutEditTextCore(et, world, dict, out);
+}
+
+bool deviceGlyphOutline(const FontGlyphs& font, std::uint32_t code, Shape& out) {
+#ifdef _WIN32
+    const DeviceGlyph& dg = deviceGlyph(font.name, code, font.italic, font.bold);
+    if (!dg.found || dg.contours.empty()) return false;
+    FillStyle fs;
+    fs.kind = FillKind::Solid;
+    fs.color = Color(255, 255, 255, 255);
+    out.fillStyles.push_back(fs);
+    out.fillPaths.push_back(dg.contours);
+    out.usesWinding = true;
+    return true;
+#else
+    (void)font; (void)code; (void)out;
+    return false;
+#endif
+}
+
+// 用任意 sink 渲染一组显示列表（GPU 后端复用同一条遍历）。
+void renderDisplayList(IDisplayListSink& sink, const std::vector<DisplayItem>& items,
+                       const Matrix& root,
+                       const std::map<std::uint16_t, std::shared_ptr<Character>>& dict,
+                       int frameIndex, float alpha, const ColorTransform& inheritedCx) {
+    renderItemsWithSink(sink, items, root, dict, frameIndex, alpha, inheritedCx);
+}
+
+void renderRuntimeStageToSink(IDisplayListSink& sink, const Movie& movie,
+                              const Matrix& root, int frameIndex) {
+    renderRuntimeStageToSinkImpl(sink, movie, root, frameIndex);
+}
 
 std::uint64_t sceneFingerprint(const Movie& movie, const std::vector<DisplayItem>& legacyItems,
                                int frameIndex, int targetW, int targetH) {
@@ -4477,20 +5058,26 @@ void renderRuntimeObject(const std::shared_ptr<fvm::DisplayObject>& d, const Mat
 // 计算输出画布与根变换。targetW/H > 0 时按设备尺寸重新光栅化：根变换在
 // twips->px 的 1/20 之上再乘显示缩放，所有矢量边缘/字形轮廓都按新分辨率扫描填充，
 // 而不是先画小图再拉伸位图（后者放大必然像素化）。
-static void setupSurface(const Movie& movie, int targetW, int targetH,
-                         int& W, int& H, Matrix& root, std::size_t& npix) {
+Matrix stageRootMatrix(const Movie& movie, int& W, int& H, int targetW, int targetH) {
     const int stageW = static_cast<int>((movie.frameSize.x1 - movie.frameSize.x0) / 20.0f);
     const int stageH = static_cast<int>((movie.frameSize.y1 - movie.frameSize.y0) / 20.0f);
     const int baseW = stageW > 0 ? stageW : 1;
     const int baseH = stageH > 0 ? stageH : 1;
     W = targetW > 0 ? targetW : baseW;
     H = targetH > 0 ? targetH : baseH;
-    npix = static_cast<std::size_t>(W) * H;
     const float sx = static_cast<float>(W) / static_cast<float>(baseW);
     const float sy = static_cast<float>(H) / static_cast<float>(baseH);
+    Matrix root;
     root.sx = sx / 20.0f; root.sy = sy / 20.0f;
     root.tx = -movie.frameSize.x0 / 20.0f * sx;
     root.ty = -movie.frameSize.y0 / 20.0f * sy;
+    return root;
+}
+
+static void setupSurface(const Movie& movie, int targetW, int targetH,
+                         int& W, int& H, Matrix& root, std::size_t& npix) {
+    root = stageRootMatrix(movie, W, H, targetW, targetH);
+    npix = static_cast<std::size_t>(W) * H;
 }
 
 bool renderMovieToBuffer(const Movie& movie, int frameIndex,

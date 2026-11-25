@@ -199,6 +199,32 @@ bool decodeStreamSound(const Movie& m, PcmData& out, std::string& err) {
     return true;
 }
 
+void resamplePcm(PcmData& pcm, int targetRate) {
+    const int ch = pcm.channels > 0 ? pcm.channels : 1;
+    if (targetRate <= 0 || pcm.rate == targetRate || pcm.samples.empty()) {
+        if (targetRate > 0) pcm.rate = targetRate;
+        return;
+    }
+    const std::size_t inFrames = pcm.samples.size() / static_cast<std::size_t>(ch);
+    const double ratio = static_cast<double>(targetRate) / pcm.rate;
+    const std::size_t outFrames = static_cast<std::size_t>(inFrames * ratio);
+    std::vector<std::int16_t> out(outFrames * static_cast<std::size_t>(ch), 0);
+    for (std::size_t i = 0; i < outFrames; ++i) {
+        double src = i / ratio;
+        std::size_t i0 = static_cast<std::size_t>(src);
+        if (i0 >= inFrames) i0 = inFrames - 1;
+        const std::size_t i1 = (i0 + 1 < inFrames) ? i0 + 1 : i0;
+        const double t = src - static_cast<double>(i0);
+        for (int c = 0; c < ch; ++c) {
+            const double a = pcm.samples[i0 * ch + c];
+            const double b = pcm.samples[i1 * ch + c];
+            out[i * ch + c] = static_cast<std::int16_t>(std::lround(a + (b - a) * t));
+        }
+    }
+    pcm.samples.swap(out);
+    pcm.rate = targetRate;
+}
+
 bool writeWav(const std::string& path, const PcmData& pcm) {
     // M7：FILE* 交给 RAII，避免写 WAV 中途提前返回/异常时泄漏文件句柄。
     std::unique_ptr<std::FILE, int(*)(std::FILE*)> guard(std::fopen(path.c_str(), "wb"), &std::fclose);
@@ -288,8 +314,11 @@ struct AudioOut::Impl {
     struct Seg {
         std::vector<std::int16_t> data;
         std::size_t pos = 0;
-        bool loop = false;
+        int repeats = 0;     // 剩余重复次数；<0 表示无限循环
+        float volume = 1.0f; // 声道增益（AS3 SoundTransform.volume）
+        int id = 0;          // 声道句柄（AS3 SoundChannel 停止用）
     };
+    int nextId_ = 1;
     std::deque<Seg> queue_;
 };
 
@@ -317,7 +346,12 @@ bool AudioOut::open(int rate, int channels) {
     wfx.wBitsPerSample = 16;
     wfx.nBlockAlign = static_cast<WORD>(channels * 2);
     wfx.nAvgBytesPerSec = static_cast<DWORD>(rate) * wfx.nBlockAlign;
-    if (waveOutOpen(&impl_->h_, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+    const MMRESULT openRc = waveOutOpen(&impl_->h_, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL);
+    if (openRc != MMSYSERR_NOERROR) {
+        // 设备/驱动拒绝该采样格式时此前完全静默，只能听到"没有声音"；
+        // 把 MMRESULT 打出来（无设备 / 被独占 / 格式不支持各不相同）。
+        std::fprintf(stderr, "[audio] waveOutOpen failed rc=%u rate=%d ch=%d\n",
+                     static_cast<unsigned>(openRc), rate, channels);
         impl_->h_ = nullptr;
         impl_->open_ = false;
         impl_->quit_ = true;   // 无 worker 时 queue() 必须拒绝，否则 FIFO 无限增长
@@ -378,15 +412,19 @@ bool AudioOut::open(int rate, int channels) {
                                 const std::size_t take = std::min(need - written, avail);
                                 for (std::size_t k = 0; k < take; ++k) {
                                     const int v = static_cast<int>(buf[written + k]) +
-                                                  static_cast<int>(seg.data[seg.pos + k]);
+                                                  static_cast<int>(seg.data[seg.pos + k] * seg.volume);
                                     buf[written + k] = static_cast<std::int16_t>(
                                         v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
                                 }
                                 written += take;
                                 seg.pos += take;
                                 if (seg.pos >= seg.data.size()) {
-                                    if (seg.loop) seg.pos = 0;
-                                    else { finished = true; break; }
+                                    // 有限次重复必须真的结束，否则 Sound.play(0,1)
+                                    // 这类一次性音效（按钮悬停/点击）会永远循环。
+                                    if (seg.repeats != 0) {
+                                        if (seg.repeats > 0) --seg.repeats;
+                                        seg.pos = 0;
+                                    } else { finished = true; break; }
                                 }
                                 if (take == 0) break;
                             }
@@ -396,8 +434,26 @@ bool AudioOut::open(int rate, int channels) {
                         }
                     }
                     if (maxWritten == 0) continue;          // 无活跃音效：不提交空缓冲
+                    // 诊断：SWF_AUDIO_DUMP=<file> 把真正送去 waveOut 的 PCM 追加落盘，
+                    // 用于离线确认"开场音效有没有波形"、"静音开关是否真的归零"。
+                    if (const char* dp = std::getenv("SWF_AUDIO_DUMP")) {
+                        if (std::FILE* f = std::fopen(dp, "ab")) {
+                            std::fwrite(buf.data(), sizeof(std::int16_t), maxWritten, f);
+                            std::fclose(f);
+                        }
+                    }
                     hdr.dwBufferLength = static_cast<DWORD>(maxWritten * sizeof(std::int16_t));
-                    waveOutWrite(imp->h_, &hdr, sizeof hdr);
+                    const MMRESULT writeRc = waveOutWrite(imp->h_, &hdr, sizeof hdr);
+                    if (writeRc != MMSYSERR_NOERROR) {
+                        // 只报一次，避免每 10ms 刷屏；写失败说明数据没进设备。
+                        static bool writeErrReported = false;
+                        if (!writeErrReported) {
+                            writeErrReported = true;
+                            std::fprintf(stderr, "[audio] waveOutWrite failed rc=%u bytes=%lu\n",
+                                         static_cast<unsigned>(writeRc),
+                                         static_cast<unsigned long>(hdr.dwBufferLength));
+                        }
+                    }
                 }
             }
         }
@@ -410,20 +466,48 @@ bool AudioOut::open(int rate, int channels) {
 #endif
 }
 
-void AudioOut::queue(const std::int16_t* samples, std::size_t count, bool loop) {
-    if (!samples || count == 0) return;
+int AudioOut::queue(const std::int16_t* samples, std::size_t count, int repeats) {
+    if (!samples || count == 0) return 0;
 #ifdef _WIN32
+    int id = 0;
     {
         std::lock_guard<std::mutex> lk(impl_->mtx_);
-        if (!impl_->open_ || impl_->quit_) return;  // 设备不可用时不堆积数据
+        if (!impl_->open_ || impl_->quit_) return 0;  // 设备不可用时不堆积数据
         Impl::Seg seg;
         seg.data.assign(samples, samples + count);
-        seg.loop = loop;
+        seg.repeats = repeats < 0 ? -1 : repeats;
+        seg.id = impl_->nextId_++;
+        id = seg.id;
         impl_->queue_.push_back(std::move(seg));
     }
     impl_->cv_.notify_one();
+    return id;
 #else
-    (void)loop;
+    (void)repeats;
+    return 0;
+#endif
+}
+
+void AudioOut::setChannelVolume(int id, float volume) {
+    if (id == 0) return;
+    // NaN/负值一律当 0：MusicController 的 m_volumeSize 早期可能是 undefined。
+    if (!(volume > 0.0f)) volume = 0.0f;
+    else if (volume > 1.0f) volume = 1.0f;
+    std::lock_guard<std::mutex> lk(impl_->mtx_);
+    for (auto& seg : impl_->queue_)
+        if (seg.id == id) seg.volume = volume;
+}
+
+void AudioOut::stopChannel(int id) {
+    if (id == 0) return;
+    std::lock_guard<std::mutex> lk(impl_->mtx_);
+    for (auto it = impl_->queue_.begin(); it != impl_->queue_.end();) {
+        if (it->id == id) it = impl_->queue_.erase(it);
+        else ++it;
+    }
+#ifdef _WIN32
+    // 已交给设备的缓冲无法按声道剔除；队列已空时整体 reset，避免停止后仍响一小段。
+    if (impl_->queue_.empty() && impl_->h_) waveOutReset(impl_->h_);
 #endif
 }
 
@@ -456,5 +540,7 @@ void AudioOut::close() {
 }
 
 bool AudioOut::isOpen() const { return impl_->open_; }
+
+int AudioOut::rate() const { return impl_->rate_; }
 
 }  // namespace swf

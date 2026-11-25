@@ -241,6 +241,23 @@ public:
     // 播放循环：推进所有 MovieClip 时间轴后派发 enterFrame 事件（动画驱动）
     void tick();
 
+    // ---- AS3 声音回调（由 Player 注入真实音频输出）----
+    // play(soundId, loops) 播放嵌入式 DefineSound，返回声道句柄（0=未播放）；
+    // stop(handle) 停止该声道。未注入时 Sound.play() 只返回 SoundChannel 不发声
+    // （纯解析/离屏渲染工具的行为）。
+    // volume(handle, 0..1) 设置声道增益（AS3 SoundTransform.volume）；
+    // frameSound(id, stop, loop) 播放时间轴帧上的 StartSound（SWF 里的 AVM1
+    // 声音标签，即使在 AVM2 影片中也是播放器级标签，不依赖 ActionScript）。
+    void setSoundHandlers(std::function<int(std::uint16_t, int)> play,
+                          std::function<void(int)> stop,
+                          std::function<void(int, float)> volume = {},
+                          std::function<void(std::uint16_t, bool, bool)> frameSound = {}) {
+        soundPlay_ = std::move(play);
+        soundStop_ = std::move(stop);
+        soundVolume_ = std::move(volume);
+        soundFrame_ = std::move(frameSound);
+    }
+
     // 把时间轴 MovieClip 停到指定内部帧（0 基）并按该帧重建放置列表。
     void setClipFrame(const std::shared_ptr<DisplayObject>& d, int frameIndex);
 
@@ -280,6 +297,10 @@ public:
                       std::shared_ptr<Object> thisObj = nullptr);
     std::shared_ptr<ClassDef> buildClass(int instanceIndex);
     Value constructObject(const Value& cls, const std::vector<Value>& cargs);
+    // 按名字取类对象（全名 / 短名）。ABC 里有定义但尚未被 newclass 实例化的类
+    // （典型：SymbolClass 导出的嵌入式声音类，只被 getDefinitionByName 按字符串引用）
+    // 会在此现场建类对象并登记到全局表。
+    Value classByName(const std::string& name);
     std::string qualifiedName(uint32_t index) const;
 
     // applicationDomain.domainMemory（Alchemy / FP11+）绑定的字节缓冲。
@@ -292,6 +313,10 @@ public:
 
 private:
     std::shared_ptr<std::vector<std::uint8_t>> domainMemoryData_;
+    std::function<int(std::uint16_t, int)> soundPlay_;
+    std::function<void(int)> soundStop_;
+    std::function<void(int, float)> soundVolume_;
+    std::function<void(std::uint16_t, bool, bool)> soundFrame_;
     // TweenLite/TweenMax 补间：按虚拟时钟在 tick() 中插值目标属性。
     struct TweenTask {
         std::shared_ptr<Object> target;
@@ -390,7 +415,14 @@ private:
 // 运行影片中的全部 ABC 脚本并构建运行时显示列表。
 // 返回的 Vm 实例须保持存活（shared_ptr），以支持逐帧 tick() 驱动动画与事件。
 // initialFrame >= 0 时强制以该帧建立初始显示树（静态渲染首帧传 0）。
-std::vector<std::shared_ptr<Vm>> runMovieScripts(Movie& movie, int initialFrame = -1);
+// playSound/stopSound：AS3 声音输出回调，必须在 run() 之前注入——文档类/单例的
+// 构造函数常在第一帧脚本里就启动背景乐，晚一步注入会丢掉这一次播放。
+std::vector<std::shared_ptr<Vm>> runMovieScripts(
+    Movie& movie, int initialFrame = -1,
+    std::function<int(std::uint16_t, int)> playSound = {},
+    std::function<void(int)> stopSound = {},
+    std::function<void(int, float)> volumeSound = {},
+    std::function<void(std::uint16_t, bool, bool)> frameSound = {});
 
 }  // namespace fvm
 }  // namespace swf

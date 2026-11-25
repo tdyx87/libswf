@@ -168,6 +168,88 @@ if(MSVC)
     target_compile_definitions(swfparser PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+# ---- GPU 渲染适配器骨架（可选）：显示列表 sink -> ../d3drender 的 swfr 后端 ----
+# 默认 OFF：软件光栅器仍是唯一必需的渲染路径（CI/无 GPU 环境）。
+# 打开后额外产出 swf_render_gpu 库与 swfparser_gpu 验证工具。
+option(SWFPARSER_D3D11_BACKEND "Build the D3D11 GPU display-list adapter (uses ../d3drender)" OFF)
+if(SWFPARSER_D3D11_BACKEND)
+    # 默认假定 d3drender 与本项目同级（F:/project/product/d3drender）；可用缓存变量覆盖。
+    set(SWF_D3DRENDER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../d3drender" CACHE PATH "swfr 渲染后端源码目录")
+    if(NOT EXISTS "${SWF_D3DRENDER_DIR}/render/Renderer.cpp")
+        message(FATAL_ERROR "SWFPARSER_D3D11_BACKEND=ON, but ${SWF_D3DRENDER_DIR}/render/Renderer.cpp is missing")
+    endif()
+
+    add_library(swfrender_d3d STATIC
+        ${SWF_D3DRENDER_DIR}/render/Renderer.cpp
+        ${SWF_D3DRENDER_DIR}/render/Tessellator.cpp
+    )
+    target_include_directories(swfrender_d3d PUBLIC ${SWF_D3DRENDER_DIR})
+    target_compile_features(swfrender_d3d PUBLIC cxx_std_17)
+    target_compile_definitions(swfrender_d3d PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(swfrender_d3d PUBLIC d3d11 dxgi d3dcompiler)
+    if(MSVC)
+        target_compile_options(swfrender_d3d PRIVATE /W4 /permissive- /utf-8)
+    endif()
+
+    add_library(swf_render_gpu STATIC src/GpuRenderSink.cpp)
+    target_link_libraries(swf_render_gpu PUBLIC swf_render swfrender_d3d)
+    if(MSVC)
+        target_compile_options(swf_render_gpu PRIVATE /W3 /utf-8)
+        target_compile_definitions(swf_render_gpu PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+
+    add_executable(swfparser_gpu src/gpu_player.cpp)
+    target_link_libraries(swfparser_gpu PRIVATE swf_render_gpu)
+    if(MSVC)
+        target_compile_options(swfparser_gpu PRIVATE /W3 /utf-8)
+        target_compile_definitions(swfparser_gpu PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+
+    # D3D11 交换链窗口播放器（仅 Windows）：每帧直接画进后台缓冲，
+    # 不经过 CPU 像素缓冲，也没有 RGBA->BGRA + StretchDIBits 的显示端缩放。
+    add_executable(swfplayer_gpu src/player_win_gpu.cpp)
+    target_link_libraries(swfplayer_gpu PRIVATE swf_render_gpu user32 gdi32 winmm)
+    if(MSVC)
+        target_compile_options(swfplayer_gpu PRIVATE /W3 /utf-8)
+        target_compile_definitions(swfplayer_gpu PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+
+    # 软件光栅器 vs GPU 适配器逐像素一致性回归（无 D3D11 设备时返回 77 = SKIP）。
+    add_executable(test_gpu_parity tests/test_gpu_parity.cpp)
+    target_link_libraries(test_gpu_parity PRIVATE swf_render_gpu)
+    target_compile_definitions(test_gpu_parity PRIVATE
+        SWF_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/testswf")
+    if(MSVC)
+        target_compile_options(test_gpu_parity PRIVATE /W3 /utf-8)
+        target_compile_definitions(test_gpu_parity PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+    # VS2017 默认把 WindowsTargetPlatformVersion 定在 8.1，而 d3drender 用的是 Win10 SDK
+    # （8.1 的 <wrl/client.h> 与 /permissive- 不兼容）。全局改 CMAKE_SYSTEM_VERSION 会
+    # 重定向整个项目，这里只给 GPU 这三个目标指定 SDK 版本。
+    set(SWF_WINSDK_VERSION "" CACHE STRING "GPU 目标使用的 Windows 10 SDK 版本（空 = 自动取最新）")
+    if(MSVC AND NOT SWF_WINSDK_VERSION)
+        file(GLOB _swf_sdk_dirs LIST_DIRECTORIES true
+             "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/Include/10.*"
+             "$ENV{ProgramW6432}/Windows Kits/10/Include/10.*")
+        if(_swf_sdk_dirs)
+            list(SORT _swf_sdk_dirs)
+            list(REVERSE _swf_sdk_dirs)
+            list(GET _swf_sdk_dirs 0 _swf_sdk_dir)
+            get_filename_component(SWF_WINSDK_VERSION "${_swf_sdk_dir}" NAME)
+        endif()
+    endif()
+    if(MSVC AND NOT SWF_WINSDK_VERSION)
+        message(FATAL_ERROR
+            "SWFPARSER_D3D11_BACKEND=ON 需要 Windows 10 SDK；找不到时请用 -DSWF_WINSDK_VERSION=10.0.xxxxx.0 指定")
+    endif()
+    if(MSVC)
+        set_target_properties(swfrender_d3d swf_render_gpu swfparser_gpu test_gpu_parity
+            swfplayer_gpu PROPERTIES VS_GLOBAL_WindowsTargetPlatformVersion "${SWF_WINSDK_VERSION}")
+        message(STATUS "D3D11 GPU adapter: Windows SDK ${SWF_WINSDK_VERSION}")
+    endif()
+    message(STATUS "D3D11 GPU adapter: ON (${SWF_D3DRENDER_DIR})")
+endif()
+
 # ---- 窗口化播放器（仅 Windows）：双击/命令行打开 SWF 即播放 ----
 # 用系统 Win32 + GDI 直接呈现软件光栅器的输出，不引入 SDL/GLFW 等新依赖。
 if(WIN32)
@@ -183,6 +265,16 @@ if(WIN32)
 endif()
 
 include(CTest)  # 提供 BUILD_TESTING 开关，并等价于 enable_testing()
+
+# 软件光栅器 vs GPU 适配器逐像素一致性（仅在 GPU 后端开启时存在该目标）。
+# 无 D3D11 设备时测试进程返回 77，按 SKIP 计数而不是失败。
+if(TARGET test_gpu_parity)
+    add_test(NAME swfparser_gpu_parity COMMAND test_gpu_parity)
+    set_tests_properties(swfparser_gpu_parity PROPERTIES
+        TIMEOUT 300
+        SKIP_RETURN_CODE 77
+        FAIL_REGULAR_EXPRESSION "FAIL|Assertion failed")
+endif()
 add_test(NAME swfparser_help COMMAND swfparser --help)
 add_test(NAME swfparser_opcodes COMMAND swfparser --opcodes)
 add_test(NAME swfparser_avm2_opcodes COMMAND swfparser --avm2-opcodes)

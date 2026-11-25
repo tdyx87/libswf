@@ -246,7 +246,18 @@ bool Player::load(const std::vector<std::uint8_t>& data, std::string& err) {
     if (stageH_ <= 0) stageH_ = 400;
 
     vms_.clear();
-    if (!movie_.abcFiles.empty()) vms_ = fvm::runMovieScripts(movie_);
+    if (!movie_.abcFiles.empty()) {
+        // AVM2 的 flash.media.Sound 需注入播放回调才会真正出声；必须在 run() 之前
+        // 注入，因为文档类/单例构造时就可能开始播放背景乐（swf2 的 MusicController）。
+        vms_ = fvm::runMovieScripts(movie_, -1,
+            [this](std::uint16_t id, int loops) { return playEmbeddedSound(id, loops); },
+            [this](int handle) { audio_.stopChannel(handle); },
+            [this](int handle, float v) { audio_.setChannelVolume(handle, v); },
+            [this](std::uint16_t id, bool stop, bool loop) {
+                SoundEvent ev; ev.soundId = id; ev.stop = stop; ev.loop = loop;
+                playSoundEvent(ev);
+            });
+    }
 
     // 把 AVM1 解释器接到本时间轴：否则 Machine::run 会因 timeline==nullptr 直接返回，
     // 脚本中的 stop/play/gotoAndPlay 等全部失效（表现为"只推进时间轴、不执行脚本"）。
@@ -468,6 +479,18 @@ void Player::syncTextFields() {
     syncTextInItems(avm1_.globals, curItems_, nullptr);
 }
 
+int Player::advanceFrames(int n) {
+    // --frame N 的唯一实现：两个 CLI 都走这里，避免"同一帧号不同画面"。
+    // 时间轴只有 totalFrames() 帧（索引 0..total-1），N 超出时截到末帧，
+    // 否则会绕着循环多跑很多圈、还把脚本副作用累加多次。
+    const int total = totalFrames();
+    int want = n;
+    if (total > 0 && want > total - 1) want = total - 1;
+    if (want < 0) want = 0;
+    for (int i = 0; i < want; ++i) tick();
+    return want;
+}
+
 void Player::tick() {
     // 1) 推进播放头：优先消费待处理的 gotoAndPlay/gotoAndStop；否则按 playing_ 前进。
     //    主时间轴到末帧后回到第 1 帧（MovieClip 默认循环）。
@@ -525,7 +548,7 @@ void Player::tick() {
             std::string err;
             if (decodeSound(tmp, pcm, err)) {
                 audio_.open(pcm.rate, pcm.channels);
-                audio_.queue(pcm.samples.data(), pcm.samples.size(), false);
+                audio_.queue(pcm.samples.data(), pcm.samples.size(), 0);
             } else {
                 fprintf(stderr, "stream decode fail: %s\n", err.c_str());
             }
@@ -578,6 +601,21 @@ bool Player::render(std::vector<std::uint8_t>& rgba, int& W, int& H,
     lastSceneFp_ = fp;
     haveSceneFp_ = true;
     lastRasterized_ = true;
+    return true;
+}
+
+bool Player::renderFrame(IDisplayListSink& sink, int targetW, int targetH) {
+    syncTextFields();   // 与 render() 一致：渲染输入包含最新的文本框内容
+
+    int W = 0, H = 0;
+    const Matrix root = stageRootMatrix(movie_, W, H, targetW, targetH);
+    sink.beginFrame(W, H, movie_.characters);
+    if (!movie_.runtimeStage.empty()) {
+        renderRuntimeStageToSink(sink, movie_, root, frame_ - 1);
+    } else {
+        renderDisplayList(sink, curItems_, root, movie_.characters, frame_ - 1, 1.0f);
+    }
+    sink.endFrame();
     return true;
 }
 
@@ -821,8 +859,28 @@ void Player::pollMouseEvents(bool down) {
     }
 }
 
+int Player::playEmbeddedSound(std::uint16_t soundId, int loops) {
+    auto it = movie_.sounds.find(soundId);
+    if (it == movie_.sounds.end()) return 0;
+    PcmData pcm;
+    std::string err;
+    if (!decodeSound(it->second, pcm, err)) {
+        fprintf(stderr, "AVM2 Sound.play decodeSound fail id=%u %s\n", soundId, err.c_str());
+        return 0;
+    }
+    // 混音设备只按一个采样率工作：其它采样率（开场音效 347/348 为 22k/11k）
+    // 重采样后入队，避免重开 waveOut 打断正在播放的背景乐。
+    if (!audio_.isOpen()) audio_.open(pcm.rate, pcm.channels);
+    resamplePcm(pcm, audio_.rate());
+    // AS3 语义：loops 是额外重复次数（0=一遍）；负值/极大值当作无限循环。
+    return audio_.queue(pcm.samples.data(), pcm.samples.size(), loops);
+}
+
 void Player::playSoundEvent(const SoundEvent& ev) {
     if (ev.soundId == 0) return;
+    if (std::getenv("SWF_AS_SOUND"))
+        std::fprintf(stderr, "[sound] event id=%u stop=%d loop=%d%c",
+                     static_cast<unsigned>(ev.soundId), ev.stop ? 1 : 0, ev.loop ? 1 : 0, 10);
     auto it = movie_.sounds.find(ev.soundId);
     if (it == movie_.sounds.end()) return;
     const Sound& s = it->second;
@@ -833,8 +891,12 @@ void Player::playSoundEvent(const SoundEvent& ev) {
         return;
     }
     // 首次播放时才打开 waveOut（此前从未调用 open，导致后台线程空转、完全无声）。
-    audio_.open(pcm.rate, pcm.channels);
-    audio_.queue(pcm.samples.data(), pcm.samples.size(), ev.loop);
+    if (!audio_.isOpen()) audio_.open(pcm.rate, pcm.channels);
+    resamplePcm(pcm, audio_.rate());
+    const int chan = audio_.queue(pcm.samples.data(), pcm.samples.size(), ev.loop ? -1 : 0);
+    if (std::getenv("SWF_AS_SOUND"))
+        std::fprintf(stderr, "[sound] frame chan=%d samples=%zu rate=%d%c", chan,
+                     pcm.samples.size(), pcm.rate, 10);
 }
 
 void* Player::findChildClip(const std::string& name) {
