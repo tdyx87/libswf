@@ -2294,6 +2294,13 @@ static Value traitDefaultValue(const abc::AbcFile& abc, const abc::Traits& t) {
         case 0x04: if (t.functionName < abc.uints.size()) return Value::uintv(abc.uints[t.functionName]); break;
         case 0x06: if (t.functionName < abc.doubles.size()) return Value::num(abc.doubles[t.functionName]); break;
         case 0x01: if (t.functionName < abc.strings.size()) return Value::str(abc.strings[t.functionName]); break;
+        // 布尔/null/undefined 字面量默认值（如 `private var m_isRunning:Boolean = true`）。
+        // 之前一律落成 undefined：游戏里音乐开关字段初值 true 丢失，MusicButton 判定
+        // isRunning 为假 → 按钮停在"关闭"帧，且 setter 按 falsy 分支把音量设成 0。
+        case 0x0A: return Value::boolean(false);
+        case 0x0B: return Value::boolean(true);
+        case 0x0C: return Value::nullv();
+        case 0x0D: return Value::undefined();
         default: break;
     }
     return Value::undefined();
