@@ -878,9 +878,6 @@ int Player::playEmbeddedSound(std::uint16_t soundId, int loops) {
 
 void Player::playSoundEvent(const SoundEvent& ev) {
     if (ev.soundId == 0) return;
-    if (std::getenv("SWF_AS_SOUND"))
-        std::fprintf(stderr, "[sound] event id=%u stop=%d loop=%d%c",
-                     static_cast<unsigned>(ev.soundId), ev.stop ? 1 : 0, ev.loop ? 1 : 0, 10);
     auto it = movie_.sounds.find(ev.soundId);
     if (it == movie_.sounds.end()) return;
     const Sound& s = it->second;
@@ -893,10 +890,7 @@ void Player::playSoundEvent(const SoundEvent& ev) {
     // 首次播放时才打开 waveOut（此前从未调用 open，导致后台线程空转、完全无声）。
     if (!audio_.isOpen()) audio_.open(pcm.rate, pcm.channels);
     resamplePcm(pcm, audio_.rate());
-    const int chan = audio_.queue(pcm.samples.data(), pcm.samples.size(), ev.loop ? -1 : 0);
-    if (std::getenv("SWF_AS_SOUND"))
-        std::fprintf(stderr, "[sound] frame chan=%d samples=%zu rate=%d%c", chan,
-                     pcm.samples.size(), pcm.rate, 10);
+    audio_.queue(pcm.samples.data(), pcm.samples.size(), ev.loop ? -1 : 0);
 }
 
 void* Player::findChildClip(const std::string& name) {

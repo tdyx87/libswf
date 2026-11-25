@@ -4789,10 +4789,6 @@ void Vm::registerNativeClasses() {
                 // AudioOut::queue 的参数是"额外重复次数"，所以这里要减 1——否则游戏里
                 // 一次性按钮音效（Sound.play(0,1)）会被播成两遍。
                 const int plays = (a.size() > 1 && a[1].toInt() > 0) ? a[1].toInt() : 1;
-                if (std::getenv("SWF_AS_SOUND"))
-                    std::fprintf(stderr, "[sound] avm2 play class=%s sid=%u loops=%d\n",
-                                 self ? self->className.c_str() : "",
-                                 static_cast<unsigned>(sid), plays);
                 int handle = 0;
                 if (sid != 0 && soundPlay_) handle = soundPlay_(sid, plays - 1);
                 auto it = globals_->props.find("SoundChannel");
