@@ -389,11 +389,131 @@ void plot(std::uint8_t* buf, int W, int H, int px, int py, const Color& c, Blend
     d[3] = clampU8(static_cast<int>(outA * 255.0f));
 }
 
+// 同一形状内多个填充的覆盖率累积器。
+//
+// 逐个填充各自 plot() 时，接缝像素被相邻两侧各覆盖约一半：第一次 over 后不透明度
+// 0.5、第二次 0.5 over 只剩 0.75，约 20%~25% 的背景色透出来，形成 1px 亮/灰虚线。
+// 这里把一批相邻填充按像素累积「覆盖率 × alpha」与加权颜色，最后整批一次合成：
+// 相邻两半覆盖率相加为 1，接缝不再漏背景；颜色是加权平均，而重叠处仍保持
+// “后画在上”的覆盖关系（见 add() 的已覆盖分支）。
+// 缓冲只覆盖「本批填充的设备包围盒」而不是整幅画布，并跨批次复用：
+// AVM2 运行时路径每个显示对象都会新建一个软件 sink（renderItemInto），若按画布
+// 尺寸分配（1280x768 约 15MB）并清零，这部分开销会在每个对象上重复一次。
+// 每行还记录实际写过的 x 范围，合成与清零只处理真正被填充到的像素。
+struct FillAccum {
+    int x0 = 0, y0 = 0;   // 当前累积区域的设备左上角
+    int w = 0, h = 0;     // 区域尺寸
+    // 每像素 4 个 float：预乘颜色加权和 r,g,b 与覆盖率×alpha 加权和 w。
+    // 交织存放让累积与合成都只碰一条 cache line（原来 rgb/wsum 分成两个数组）。
+    std::vector<float> px;
+    std::vector<int> rmin, rmax;   // 按**设备行号**（绝对 y）记录写过的 x 范围
+
+    void begin(int bx0, int by0, int bx1, int by1) {
+        x0 = bx0; y0 = by0;
+        w = bx1 - bx0 + 1; h = by1 - by0 + 1;
+        const std::size_t n = static_cast<std::size_t>(w) * h;
+        // 只在需要更大空间时增长；新元素由 resize 置 0，其余空间在上次合成后已清零。
+        if (px.size() < n * 4) px.resize(n * 4, 0.0f);
+        // 行范围按绝对行号索引：跨批次复用，不需要每批重新初始化整张表
+        // （每组都 assign 一次 h 行的开销在每帧上万次分组累计下很可观）。
+        if (rmin.size() < static_cast<std::size_t>(by1) + 1) {
+            rmin.resize(static_cast<std::size_t>(by1) + 1, INT_MAX);
+            rmax.resize(static_cast<std::size_t>(by1) + 1, -1);
+        }
+    }
+    // a = 覆盖率 × alpha（0..1）。像素已被先前填充完全覆盖时按 over 覆盖，保持后画在上。
+    inline void add(int x, int y, const Color& c, float a) {
+        if (a <= 0.0f) return;
+        const int lx = x - x0, ly = y - y0;
+        if (lx < 0 || ly < 0 || lx >= w || ly >= h) return;
+        if (x < rmin[y]) rmin[y] = x;
+        if (x > rmax[y]) rmax[y] = x;
+        const std::size_t q = (static_cast<std::size_t>(ly) * w + lx) * 4;
+        float* p = &px[q];
+        if (p[3] >= 1.0f) {
+            float k = 1.0f - a;
+            p[0] = p[0] * k + c.r * a;
+            p[1] = p[1] * k + c.g * a;
+            p[2] = p[2] * k + c.b * a;
+            return;
+        }
+        p[0] += c.r * a;
+        p[1] += c.g * a;
+        p[2] += c.b * a;
+        p[3] += a;
+    }
+    // 一次性合成到目标缓冲（覆盖率取各填充的并集，饱和到 1），然后清空写过的像素。
+    void composite(std::uint8_t* buf, int W, int H) {
+        for (int y = y0; y < y0 + h; ++y) {
+            const int a = rmin[y], b = rmax[y];
+            if (a > b) continue;
+            const std::size_t rowBase = static_cast<std::size_t>(y - y0) * w;
+            std::size_t i = rowBase + (a - x0);
+            for (int x = a; x <= b; ++x, ++i) {
+                const float* p = &px[i * 4];
+                const float ws = p[3];
+                if (ws <= 0.0f) continue;
+                std::uint8_t r, g, bl;
+                float al;
+                if (ws == 1.0f) {   // 完全覆盖且无重叠：累积值即最终色，省掉除法
+                    r = clampU8(static_cast<int>(p[0] + 0.5f));
+                    g = clampU8(static_cast<int>(p[1] + 0.5f));
+                    bl = clampU8(static_cast<int>(p[2] + 0.5f));
+                    al = 1.0f;
+                } else {
+                    float inv = 1.0f / ws;
+                    al = ws > 1.0f ? 1.0f : ws;
+                    r = clampU8(static_cast<int>(p[0] * inv + 0.5f));
+                    g = clampU8(static_cast<int>(p[1] * inv + 0.5f));
+                    bl = clampU8(static_cast<int>(p[2] * inv + 0.5f));
+                }
+                if (al >= 1.0f) {   // 完全覆盖：直接写不透明像素
+                    std::uint8_t* d = buf + (static_cast<std::size_t>(y) * W + x) * 4;
+                    d[0] = r; d[1] = g; d[2] = bl; d[3] = 255;
+                    continue;
+                }
+                plot(buf, W, H, x, y,
+                     Color(r, g, bl, clampU8(static_cast<int>(al * 255.0f + 0.5f))),
+                     BlendMode::Normal);
+            }
+            std::size_t q0 = (rowBase + (a - x0)) * 4;
+            std::fill(px.begin() + q0, px.begin() + q0 + static_cast<std::size_t>(b - a + 1) * 4, 0.0f);
+            rmin[y] = INT_MAX;
+            rmax[y] = -1;
+        }
+    }
+};
+
 // even-odd 扫描线填充一组轮廓（设备坐标），按 Paint 上色
 // alphaMul：对象级透明度（运行时 DisplayObject.alpha 等）乘到源色 alpha 上。
+// acc 非空时只累积覆盖率与颜色，由调用方在形状全部填充后一次合成。
+// 垂直方向子扫描线条数（抗锯齿采样）。细于一个像素的带（装饰细线、发丝、细描边）
+// 在 2 条子扫描线下会整行漏采样，沿走向断成虚线；条数越多漏采样概率越低。
+static int aaYThinSamples() {
+    static const int n = [] {
+        const char* e = std::getenv("SWF_AA_THIN");
+        int v = e ? std::atoi(e) : 6;
+        if (v < 1) v = 1;
+        if (v > 16) v = 16;
+        return v;
+    }();
+    return n;
+}
+
+static int aaYSamples() {
+    static const int n = [] {
+        const char* e = std::getenv("SWF_AA_Y");
+        int v = e ? std::atoi(e) : 2;
+        if (v < 1) v = 1;
+        if (v > 16) v = 16;
+        return v;
+    }();
+    return n;
+}
+
 void fillContours(const std::vector<Contour>& contours, const Matrix& M, const Matrix& Minv,
                   const Paint& paint, std::uint8_t* buf, int W, int H, float alphaMul = 1.0f,
-                  BlendMode bm = BlendMode::Normal) {
+                  BlendMode bm = BlendMode::Normal, FillAccum* acc = nullptr) {
     struct Edge { float x0, y0, x1, y1; };
     // 每个轮廓单独成组（保留下面的"嵌套 = 洞、部分重叠 = 并集"判定）。
     struct Poly {
@@ -403,6 +523,7 @@ void fillContours(const std::vector<Contour>& contours, const Matrix& M, const M
     };
     std::vector<Poly> polys;
     float ymin = 1e9f, ymax = -1e9f, xmin = 1e9f, xmax = -1e9f;
+    double area2 = 0.0;   // 2×有向面积（设备空间）：用于估计平均厚度，判断是否是细带
     for (const auto& ct : contours) {
         int n = static_cast<int>(ct.xs.size());
         if (n < 2) continue;
@@ -418,6 +539,7 @@ void fillContours(const std::vector<Contour>& contours, const Matrix& M, const M
         for (int i = 0; i < n; ++i) {
             int j = (i + 1) % n;
             p.edges.push_back({dx[i], dy[i], dx[j], dy[j]});
+            area2 += static_cast<double>(dx[i]) * dy[j] - static_cast<double>(dx[j]) * dy[i];
         }
         ymin = std::min(ymin, p.ymin);
         ymax = std::max(ymax, p.ymax);
@@ -473,6 +595,11 @@ void fillContours(const std::vector<Contour>& contours, const Matrix& M, const M
     int x0 = std::max(0, static_cast<int>(std::floor(xmin)));
     int x1 = std::min(W - 1, static_cast<int>(std::ceil(xmax)));
     if (x0 > x1) return;
+    // 与有向边路径一致：平均厚度不足 2 像素的细带用更密的垂直子扫描线，
+    // 否则连续细线会被 2 条子扫描线漏采样成虚线。
+    const double bboxW = static_cast<double>(x1) - x0 + 1.0;
+    const double avgThick = std::fabs(area2) * 0.5 / bboxW;
+    const int rowSub = avgThick < 2.0 ? aaYThinSamples() : aaYSamples();
     DevPaint dp; dp.setup(paint, Minv, alphaMul, bm);
     parallelBands(y0, y1, [&](int ya, int yb) {
         // 行缓冲按线程私有分配（行带内复用），避免跨线程共享写。
@@ -486,8 +613,10 @@ void fillContours(const std::vector<Contour>& contours, const Matrix& M, const M
                 if (p.ymax <= y + 0.25f || p.ymin >= y + 0.75f) continue;
                 std::fill(cov.begin() + x0, cov.begin() + x1 + 1, 0.0f);
                 // 2x2 超采样：每像素行取 2 条子扫描线，各贡献 0.5 覆盖率（水平抗锯齿）
-                for (int sub = 0; sub < 2; ++sub) {
-                    float yy = y + (sub == 0 ? 0.25f : 0.75f);
+                const int nsub = rowSub;
+                const float wsub = 1.0f / static_cast<float>(nsub);
+                for (int sub = 0; sub < nsub; ++sub) {
+                    float yy = y + (static_cast<float>(sub) + 0.5f) * wsub;
                     xs.clear();
                     for (const auto& e : p.edges) {
                         if ((e.y0 <= yy && e.y1 > yy) || (e.y1 <= yy && e.y0 > yy)) {
@@ -508,7 +637,7 @@ void fillContours(const std::vector<Contour>& contours, const Matrix& M, const M
                         for (int x = xa; x <= xb; ++x) {
                             float l = std::max(A, static_cast<float>(x) - 0.5f);
                             float r = std::min(B, static_cast<float>(x) + 0.5f);
-                            if (r > l) cov[x] += 0.5f * (r - l);
+                            if (r > l) cov[x] += wsub * (r - l);
                         }
                     }
                 }
@@ -523,7 +652,7 @@ void fillContours(const std::vector<Contour>& contours, const Matrix& M, const M
                 float cover = solidCov[x] - holeCov[x];
                 if (cover <= 0.0f) continue;
                 if (cover > 1.0f) cover = 1.0f;
-                if (dp.opaqueDirect && cover >= 1.0f) {   // 不透明纯色内部像素：直写
+                if (!acc && dp.opaqueDirect && cover >= 1.0f) {   // 不透明纯色内部像素：直写
                     std::uint8_t* d = buf + (static_cast<std::size_t>(y) * W + x) * 4;
 
                     d[0] = dp.solidC.r; d[1] = dp.solidC.g; d[2] = dp.solidC.b; d[3] = 255;
@@ -532,6 +661,11 @@ void fillContours(const std::vector<Contour>& contours, const Matrix& M, const M
                 Color c = dp.solid ? dp.solidC : dp.at(cur);
                 if (!dp.solid)
                     c.a = clampU8(static_cast<int>(c.a * alphaMul + 0.5f));   // 对象级透明度
+                if (acc) {
+                    float a = (c.a / 255.0f) * (cover < 1.0f ? cover : 1.0f);
+                    acc->add(x, y, c, a);
+                    continue;
+                }
                 if (cover < 1.0f) {
                     float a = (c.a / 255.0f) * cover;
                     c.a = clampU8(static_cast<int>(a * 255.0f + 0.5f));
@@ -557,12 +691,14 @@ struct DEdge { float x0, y0, x1, y1; int sign; };
 
 // 对一组设备坐标边，计算扫描线行 y 的覆盖率（2 条子扫描线，水平抗锯齿）。
 // rule: 0 = 带符号非零环绕（默认）；1 = 偶奇；2 = 无符号并集（忽略侧号）。
+
 static void edgesCoverageRow(const std::vector<DEdge>& es, const std::vector<int>& act, int y,
                              int x0, int x1, float* cov, int rule,
-                             std::vector<std::pair<float, int>>& xs) {
+                             std::vector<std::pair<float, int>>& xs, int nsub) {
     std::fill(cov + x0, cov + x1 + 1, 0.0f);
-    for (int sub = 0; sub < 2; ++sub) {          // 2x2 超采样（水平抗锯齿）
-        float yy = y + (sub == 0 ? 0.25f : 0.75f);
+    const float wsub = 1.0f / static_cast<float>(nsub);
+    for (int sub = 0; sub < nsub; ++sub) {
+        float yy = y + (static_cast<float>(sub) + 0.5f) * wsub;
         xs.clear();
         for (int ei : act) {
             const DEdge& e = es[ei];
@@ -591,7 +727,7 @@ static void edgesCoverageRow(const std::vector<DEdge>& es, const std::vector<int
             for (int x = xa; x <= xb; ++x) {
                 float l = std::max(A, static_cast<float>(x) - 0.5f);
                 float r = std::min(B, static_cast<float>(x) + 0.5f);
-                if (r > l) cov[x] += 0.5f * (r - l);
+                if (r > l) cov[x] += wsub * (r - l);
             }
         }
     }
@@ -599,7 +735,8 @@ static void edgesCoverageRow(const std::vector<DEdge>& es, const std::vector<int
 
 void fillEdgesWinding(const std::vector<FillEdge>& edges, const Matrix& M, const Matrix& Minv,
                       const Paint& paint, std::uint8_t* buf, int W, int H,
-                      float alphaMul = 1.0f, BlendMode bm = BlendMode::Normal) {
+                      float alphaMul = 1.0f, BlendMode bm = BlendMode::Normal,
+                      FillAccum* acc = nullptr) {
     if (edges.empty()) return;
     typedef DEdge E;
     // 边表按整次填充一次性构建：变换后的边与包围盒只算一遍，行带内复用。
@@ -607,6 +744,7 @@ void fillEdgesWinding(const std::vector<FillEdge>& edges, const Matrix& M, const
     es.clear();
     es.reserve(edges.size());
     float ymin = 1e9f, ymax = -1e9f, xmin = 1e9f, xmax = -1e9f;
+    double area2 = 0.0;   // 2×有向面积（设备空间），用来估计这条填充的平均厚度
     for (const auto& e : edges) {
         // 只有在**变换后**（设备空间）仍水平、不参与扫描线相交的边才可跳过。
         // 形状局部为水平、但经旋转/斜切后变为斜边的情况必须保留，否则会漏交点。
@@ -615,6 +753,7 @@ void fillEdgesWinding(const std::vector<FillEdge>& edges, const Matrix& M, const
         M.apply(e.x1, e.y1, X1, Y1);
         if (Y0 == Y1) continue;
         es.push_back({X0, Y0, X1, Y1, e.sign});
+        area2 += static_cast<double>(X0) * Y1 - static_cast<double>(X1) * Y0;
         ymin = std::min(ymin, std::min(Y0, Y1));
         ymax = std::max(ymax, std::max(Y0, Y1));
         xmin = std::min(xmin, std::min(X0, X1));
@@ -629,6 +768,11 @@ void fillEdgesWinding(const std::vector<FillEdge>& edges, const Matrix& M, const
     int xx0 = std::max(0, static_cast<int>(std::floor(xmin)));
     int xx1 = std::min(W - 1, static_cast<int>(std::ceil(xmax)));
     if (xx0 > xx1) return;
+    // 平均厚度 = 面积 / 包围盒宽度。厚度不足 2 像素的带（细装饰线、发丝）在
+    // 2 条垂直子扫描线下会整行漏采样、断成虚线，改用更密的子扫描线。
+    const double bboxW = static_cast<double>(xx1) - xx0 + 1.0;
+    const double avgThick = std::fabs(area2) * 0.5 / bboxW;
+    const int nsub = avgThick < 2.0 ? aaYThinSamples() : aaYSamples();
     DevPaint dp; dp.setup(paint, Minv, alphaMul, bm);
     // 默认按非零环绕规则（规范 UsesFillWindingRule 决定，形状级已在 Paint::winding 中处理）。
     const int rule = 0;
@@ -661,14 +805,14 @@ void fillEdgesWinding(const std::vector<FillEdge>& edges, const Matrix& M, const
             if (!act.empty())
                 act.erase(std::remove_if(act.begin(), act.end(),
                                          [&](int i) { return yEnd[i] <= y; }), act.end());
-            edgesCoverageRow(es, act, y, xx0, xx1, cov.data(), rule, xs);
+            edgesCoverageRow(es, act, y, xx0, xx1, cov.data(), rule, xs, nsub);
             DevPaint::Cursor cur{};
             if (!dp.solid) cur = dp.cursor(xx0 + 0.5f, y + 0.5f);
             for (int x = xx0; x <= xx1; ++x, cur.gx += cur.sx, cur.gy += cur.ry) {
                 float cover = cov[x];
                 if (cover <= 0.0f) continue;
                 if (cover > 1.0f) cover = 1.0f;
-                if (dp.opaqueDirect && cover >= 1.0f) {   // 不透明纯色内部像素：直写
+                if (!acc && dp.opaqueDirect && cover >= 1.0f) {   // 不透明纯色内部像素：直写
                     std::uint8_t* d = buf + (static_cast<std::size_t>(y) * W + x) * 4;
 
                     d[0] = dp.solidC.r; d[1] = dp.solidC.g; d[2] = dp.solidC.b; d[3] = 255;
@@ -677,6 +821,11 @@ void fillEdgesWinding(const std::vector<FillEdge>& edges, const Matrix& M, const
                 Color c = dp.solid ? dp.solidC : dp.at(cur);
                 if (!dp.solid)
                     c.a = clampU8(static_cast<int>(c.a * alphaMul + 0.5f));
+                if (acc) {
+                    float a = (c.a / 255.0f) * (cover < 1.0f ? cover : 1.0f);
+                    acc->add(x, y, c, a);
+                    continue;
+                }
                 if (cover < 1.0f) {
                     float a2 = (c.a / 255.0f) * cover;
                     c.a = clampU8(static_cast<int>(a2 * 255.0f + 0.5f));
@@ -696,11 +845,12 @@ void fillEdgesWinding(const std::vector<FillEdge>& edges, const Matrix& M, const
 // 光栅化形状的第 i 个填充样式：优先使用有向边 + 非零环绕（权威几何）；
 // 缺边时回退到轮廓 + 启发式（用于变形插值等没有边数据的场合）。
 void fillStyleOf(const Shape& shape, std::size_t i, const Matrix& M, const Matrix& Minv,
-                 const Paint& p, std::uint8_t* buf, int W, int H, float alphaMul, BlendMode bm) {
+                 const Paint& p, std::uint8_t* buf, int W, int H, float alphaMul, BlendMode bm,
+                 FillAccum* acc = nullptr) {
     if (i < shape.fillEdges.size() && !shape.fillEdges[i].empty()) {
-        fillEdgesWinding(shape.fillEdges[i], M, Minv, p, buf, W, H, alphaMul, bm);
+        fillEdgesWinding(shape.fillEdges[i], M, Minv, p, buf, W, H, alphaMul, bm, acc);
     } else if (i < shape.fillPaths.size() && !shape.fillPaths[i].empty()) {
-        fillContours(shape.fillPaths[i], M, Minv, p, buf, W, H, alphaMul, bm);
+        fillContours(shape.fillPaths[i], M, Minv, p, buf, W, H, alphaMul, bm, acc);
     }
 }
 
@@ -962,8 +1112,10 @@ void fillMask(const std::vector<std::vector<Contour>>& paths, const Matrix& M,
     for (int y = y0; y <= y1; ++y) {
         std::fill(cov.begin(), cov.end(), 0.0f);
         // 与填充相同的 2x2 超采样，得到 0..1 覆盖率写入遮罩（裁剪边缘平滑）
-        for (int sub = 0; sub < 2; ++sub) {
-            float yy = y + (sub == 0 ? 0.25f : 0.75f); xs.clear();
+        const int nsub = aaYSamples();
+        const float wsub = 1.0f / static_cast<float>(nsub);
+        for (int sub = 0; sub < nsub; ++sub) {
+            float yy = y + (static_cast<float>(sub) + 0.5f) * wsub; xs.clear();
             for (const auto& e : edges) {
                 if ((e.y0 <= yy && e.y1 > yy) || (e.y1 <= yy && e.y0 > yy)) {
                     float t = (yy - e.y0) / (e.y1 - e.y0);
@@ -975,7 +1127,7 @@ void fillMask(const std::vector<std::vector<Contour>>& paths, const Matrix& M,
             for (std::size_t k = 0; k + 1 < xs.size(); k += 2) {
                 int xa = std::max(0, static_cast<int>(std::ceil(xs[k] - 0.5f)));
                 int xb = std::min(W - 1, static_cast<int>(std::floor(xs[k + 1] - 0.5f)));
-                for (int x = xa; x <= xb; ++x) cov[x] += 0.5f;
+                for (int x = xa; x <= xb; ++x) cov[x] += wsub;
             }
         }
         for (int x = 0; x < W; ++x) {
@@ -1864,6 +2016,8 @@ static void applyFilters(const std::vector<Filter>& filters, std::vector<std::ui
 // 像素运算全部复用本文件既有函数（fillStyleOf / strokeContours / fillMask /
 // renderEditText / applyFilters），与拆分前的渲染路径逐像素一致。
 // ---------------------------------------------------------------------------
+
+
 class SoftwareSink final : public IDisplayListSink {
 public:
     SoftwareSink(std::uint8_t* buf, int W, int H) : m_buf(buf), m_W(W), m_H(H) {}
@@ -1878,32 +2032,57 @@ public:
 
     void drawFill(const Shape& shape, std::size_t index, const Matrix& world,
                   const ColorTransform& cx, BlendMode blend, float alpha) override {
-        if (!m_buf || index >= shape.fillStyles.size()) return;
-        if (index >= shape.fillEdges.size() && index >= shape.fillPaths.size()) return;
-
+        if (!m_buf) return;
+        Paint p;
+        if (!fillPaint(shape, index, cx, p)) return;
         Matrix Minv;
         world.invert(Minv);
-        const FillStyle& fs = shape.fillStyles[index];
-        Paint p;
-        p.kind = fs.kind; p.solid = fs.color; p.cx = cx; p.tiled = fs.tiled;
-        p.spread = fs.spreadMode; p.interp = fs.interpMode;
-        p.winding = shape.usesWinding;
-        if (fs.kind == FillKind::LinearGradient || fs.kind == FillKind::RadialGradient ||
-            fs.kind == FillKind::FocalGradient) {
-            p.grad = fs.gradient;
-            // SWF 的 gradientMatrix 是「渐变空间 -> 形状空间」，采样需用其逆。
-            Matrix g = fs.gradientMatrix;
-            if (!g.invert(p.gmat)) p.gmat = fs.gradientMatrix;
-            p.focalX = fs.focalX; p.focalY = fs.focalY;
-        } else if (fs.kind == FillKind::Bitmap && m_dict) {
-            auto it = m_dict->find(fs.bitmapId);
-            if (it != m_dict->end() && it->second && it->second->bitmap) {
-                p.bmp = it->second->bitmap.get();
-                Matrix b = fs.gradientMatrix;
-                if (!b.invert(p.bmat)) p.bmat = fs.gradientMatrix;
+        fillStyleOf(shape, index, world, Minv, p, m_buf, m_W, m_H, alpha, blend);
+    }
+
+    // 同一形状内相邻填充的接缝修复：
+    // 逐个填充各自 alpha 合成时，共享边界的像素被两侧各覆盖约一半，两次 over 后
+    // 只剩约 80% 不透明度，约 20% 背景色透出，形成 1px 亮/灰虚线。
+    // 这里按 drawOrder 把「连续的一批填充」累积覆盖率与颜色后一次合成；
+    // 描边处切断批次，保持原有叠放顺序（填充仍会盖住先画的描边）。
+    void drawShape(const Shape& shape, const Matrix& world, const ColorTransform& cx,
+                   BlendMode blend, float alpha) override {
+        if (!m_buf || blend != BlendMode::Normal || shape.fillStyles.size() < 2) {
+            IDisplayListSink::drawShape(shape, world, cx, blend, alpha);
+            return;
+        }
+        std::vector<char> isLine;
+        std::vector<std::size_t> styles;
+        if (!shape.drawOrder.empty()) {
+            for (const auto& op : shape.drawOrder) {
+                if (op.style < 0) continue;
+                isLine.push_back(op.isLine ? 1 : 0);
+                styles.push_back(static_cast<std::size_t>(op.style));
+            }
+        } else {
+            for (std::size_t i = 0; i < shape.fillStyles.size(); ++i) {
+                isLine.push_back(0);
+                styles.push_back(i);
+            }
+            for (std::size_t i = 0; i < shape.lineStyles.size(); ++i) {
+                isLine.push_back(1);
+                styles.push_back(i);
             }
         }
-        fillStyleOf(shape, index, world, Minv, p, m_buf, m_W, m_H, alpha, blend);
+        for (std::size_t i = 0; i < styles.size();) {
+            if (isLine[i]) {
+                drawStroke(shape, styles[i], world, cx, blend, alpha);
+                ++i;
+                continue;
+            }
+            std::size_t j = i;
+            while (j < styles.size() && !isLine[j]) ++j;
+            if (j - i >= 2)
+                drawFillGroup(shape, styles, i, j, world, cx, blend, alpha);
+            else
+                drawFill(shape, styles[i], world, cx, blend, alpha);
+            i = j;
+        }
     }
 
     void drawStroke(const Shape& shape, std::size_t index, const Matrix& world,
@@ -2041,6 +2220,95 @@ public:
     }
 
 private:
+    // 构造某个填充样式的 Paint（位图需要帧字典）。样式或几何缺失时返回 false。
+    bool fillPaint(const Shape& shape, std::size_t index, const ColorTransform& cx, Paint& p) {
+        if (index >= shape.fillStyles.size()) return false;
+        if (index >= shape.fillEdges.size() && index >= shape.fillPaths.size()) return false;
+        const FillStyle& fs = shape.fillStyles[index];
+        p.kind = fs.kind; p.solid = fs.color; p.cx = cx; p.tiled = fs.tiled;
+        p.spread = fs.spreadMode; p.interp = fs.interpMode;
+        p.winding = shape.usesWinding;
+        if (fs.kind == FillKind::LinearGradient || fs.kind == FillKind::RadialGradient ||
+            fs.kind == FillKind::FocalGradient) {
+            p.grad = fs.gradient;
+            // SWF 的 gradientMatrix 是「渐变空间 -> 形状空间」，采样需用其逆。
+            Matrix g = fs.gradientMatrix;
+            if (!g.invert(p.gmat)) p.gmat = fs.gradientMatrix;
+            p.focalX = fs.focalX; p.focalY = fs.focalY;
+        } else if (fs.kind == FillKind::Bitmap && m_dict) {
+            auto it = m_dict->find(fs.bitmapId);
+            if (it != m_dict->end() && it->second && it->second->bitmap) {
+                p.bmp = it->second->bitmap.get();
+                Matrix b = fs.gradientMatrix;
+                if (!b.invert(p.bmat)) p.bmat = fs.gradientMatrix;
+            }
+        }
+        return true;
+    }
+    // 一批连续填充：按像素累积覆盖率与颜色，最后一次性合成（消除接缝亮线）。
+    void drawFillGroup(const Shape& shape, const std::vector<std::size_t>& styles,
+                       std::size_t begin, std::size_t end, const Matrix& world,
+                       const ColorTransform& cx, BlendMode blend, float alpha) {
+        int bx0 = 0, by0 = 0, bx1 = -1, by1 = -1;
+        if (!fillGroupBounds(shape, styles, begin, end, world, bx0, by0, bx1, by1)) return;
+        // 累积缓冲按线程复用：AVM2 运行时路径每个显示对象新建一个 sink，
+        // 把缓冲挂在 sink 上会让每个对象都重新分配一次。
+        static thread_local FillAccum accum;
+        FillAccum& acc = accum;
+        acc.begin(bx0, by0, bx1, by1);
+        Matrix Minv;
+        world.invert(Minv);
+        bool any = false;
+        for (std::size_t i = begin; i < end; ++i) {
+            Paint p;
+            if (!fillPaint(shape, styles[i], cx, p)) continue;
+            fillStyleOf(shape, styles[i], world, Minv, p, m_buf, m_W, m_H, alpha, blend, &acc);
+            any = true;
+        }
+        if (any) acc.composite(m_buf, m_W, m_H);
+    }
+    // 这批填充的设备包围盒（裁剪到画布，留 2px 抗锯齿余量）。
+    bool fillGroupBounds(const Shape& shape, const std::vector<std::size_t>& styles,
+                         std::size_t begin, std::size_t end, const Matrix& world,
+                         int& bx0, int& by0, int& bx1, int& by1) const {
+        // 只在**局部坐标**里取 min/max（纯比较，无矩阵变换），最后变换一次四角。
+        // 逐边变换会与 fillEdgesWinding 里的变换重复：每帧两遍全部边、每帧上万次
+        // 矩阵乘法。旋转/斜切时四角包围盒是真实包围盒的超集，只会多算几个像素，
+        // 对正确性无影响（累积缓冲本来还要留 2px 抗锯齿余量）。
+        float lx0 = 1e9f, ly0 = 1e9f, lx1 = -1e9f, ly1 = -1e9f;
+        for (std::size_t i = begin; i < end; ++i) {
+            const std::size_t idx = styles[i];
+            if (idx < shape.fillEdges.size() && !shape.fillEdges[idx].empty()) {
+                for (const auto& e : shape.fillEdges[idx]) {
+                    lx0 = std::min(lx0, std::min(e.x0, e.x1)); ly0 = std::min(ly0, std::min(e.y0, e.y1));
+                    lx1 = std::max(lx1, std::max(e.x0, e.x1)); ly1 = std::max(ly1, std::max(e.y0, e.y1));
+                }
+            } else if (idx < shape.fillPaths.size()) {
+                for (const auto& ct : shape.fillPaths[idx])
+                    for (std::size_t k = 0; k < ct.xs.size(); ++k) {
+                        lx0 = std::min(lx0, ct.xs[k]); ly0 = std::min(ly0, ct.ys[k]);
+                        lx1 = std::max(lx1, ct.xs[k]); ly1 = std::max(ly1, ct.ys[k]);
+                    }
+            }
+        }
+        if (lx0 > lx1 || ly0 > ly1) return false;
+        float fx0 = 1e9f, fy0 = 1e9f, fx1 = -1e9f, fy1 = -1e9f;
+        const float cxs[4] = {lx0, lx1, lx0, lx1};
+        const float cys[4] = {ly0, ly0, ly1, ly1};
+        for (int k = 0; k < 4; ++k) {
+            float X, Y;
+            world.apply(cxs[k], cys[k], X, Y);
+            fx0 = std::min(fx0, X); fy0 = std::min(fy0, Y);
+            fx1 = std::max(fx1, X); fy1 = std::max(fy1, Y);
+        }
+        if (fx0 > fx1 || fy0 > fy1) return false;
+        bx0 = std::max(0, static_cast<int>(std::floor(fx0)) - 2);
+        by0 = std::max(0, static_cast<int>(std::floor(fy0)) - 2);
+        bx1 = std::min(m_W - 1, static_cast<int>(std::ceil(fx1)) + 2);
+        by1 = std::min(m_H - 1, static_cast<int>(std::ceil(fy1)) + 2);
+        return bx0 <= bx1 && by0 <= by1;
+    }
+
     struct MaskFrame {
         std::uint8_t* parent = nullptr;
         std::vector<MaskShape> masks;
@@ -2074,20 +2342,9 @@ void renderItemsWithSink(IDisplayListSink& sink, const std::vector<DisplayItem>&
 // 按 drawOrder 顺序把形状的填充/描边送到 sink（无 drawOrder 时先填充后描边）。
 static void drawShapeToSink(IDisplayListSink& sink, const Shape& shape, const Matrix& world,
                             const ColorTransform& cx, float alpha, BlendMode bm) {
-    if (!shape.drawOrder.empty()) {
-        for (const auto& op : shape.drawOrder) {
-            if (op.style < 0) continue;
-            if (op.isLine)
-                sink.drawStroke(shape, static_cast<std::size_t>(op.style), world, cx, bm, alpha);
-            else
-                sink.drawFill(shape, static_cast<std::size_t>(op.style), world, cx, bm, alpha);
-        }
-        return;
-    }
-    for (std::size_t i = 0; i < shape.fillStyles.size(); ++i)
-        sink.drawFill(shape, i, world, cx, bm, alpha);
-    for (std::size_t i = 0; i < shape.lineStyles.size(); ++i)
-        sink.drawStroke(shape, i, world, cx, bm, alpha);
+    // 形状作为一个整体提交：软件后端据此把多个填充的覆盖率累积后一次合成，
+    // GPU 等后端沿用默认的逐样式绘制。
+    sink.drawShape(shape, world, cx, bm, alpha);
 }
 
 static thread_local bool s_rtClockMode = false;

@@ -41,6 +41,27 @@ public:
     virtual void drawStroke(const Shape& shape, std::size_t styleIndex, const Matrix& world,
                             const ColorTransform& cx, BlendMode blend, float alpha) = 0;
 
+    // 一个形状的全部填充/描边（按 drawOrder 排序；无 drawOrder 时先填充后描边）。
+    // 软件后端重写此方法，把同一形状的多个填充按覆盖率累积后一次合成，
+    // 消除相邻填充之间漏背景造成的 1px 接缝亮线；默认实现即逐个样式绘制。
+    virtual void drawShape(const Shape& shape, const Matrix& world, const ColorTransform& cx,
+                           BlendMode blend, float alpha) {
+        if (!shape.drawOrder.empty()) {
+            for (const auto& op : shape.drawOrder) {
+                if (op.style < 0) continue;
+                if (op.isLine)
+                    drawStroke(shape, static_cast<std::size_t>(op.style), world, cx, blend, alpha);
+                else
+                    drawFill(shape, static_cast<std::size_t>(op.style), world, cx, blend, alpha);
+            }
+            return;
+        }
+        for (std::size_t i = 0; i < shape.fillStyles.size(); ++i)
+            drawFill(shape, i, world, cx, blend, alpha);
+        for (std::size_t i = 0; i < shape.lineStyles.size(); ++i)
+            drawStroke(shape, i, world, cx, blend, alpha);
+    }
+
     // 运行时 graphics 产生的临时形状（不属于影片字典，形状对象每帧都可能重建）。
     // 后端若按形状指针缓存网格（GPU）必须重写这两个方法，不能直接走 drawFill 的缓存。
     virtual void drawTransientFill(const Shape& shape, std::size_t styleIndex, const Matrix& world,
