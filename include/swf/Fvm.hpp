@@ -293,6 +293,16 @@ public:
     // ---- 属性访问（含类成员链、getter/setter）----
     Value getProperty(std::shared_ptr<Object> obj, const std::string& name);
     Value getPropertyImpl(std::shared_ptr<Object> obj, const std::string& name);
+    // super 语义：从“声明当前方法体的类的父类”开始解析，而不是从对象自身类。
+    // 否则 `super.x` 会再次命中子类同名 getter（UIComponent.scaleX 无限递归）。
+    std::shared_ptr<ClassDef> superStartFor(const std::shared_ptr<Object>& obj,
+                                            uint32_t methodIndex) const;
+    Value getSuperProperty(const std::shared_ptr<Object>& obj, const std::string& name,
+                           uint32_t methodIndex);
+    void setSuperProperty(const std::shared_ptr<Object>& obj, const std::string& name,
+                          const Value& v, uint32_t methodIndex);
+    Value callSuperMethod(const std::shared_ptr<Object>& obj, const std::string& name,
+                          const std::vector<Value>& args, uint32_t methodIndex);
     void  setProperty(std::shared_ptr<Object> obj, const std::string& name, const Value& v);
     Value callMethod(std::shared_ptr<Object> obj, const std::string& name, const std::vector<Value>& args);
     // 字符串原始值装箱为 String 实例（挂内建 String 类，charAt/indexOf 等方法才可解析）

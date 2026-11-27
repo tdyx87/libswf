@@ -211,29 +211,19 @@ inline void registerFvmOps() {
     // ---- 第二批：作用域/枚举/属性/调用（不涉及控制流跳转）----
     fvmOps().add(0x1c, [](ExecCtx& c) {  // pushwith
         Value v = c.pop(); if (v.kind == VKind::Object && v.obj) c.scope.push_back(v.obj); });
-    fvmOps().add(0x04, [](ExecCtx& c) {  // getsuper: obj,[ns],[name] -> value（跳过本类覆盖）
+    fvmOps().add(0x04, [](ExecCtx& c) {  // getsuper: obj,[ns],[name] -> value（从声明类的父类开始）
         uint32_t mn = c.in.u30();
         std::string name = takeRuntimeName(c, mn);
         Value obj = c.pop();
         if (obj.kind != VKind::Object || !obj.obj) { c.push(Value::undefined()); return; }
-        Value result = Value::undefined();
-        for (auto cd = obj.obj->cls ? obj.obj->cls->superClass : nullptr; cd; cd = cd->superClass) {
-            bool declared = false;
-            for (const auto& m : cd->instanceMembers) if (m.name == name) { declared = true; break; }
-            if (!declared) continue;
-            auto sp = obj.obj->slots.find(name);
-            if (sp != obj.obj->slots.end()) result = sp->second;
-            else { auto pp = obj.obj->props.find(name); if (pp != obj.obj->props.end()) result = pp->second; }
-            break;
-        }
-        if (result.isUndefined()) result = c.vm.getProperty(obj.obj, name);
-        c.push(result); });
+        c.push(c.vm.getSuperProperty(obj.obj, name, c.body.methodIndex)); });
     fvmOps().add(0x05, [](ExecCtx& c) {  // setsuper: obj,[ns],[name],value -> (空)
         uint32_t mn = c.in.u30();
         Value val = c.pop();
         std::string name = takeRuntimeName(c, mn);
         Value obj = c.pop();
-        if (obj.kind == VKind::Object && obj.obj) c.vm.setProperty(obj.obj, name, val); });
+        if (obj.kind == VKind::Object && obj.obj)
+            c.vm.setSuperProperty(obj.obj, name, val, c.body.methodIndex); });
     fvmOps().add(0x59, [](ExecCtx& c) {  // getdescendants: obj,[ns],[name] -> XMLList
         uint32_t mn = c.in.u30();
         const std::string want = takeRuntimeName(c, mn);
@@ -269,7 +259,8 @@ inline void registerFvmOps() {
         std::vector<Value> cargs(argc); for (uint32_t k = 0; k < argc; ++k) cargs[argc - 1 - k] = c.pop();
         std::string mname = takeRuntimeName(c, mn);
         Value recv = c.pop();
-        if (recv.kind == VKind::Object && recv.obj) c.push(c.vm.callMethod(recv.obj, mname, cargs));
+        if (recv.kind == VKind::Object && recv.obj)
+            c.push(c.vm.callSuperMethod(recv.obj, mname, cargs, c.body.methodIndex));
         else c.push(Value::undefined()); });
     fvmOps().add(0x4e, [](ExecCtx& c) {  // callsupervoid
         uint32_t mn = c.in.u30(); uint32_t argc = c.in.u30();
@@ -277,32 +268,9 @@ inline void registerFvmOps() {
         std::string mname = takeRuntimeName(c, mn);
         Value recv = c.pop();
         if (recv.kind != VKind::Object || !recv.obj) return;  // void 调用：不压栈
-        auto obj = recv.obj;
-        // AVM2 语义：super.f() 是静态 super 分派——从接收者类的【父类】开始查找，
-        // 跳过本类（virtual 分派会命中本类覆盖实现，导致 super 调用自递归）。
-        // 例：gs.TweenMax.initTweenVals() 体内 callsupervoid [initTweenVals]，
-        // 必须解析到 gs.TweenLite 的实现而不是 TweenMax 的转发覆盖。
-        // 注意 callsupervoid 无压栈效应，返回值一律丢弃。
-        for (auto cls = obj->cls ? obj->cls->superClass : nullptr; cls; cls = cls->superClass) {
-            for (const auto& m : cls->instanceMembers) {
-                if (m.name != mname || m.kind != Member::Method) continue;
-                if (std::getenv("SWF_AS_DEBUG") && mname == "initTweenVals")
-                    std::fprintf(stderr, "[super-dispatch] %s.%s -> %s mi=%u bi=%d\n",
-                                 obj->className.c_str(), mname.c_str(), cls->name.c_str(),
-                                 m.methodIndex,
-                                 (m.methodIndex < c.vm.abcFile().methods.size()) ? c.vm.abcFile().methods[m.methodIndex].bodyIndex : -1);
-                if (m.native) return;
-                if (m.methodIndex < c.vm.abcFile().methods.size()) {
-                    int bi = c.vm.abcFile().methods[m.methodIndex].bodyIndex;
-                    if (bi >= 0 && bi < static_cast<int>(c.vm.abcFile().methodBodies.size())) {
-                        c.vm.exec(c.vm.abcFile().methodBodies[bi], cargs, obj);
-                        return;
-                    }
-                }
-            }
-        }
-        // 父类链上没有：退回普通调用（动态属性/原生基类兜底）
-        c.vm.callMethod(obj, mname, cargs); });
+        // AVM2 语义：super.f() 从【声明当前方法体的类】的父类开始静态分派，
+        // 跳过本类覆盖实现；不能退回普通 callMethod（会再次命中本类而自递归）。
+        c.vm.callSuperMethod(recv.obj, mname, cargs, c.body.methodIndex); });
     fvmOps().add(0x4c, [](ExecCtx& c) {  // callproplex
         uint32_t mn = c.in.u30(); uint32_t argc = c.in.u30();
         std::vector<Value> cargs(argc); for (uint32_t k = 0; k < argc; ++k) cargs[argc - 1 - k] = c.pop();
@@ -589,8 +557,11 @@ inline void registerFvmOps() {
         for (uint32_t k = 0; k < n; ++k) cargs[n - 1 - k] = c.pop();
         Value recv = c.pop();
         auto obj = (recv.kind == VKind::Object && recv.obj) ? recv.obj : c.thisObj;
-        if (!obj || !obj->cls || !obj->cls->superClass) return;
-        auto sup = obj->cls->superClass;
+        if (!obj || !obj->cls) return;
+        // 从【声明本构造器的类】的父类取超类，而不是接收者自身类：
+        // 父类构造器内部再次 constructsuper 时必须继续上溯，否则会自我递归。
+        auto sup = c.vm.superStartFor(obj, c.body.methodIndex);
+        if (!sup) return;
         // 原生基类（Sprite/MovieClip/EventDispatcher/Event...）走其 ctor，
         // 否则按 ABC instance_info.iinit 执行超类字节码构造。
         if (sup->ctor) { sup->ctor(obj, cargs); return; }
@@ -2976,6 +2947,147 @@ Value Vm::getPropertyImpl(std::shared_ptr<Object> obj, const std::string& name) 
                 }
                 if (m.defaultValue.kind != VKind::Undefined) return m.defaultValue;
             }
+    }
+    return Value::undefined();
+}
+
+// 找出当前方法体声明的类（按 methodIndex 在实例成员链上匹配），返回其父类。
+std::shared_ptr<ClassDef> Vm::superStartFor(const std::shared_ptr<Object>& obj,
+                                            uint32_t methodIndex) const {
+    if (!obj) return nullptr;
+    // 构造器（iinit）不是 instance trait，需按 instance_info.iinit 反查声明类；
+    // 否则 constructsuper 在父类构造器里再次使用接收者类，形成无限自递归
+    // （ADVERTISING -> textShow -> textShow ...）。
+    if (methodIndex < abc_.methods.size()) {
+        for (std::size_t i = 0; i < abc_.instances.size(); ++i) {
+            if (abc_.instances[i].iinit != methodIndex) continue;
+            auto it = classCache_.find(static_cast<int>(i));
+            std::shared_ptr<ClassDef> cd = it != classCache_.end() ? it->second
+                                                                  : const_cast<Vm*>(this)->buildClass(static_cast<int>(i));
+            return cd ? cd->superClass : nullptr;
+        }
+    }
+    for (auto c = obj->cls; c; c = c->superClass) {
+        for (const auto& m : c->instanceMembers) {
+            if (m.methodIndex != methodIndex) continue;
+            if (m.kind == Member::Method || m.kind == Member::Getter || m.kind == Member::Setter)
+                return c->superClass;
+        }
+    }
+    return obj->cls ? obj->cls->superClass : nullptr;
+}
+
+Value Vm::getSuperProperty(const std::shared_ptr<Object>& obj, const std::string& name,
+                           uint32_t methodIndex) {
+    if (!obj) return Value::undefined();
+    for (auto c = superStartFor(obj, methodIndex); c; c = c->superClass) {
+        for (const auto& m : c->instanceMembers) {
+            if (m.name != name) continue;
+            if (m.kind == Member::Getter) {
+                if (m.native) return m.native(obj, {});
+                if (m.methodIndex < abc_.methods.size()) {
+                    const int bi = abc_.methods[m.methodIndex].bodyIndex;
+                    if (bi >= 0 && bi < static_cast<int>(abc_.methodBodies.size()))
+                        return exec(abc_.methodBodies[bi], {}, obj);
+                }
+                return Value::undefined();
+            }
+            if (m.kind == Member::Method) {
+                auto fn = newObject(ObjKind::Function, name);
+                if (m.native) fn->props["$native"] = Value::str(name);
+                else fn->props["$method"] = Value::uintv(m.methodIndex);
+                fn->props["$this"] = Value::object(obj);
+                if (c->classObject) fn->scope.push_back(c->classObject);
+                return Value::object(fn);
+            }
+            if (m.kind == Member::Slot || m.kind == Member::Const) {
+                auto sp = obj->slots.find(name);
+                if (sp != obj->slots.end()) return sp->second;
+                auto pp = obj->props.find(name);
+                if (pp != obj->props.end()) return pp->second;
+                return m.defaultValue;
+            }
+            if (m.defaultValue.kind != VKind::Undefined) return m.defaultValue;
+        }
+        for (const auto& m : c->staticMembers) {
+            if (m.name != name) continue;
+            if (m.kind == Member::Getter) {
+                if (m.native) return m.native(obj, {});
+                if (m.methodIndex < abc_.methods.size()) {
+                    const int bi = abc_.methods[m.methodIndex].bodyIndex;
+                    if (bi >= 0 && bi < static_cast<int>(abc_.methodBodies.size()))
+                        return exec(abc_.methodBodies[bi], {}, obj);
+                }
+            }
+            if (m.kind == Member::Method && m.native) {
+                auto fn = newObject(ObjKind::Function, name);
+                fn->props["$native"] = Value::str(name);
+                fn->props["$this"] = Value::object(obj);
+                return Value::object(fn);
+            }
+        }
+    }
+    // 基类内置显示属性（原生类未在 cls 链上时兜底）。
+    if (obj->display) {
+        if (name == "x") return Value::num(obj->display->x);
+        if (name == "y") return Value::num(obj->display->y);
+        if (name == "scaleX") return Value::num(obj->display->scaleX);
+        if (name == "scaleY") return Value::num(obj->display->scaleY);
+        if (name == "rotation") return Value::num(obj->display->rotation);
+        if (name == "alpha") return Value::num(obj->display->alpha);
+        if (name == "visible") return Value::boolean(obj->display->visible);
+    }
+    return Value::undefined();
+}
+
+void Vm::setSuperProperty(const std::shared_ptr<Object>& obj, const std::string& name,
+                          const Value& v, uint32_t methodIndex) {
+    if (!obj) return;
+    for (auto c = superStartFor(obj, methodIndex); c; c = c->superClass) {
+        for (const auto& m : c->instanceMembers) {
+            if (m.name != name || m.kind != Member::Setter) continue;
+            if (m.native) { m.native(obj, {v}); return; }
+            if (m.methodIndex < abc_.methods.size()) {
+                const int bi = abc_.methods[m.methodIndex].bodyIndex;
+                if (bi >= 0 && bi < static_cast<int>(abc_.methodBodies.size()))
+                    exec(abc_.methodBodies[bi], {v}, obj);
+            }
+            return;
+        }
+        for (const auto& m : c->instanceMembers) {
+            if (m.name != name) continue;
+            if (m.kind == Member::Slot || m.kind == Member::Const) {
+                obj->slots[name] = v;
+                return;
+            }
+        }
+    }
+    if (obj->display) {
+        if (name == "x") { obj->display->x = v.toNumber(); return; }
+        if (name == "y") { obj->display->y = v.toNumber(); return; }
+        if (name == "scaleX") { obj->display->scaleX = v.toNumber(); obj->display->hasFull = false; return; }
+        if (name == "scaleY") { obj->display->scaleY = v.toNumber(); obj->display->hasFull = false; return; }
+        if (name == "rotation") { obj->display->rotation = v.toNumber(); obj->display->hasFull = false; return; }
+        if (name == "alpha") { obj->display->alpha = v.toNumber(); return; }
+        if (name == "visible") { obj->display->visible = v.toBool(); return; }
+    }
+}
+
+Value Vm::callSuperMethod(const std::shared_ptr<Object>& obj, const std::string& name,
+                          const std::vector<Value>& args, uint32_t methodIndex) {
+    if (!obj) return Value::undefined();
+    for (auto c = superStartFor(obj, methodIndex); c; c = c->superClass) {
+        for (const auto& m : c->instanceMembers) {
+            if (m.name != name) continue;
+            if (m.kind != Member::Method && m.kind != Member::Getter) continue;
+            if (m.native) return m.native(obj, args);
+            if (m.methodIndex < abc_.methods.size()) {
+                const int bi = abc_.methods[m.methodIndex].bodyIndex;
+                if (bi >= 0 && bi < static_cast<int>(abc_.methodBodies.size()))
+                    return exec(abc_.methodBodies[bi], args, obj);
+            }
+            return Value::undefined();
+        }
     }
     return Value::undefined();
 }
@@ -7335,7 +7447,10 @@ void Vm::advanceTimeline(const std::shared_ptr<DisplayObject>& d) {
             }
         }
     }
-    for (auto& c : d->children) advanceTimeline(c);
+    // 快照后再递归：推进子剪辑时可能执行 AS3 构造器/事件（addChild 会修改
+    // 父级 children 向量），直接遍历原向量会在 realloc 后拿到悬空引用。
+    auto kids = d->children;
+    for (auto& c : kids) advanceTimeline(c);
 }
 
 // 进入新帧时执行该显示对象注册的 frame script（addFrameScript）。
@@ -7630,7 +7745,10 @@ void Vm::tick() {
         }
     }
     phAccum("timerObjs", phT); phT = nowMs();
-    for (auto& d : stage) advanceTimeline(d);
+    // 快照 stage：推进过程中 AS3 的 addChild 会 push_back 到 stage，
+    // realloc 会让原引用失效（曾在 applyTimelineFrame 里读到已释放的 shared_ptr）。
+    auto roots = stage;
+    for (auto& d : roots) advanceTimeline(d);
     phAccum("timeline", phT); phT = nowMs();
     for (auto& d : stage) runFrameScripts(d);
     phAccum("frameScripts", phT); phT = nowMs();
