@@ -12,6 +12,7 @@
 #include <cstring>
 #include <ctime>
 #include <limits>
+#include <regex>
 #include <set>
 
 #include "swf/Decoder.hpp"   // Movie 完整定义
@@ -96,6 +97,7 @@ struct ExecCtx {
     std::shared_ptr<Object> thisObj;
     Vm& vm;
     size_t codeSize = 0;
+    size_t opPc = 0;   // 当前指令的起始地址（lookupswitch 的偏移以它为基准）
     bool done = false;
     Value returnValue;
     void push(const Value& v) { stack.push_back(v); }
@@ -634,7 +636,10 @@ inline void registerFvmOps() {
         int32_t n = c.pop().toInt();
         int32_t chosen = defOff;
         if (n >= 0 && n <= static_cast<int32_t>(caseCount)) chosen = caseOffs[n];
-        c.jump(chosen); });
+        // AVM2 的 lookupswitch 偏移相对【指令起始地址】，而非操作数末尾；
+        // 用 c.jump() 会多偏一条 switch 指令的长度，落进指令中间的字节。
+        const int64_t t = static_cast<int64_t>(c.opPc) + chosen;
+        if (t >= 0 && t <= static_cast<int64_t>(c.codeSize)) c.in.seek(static_cast<size_t>(t)); });
 
     // ---- 第七批：调用 / 构造 / 类 / 属性查找 ----
     fvmOps().add(0x43, [](ExecCtx& c) {   // callmethod
@@ -3289,6 +3294,44 @@ Value Vm::callMethod(std::shared_ptr<Object> obj, const std::string& name, const
     return Value::undefined();
 }
 
+// RegExp 的 test() 后端：AS3 的正则语法与 ECMAScript 基本一致，直接交给 std::regex。
+// global 模式下按 lastIndex 继续搜索并在成功后推进（空匹配也至少推进一位）。
+static bool asRegExpSearch(const std::shared_ptr<Object>& self, const std::string& input,
+                           std::smatch& m) {
+    if (!self) return false;
+    auto pp = self->props.find("$pattern");
+    const std::string pat = pp == self->props.end() ? std::string() : pp->second.toString();
+    auto flag = [&self](const char* n) {
+        auto it = self->props.find(n);
+        return it != self->props.end() && it->second.toBool();
+    };
+    std::regex_constants::syntax_option_type opt = std::regex_constants::ECMAScript;
+    if (flag("ignoreCase")) opt |= std::regex_constants::icase;
+    // 说明：MSVC 的 std::regex_constants 没有 C++17 的 multiline 标志，
+    // 多行模式暂不参与匹配（属性仍保留，供 AS 侧读取）。
+    std::regex re;
+    try { re = std::regex(pat, opt); } catch (const std::regex_error&) { return false; }
+    const bool global = flag("global");
+    size_t start = 0;
+    if (global) {
+        auto li = self->props.find("lastIndex");
+        if (li != self->props.end() && li->second.toInt() > 0)
+            start = static_cast<size_t>(li->second.toInt());
+        if (start > input.size()) { self->props["lastIndex"] = Value::intg(0); return false; }
+    }
+    const std::string tail = input.substr(start);
+    if (!std::regex_search(tail, m, re)) {
+        if (global) self->props["lastIndex"] = Value::intg(0);
+        return false;
+    }
+    if (global) {
+        const size_t adv = static_cast<size_t>(m.position(0)) +
+                           std::max<size_t>(1, static_cast<size_t>(m.length(0)));
+        self->props["lastIndex"] = Value::intg(static_cast<int64_t>(start + adv));
+    }
+    return true;
+}
+
 // ---- 原生 AS3 / Flash API 注册 ----
 void Vm::registerNativeClasses() {
     auto mkClass = [&](const char* name, ObjKind k) -> std::shared_ptr<Object> {
@@ -4052,6 +4095,58 @@ void Vm::registerNativeClasses() {
                 return Value::undefined();
             };
             cd->instanceMembers.push_back(m);
+        }
+        // ---- RegExp：test()/exec() ----
+        // Google Analytics 的 Utils.validateAccount 用 /^UA-\d+-\d+$/ 校验跟踪 ID；
+        // 之前 RegExp 只是占位类，test() 返回 undefined，Tracker 构造器因此抛
+        // Error("Account ... is not valid.")，ShowScreen 在 GATracker 处中断，
+        // 游戏画面永远加不进显示列表（加载屏消失后一片空白）。
+        if (std::string(nm) == "RegExp") {
+            cd->ctor = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
+                if (!self) return Value::undefined();
+                self->props["$pattern"] = Value::str(a.empty() ? std::string() : a[0].toString());
+                const std::string flags = a.size() > 1 ? a[1].toString() : std::string();
+                self->props["global"] = Value::boolean(flags.find('g') != std::string::npos);
+                self->props["ignoreCase"] = Value::boolean(flags.find('i') != std::string::npos);
+                self->props["multiline"] = Value::boolean(flags.find('m') != std::string::npos);
+                self->props["lastIndex"] = Value::intg(0);
+                return Value::undefined();
+            };
+            {
+                Member g; g.kind = Member::Getter; g.name = "source";
+                g.native = [](std::shared_ptr<Object> self, const std::vector<Value>&) -> Value {
+                    if (!self) return Value::str("");
+                    auto p = self->props.find("$pattern");
+                    return p == self->props.end() ? Value::str("") : p->second;
+                };
+                cd->instanceMembers.push_back(g);
+            }
+            {
+                Member m; m.kind = Member::Method; m.name = "test";
+                m.native = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
+                    std::smatch mt;
+                    return Value::boolean(asRegExpSearch(self, a.empty() ? std::string() : a[0].toString(), mt));
+                };
+                cd->instanceMembers.push_back(m);
+            }
+            {
+                Member m; m.kind = Member::Method; m.name = "exec";
+                m.native = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
+                    std::smatch mt;
+                    if (!asRegExpSearch(self, a.empty() ? std::string() : a[0].toString(), mt))
+                        return Value::nullv();
+                    // 无 Vm 上下文时无法分配 Array：用带 $length/索引属性的普通对象近似，
+                    // 至少能让 index/length 读取与 for-each 派发走通。
+                    auto arr = std::make_shared<Object>();
+                    arr->kind = ObjKind::Array;
+                    arr->className = "Array";
+                    arr->props["0"] = Value::str(mt.str(0));
+                    arr->props["$length"] = Value::intg(1);
+                    arr->props["index"] = Value::intg(mt.position(0));
+                    return Value::object(arr);
+                };
+                cd->instanceMembers.push_back(m);
+            }
         }
         if (std::string(nm) == "MouseEvent" || std::string(nm) == "KeyboardEvent") {
             // new MouseEvent(type, bubbles, cancelable, localX, localY, ...)
@@ -7773,6 +7868,7 @@ Value Vm::exec(const abc::MethodBody& body, const std::vector<Value>& args,
         if (auto* h = fvmOps().find(op)) {
             ExecCtx ec{stack, locals, scope, in, body, thisObj, *this};
             ec.codeSize = body.code.size();
+            ec.opPc = opPc;
             try {
                 (*h)(ec);
             } catch (const AsThrow& t) {
