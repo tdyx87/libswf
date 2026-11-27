@@ -3283,6 +3283,122 @@ static void renderDynamicText(const fvm::DisplayObject& d, const Matrix& world,
     FontGlyphs deviceFont;
     if (!fg) { deviceFont.name = d.textFont; fg = &deviceFont; }
 
+    // htmlText：按 run 自带样式逐字绘制（软件光栅路径）。
+    if (!d.textRuns.empty()) {
+        std::map<std::string, FontGlyphs> deviceFonts;
+        auto findFont = [&](const std::string& face) -> const FontGlyphs* {
+            if (!face.empty()) {
+                const FontGlyphs* best = nullptr;
+                for (const auto& kv : movie.characters) {
+                    if (!kv.second || !kv.second->font) continue;
+                    const std::string& n = kv.second->font->name;
+                    if (n == face) return kv.second->font.get();
+                    if (best == nullptr && n.find(face) != std::string::npos) best = kv.second->font.get();
+                }
+                if (best) return best;
+            }
+            FontGlyphs& df = deviceFonts[face];
+            df.name = face;
+            return &df;
+        };
+        struct SCell {
+            std::uint32_t code = 0;
+            const FontGlyphs* fg = nullptr;
+            const Shape* shape = nullptr;
+            float adv = 0.0f;
+            TextMetrics tm;
+            std::uint32_t color = 0;
+            bool underline = false;
+            int align = 0;
+        };
+        std::vector<std::vector<SCell>> lines(1);
+        for (const auto& run : d.textRuns) {
+            const std::string face = run.font.empty() ? d.textFont : run.font;
+            const int px = run.size > 0 ? run.size : d.textSize;
+            if (px <= 0 || run.text.empty()) continue;
+            const FontGlyphs* rfg = findFont(face);
+            const TextMetrics rtm = textMetrics(*rfg, static_cast<float>(px) * 20.0f);
+            const std::uint32_t rcol = run.hasColor ? run.color : d.textColor;
+            std::uint32_t prev = 0;
+            for (std::uint32_t ch : utf8Codes(run.text)) {
+                if (ch == '\r') continue;
+                if (ch == '\n') { lines.emplace_back(); prev = 0; continue; }
+                int gi = -1;
+                const Shape* gs = nullptr;
+                auto it = rfg->codeToGlyph.find(static_cast<int>(ch));
+                if (it != rfg->codeToGlyph.end() && it->second >= 0 &&
+                    it->second < static_cast<int>(rfg->shapes.size())) {
+                    gi = it->second;
+                    gs = rfg->shapes[static_cast<std::size_t>(gi)].get();
+                }
+                float deviceAdv = 0.0f;
+#ifdef _WIN32
+                if (!gs) deviceAdv = deviceGlyph(rfg->name, ch, run.italic, run.bold).advanceEm;
+#endif
+                SCell c;
+                c.code = ch; c.fg = rfg; c.shape = gs;
+                c.adv = glyphAdvanceTwips(*rfg, gi, gs, deviceAdv, rtm) +
+                        kerningUnits(*rfg, prev, ch) * rtm.scale;
+                c.tm = rtm; c.color = rcol; c.underline = run.underline; c.align = run.align;
+                lines.back().push_back(c);
+                prev = ch;
+            }
+        }
+        float blockW = 0.0f;
+        for (const auto& ln : lines) {
+            float w = 0.0f;
+            for (const auto& c : ln) w += c.adv;
+            blockW = std::max(blockW, w);
+        }
+        float lineTop = 0.0f;
+        for (const auto& ln : lines) {
+            if (ln.empty()) { lineTop += 20.0f; continue; }
+            int align = 0;
+            for (const auto& c : ln) if (c.align >= 0) { align = c.align; break; }
+            float lineW = 0.0f, ascent = 0.0f, lineH = 0.0f;
+            for (const auto& c : ln) {
+                lineW += c.adv;
+                ascent = std::max(ascent, c.tm.ascent);
+                lineH = std::max(lineH, c.tm.lineH);
+            }
+            float penX = align == 1 ? blockW - lineW : (align == 2 ? (blockW - lineW) * 0.5f : 0.0f);
+            for (const auto& c : ln) {
+                Paint cp;
+                cp.kind = FillKind::Solid;
+                cp.solid = Color(static_cast<std::uint8_t>((c.color >> 16) & 0xFF),
+                                 static_cast<std::uint8_t>((c.color >> 8) & 0xFF),
+                                 static_cast<std::uint8_t>(c.color & 0xFF));
+                const float gsScale = c.shape ? c.tm.scale : c.tm.deviceScale;
+                Matrix ms; ms.sx = gsScale; ms.sy = gsScale;
+                Matrix mt; mt.tx = penX; mt.ty = lineTop + ascent;
+                Matrix gm = world.post(ms).post(mt);
+                Matrix Minv; gm.invert(Minv);
+                if (c.shape) {
+                    for (std::size_t si = 0; si < c.shape->fillStyles.size(); ++si)
+                        fillStyleOf(*c.shape, si, gm, Minv, cp, buf, W, H, alpha, BlendMode::Normal);
+#ifdef _WIN32
+                } else if (c.code != ' ') {
+                    const auto& dg = deviceGlyph(c.fg->name, c.code, c.fg->italic, c.fg->bold);
+                    if (dg.found) fillContours(dg.contours, gm, Minv, cp, buf, W, H, alpha, BlendMode::Normal);
+#endif
+                }
+                if (c.underline) {
+                    Matrix ums; ums.tx = penX; ums.ty = lineTop + ascent + 2.0f;
+                    Matrix ugm = world.post(ums);
+                    Matrix uinv; ugm.invert(uinv);
+                    Contour uct;
+                    uct.xs = { 0.0f, c.adv, c.adv, 0.0f };
+                    uct.ys = { 0.0f, 0.0f, 20.0f, 20.0f };
+                    std::vector<Contour> uq{ uct };
+                    fillContours(uq, ugm, uinv, cp, buf, W, H, alpha, BlendMode::Normal);
+                }
+                penX += c.adv;
+            }
+            lineTop += lineH;
+        }
+        return;
+    }
+
     const float fontHeight = static_cast<float>(d.textSize) * 20.0f;   // px -> twips
     if (fontHeight <= 0.0f || d.textData.empty()) return;
 
@@ -5009,8 +5125,8 @@ static void renderGraphicsToSink(IDisplayListSink& sink, const fvm::DisplayObjec
     flushFill();
 }
 
-static void renderDynamicTextToSink(IDisplayListSink& sink, const fvm::DisplayObject& d,
-                                    const Matrix& world, const Movie& movie, float alpha) {
+static void renderPlainDynamicTextToSink(IDisplayListSink& sink, const fvm::DisplayObject& d,
+                                         const Matrix& world, const Movie& movie, float alpha) {
     const FontGlyphs* fg = nullptr;
     if (!d.textFont.empty())
         for (const auto& kv : movie.characters)
@@ -5033,6 +5149,124 @@ static void renderDynamicTextToSink(IDisplayListSink& sink, const fvm::DisplayOb
         float gsScale = gs ? tm.scale : tm.deviceScale;
         if (gs) { Matrix ms; ms.sx=gsScale; ms.sy=gsScale; Matrix mt; mt.tx=penX; mt.ty=penY+tm.ascent; Matrix gm = world.post(ms).post(mt); sink.drawGlyph(*gs, gm, col, noCx, BlendMode::Normal, alpha); }
         penX += adv; prev = ch;
+    }
+}
+
+// htmlText 的 run 绘制：每个 run 自带字体/字号/颜色/粗斜体/下划线，按行排版。
+// 行内若 run.align 要求居中/右对齐，则以本块最宽行为基准对齐（没有字段宽度可用）。
+static void renderDynamicTextToSink(IDisplayListSink& sink, const fvm::DisplayObject& d,
+                                    const Matrix& world, const Movie& movie, float alpha) {
+    if (d.textRuns.empty()) {
+        renderPlainDynamicTextToSink(sink, d, world, movie, alpha);
+        return;
+    }
+    struct Cell {
+        std::uint32_t code = 0;
+        const FontGlyphs* fg = nullptr;
+        const Shape* shape = nullptr;
+        float adv = 0.0f;
+        TextMetrics tm;
+        std::uint32_t color = 0;
+        bool bold = false, italic = false, underline = false;
+        int align = 0;
+    };
+    std::map<std::string, FontGlyphs> deviceFonts;
+    auto findFont = [&](const std::string& face) -> const FontGlyphs* {
+        if (!face.empty()) {
+            const FontGlyphs* best = nullptr;
+            for (const auto& kv : movie.characters) {
+                if (!kv.second || !kv.second->font) continue;
+                const std::string& n = kv.second->font->name;
+                if (n == face) return kv.second->font.get();
+                if (best == nullptr && n.find(face) != std::string::npos) best = kv.second->font.get();
+            }
+            if (best) return best;
+        }
+        FontGlyphs& df = deviceFonts[face];
+        df.name = face;
+        return &df;
+    };
+    std::vector<std::vector<Cell>> lines(1);
+    for (const auto& run : d.textRuns) {
+        const std::string face = run.font.empty() ? d.textFont : run.font;
+        const int px = run.size > 0 ? run.size : d.textSize;
+        if (px <= 0 || run.text.empty()) continue;
+        const FontGlyphs* fg = findFont(face);
+        const TextMetrics tm = textMetrics(*fg, static_cast<float>(px) * 20.0f);
+        const std::uint32_t col = run.hasColor ? run.color : d.textColor;
+        std::uint32_t prev = 0;
+        for (std::uint32_t ch : utf8Codes(run.text)) {
+            if (ch == '\r') continue;
+            if (ch == '\n') { lines.emplace_back(); prev = 0; continue; }
+            int gi = -1;
+            const Shape* gs = nullptr;
+            auto it = fg->codeToGlyph.find(static_cast<int>(ch));
+            if (it != fg->codeToGlyph.end() && it->second >= 0 &&
+                it->second < static_cast<int>(fg->shapes.size())) {
+                gi = it->second;
+                gs = fg->shapes[static_cast<std::size_t>(gi)].get();
+            }
+            float deviceAdv = 0.0f;
+#ifdef _WIN32
+            if (!gs) deviceAdv = deviceGlyph(fg->name, ch, run.italic, run.bold).advanceEm;
+#endif
+            Cell c;
+            c.code = ch; c.fg = fg; c.shape = gs;
+            c.adv = glyphAdvanceTwips(*fg, gi, gs, deviceAdv, tm) +
+                    kerningUnits(*fg, prev, ch) * tm.scale;
+            c.tm = tm;
+            c.color = col;
+            c.bold = run.bold; c.italic = run.italic; c.underline = run.underline;
+            c.align = run.align;
+            lines.back().push_back(c);
+            prev = ch;
+        }
+    }
+    float blockW = 0.0f;
+    for (const auto& ln : lines) {
+        float w = 0.0f;
+        for (const auto& c : ln) w += c.adv;
+        blockW = std::max(blockW, w);
+    }
+    ColorTransform noCx;
+    float lineTop = 0.0f;
+    for (const auto& ln : lines) {
+        if (ln.empty()) { lineTop += 20.0f; continue; }
+        int align = 0;
+        for (const auto& c : ln) if (c.align >= 0) { align = c.align; break; }
+        float lineW = 0.0f, ascent = 0.0f, lineH = 0.0f;
+        for (const auto& c : ln) {
+            lineW += c.adv;
+            ascent = std::max(ascent, c.tm.ascent);
+            lineH = std::max(lineH, c.tm.lineH);
+        }
+        float penX = align == 1 ? blockW - lineW : (align == 2 ? (blockW - lineW) * 0.5f : 0.0f);
+        for (const auto& c : ln) {
+            const Color col(static_cast<std::uint8_t>((c.color >> 16) & 0xFF),
+                            static_cast<std::uint8_t>((c.color >> 8) & 0xFF),
+                            static_cast<std::uint8_t>(c.color & 0xFF),
+                            static_cast<std::uint8_t>((c.color >> 24) & 0xFF));
+            const float gsScale = c.shape ? c.tm.scale : c.tm.deviceScale;
+            const float ty = lineTop + ascent;
+            if (c.shape) {
+                Matrix ms; ms.sx = gsScale; ms.sy = gsScale;
+                Matrix mt; mt.tx = penX; mt.ty = ty;
+                sink.drawGlyph(*c.shape, world.post(ms).post(mt), col, noCx, BlendMode::Normal, alpha);
+            }
+            if (c.underline) {
+                Shape sh; sh.usesWinding = true;
+                FillStyle fs; fs.kind = FillKind::Solid; fs.color = col;
+                sh.fillStyles.push_back(fs);
+                Contour ct;
+                const float uy = ty + 2.0f;
+                ct.xs = { penX, penX + c.adv, penX + c.adv, penX };
+                ct.ys = { uy, uy, uy + 20.0f, uy + 20.0f };
+                sh.fillPaths.push_back({ ct });
+                sink.drawTransientFill(sh, 0, world, noCx, BlendMode::Normal, alpha);
+            }
+            penX += c.adv;
+        }
+        lineTop += lineH;
     }
 }
 

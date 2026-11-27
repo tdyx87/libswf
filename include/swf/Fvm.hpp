@@ -145,6 +145,17 @@ struct GraphicsCmd {
     double cx = 0, cy = 0;           // CurveTo 控制点
 };
 
+// htmlText 解析出的一段带样式的文本（一段内样式相同）。
+struct TextRun {
+    std::string text;
+    std::string font;                 // 空 = 使用字段默认字体
+    int size = 0;                     // 0 = 使用字段默认字号
+    std::uint32_t color = 0;          // ARGB
+    bool hasColor = false;
+    bool bold = false, italic = false, underline = false;
+    int align = -1;                   // -1 继承；0 左 1 右 2 居中
+};
+
 // 显示对象（构成运行时显示列表树）
 struct DisplayObject {
     ObjKind kind = ObjKind::DisplayObject;
@@ -201,6 +212,8 @@ struct DisplayObject {
     uint32_t textColor = 0xFF000000;   // ARGB（高字节 alpha）
     std::string textFont;
     bool  hasText = false;
+    std::vector<TextRun> textRuns;     // htmlText 解析结果（非空时按 run 绘制）
+    std::string htmlSource;            // 原始 htmlText（styleSheet 后到时重新解析）
     BlendMode blend = BlendMode::Normal;   // 混合模式（PlaceObject3 blendMode）
     // PlaceObject3 FilterList。shared_ptr 让前向声明类型可用于不完整类型成员，
     // 且同一滤镜列表在逐帧复用显示对象时无需反复拷贝。

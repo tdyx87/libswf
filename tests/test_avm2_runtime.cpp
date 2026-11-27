@@ -889,6 +889,44 @@ int main() {
         }
     }
 
+    // ---- 13. htmlText 的 run 解析与 StyleSheet.parseCSS ----
+    {
+        auto tf = vm.newObject(ObjKind::Generic, "TextField");
+        tf->display = std::make_shared<f::DisplayObject>();
+        tf->display->textSize = 12;
+        vm.setProperty(tf, "htmlText", Value::str(
+            "<font color=\"#ff0000\" size=\"20\">Hi</font><b>!</b><br>X&amp;Y"));
+        check(tf->display->textData == "Hi!\nX&Y", "htmlText 提取纯文本并解码实体");
+        check(tf->display->textRuns.size() >= 3, "htmlText 按样式拆分为多个 run");
+        if (!tf->display->textRuns.empty()) {
+            const auto& r = tf->display->textRuns[0];
+            check(r.hasColor && r.color == 0xFFFF0000u && r.size == 20,
+                  "<font color/size> 写入 run 的颜色与字号");
+        }
+        bool bold = false;
+        for (const auto& r : tf->display->textRuns)
+            if (r.text == "!" && r.bold) bold = true;
+        check(bold, "<b> 生成 bold run");
+
+        const Value sheet = make(vm, "StyleSheet");
+        check(sheet.kind == VKind::Object && sheet.obj, "StyleSheet 可构造");
+        if (sheet.kind == VKind::Object && sheet.obj) {
+            call(vm, sheet.obj, "parseCSS", {Value::str(
+                ".hot { color: #00ff00; fontSize: 18px; fontFamily: 'Arial'; }")});
+            vm.setProperty(tf, "styleSheet", sheet);
+            vm.setProperty(tf, "htmlText", Value::str("<span class=\"hot\">Z</span>"));
+            check(tf->display->textRuns.size() == 1 && tf->display->textRuns[0].color == 0xFF00FF00u &&
+                  tf->display->textRuns[0].size == 18 && tf->display->textRuns[0].font == "Arial",
+                  "StyleSheet 的 .class 选择器应用到 run");
+            const Value st = call(vm, sheet.obj, "getStyle", {Value::str(".hot")});
+            check(st.kind == VKind::Object && st.obj && st.obj->props.count("color") == 1,
+                  "StyleSheet.getStyle 返回解析后的声明");
+        }
+        vm.setProperty(tf, "text", Value::str("plain"));
+        check(tf->display->textRuns.empty() && tf->display->textData == "plain",
+              "纯 text 会清除 htmlText run");
+    }
+
     std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

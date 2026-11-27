@@ -181,6 +181,17 @@ static std::string takeRuntimeName(ExecCtx& c, uint32_t mn) {
                 name = v.toString();
         }
     }
+    // E4X 属性访问：`xml.@name` 的 multiname 是 QNameA/RTQNameA/MultinameA 等
+    // 带 A（attribute）后缀的种类，但名字串本身不含 '@'。这里补回前缀，
+    // 让 getProperty/setProperty 能区分「同名子元素」与「属性」。
+    const abc::Multiname* m = A.mn(mn);
+    if (m) {
+        using K = abc::Multiname::Kind;
+        if (m->kind == K::QNameA || m->kind == K::RTQNameA ||
+            m->kind == K::RTQNameLA || m->kind == K::MultinameA ||
+            m->kind == K::MultinameLA)
+            name.insert(name.begin(), '@');
+    }
     return name;
 }
 
@@ -1572,6 +1583,346 @@ static std::string xmlUnescape(const std::string& s) {
     }
     return out;
 }
+
+// ---- htmlText / StyleSheet ----
+// TextField.htmlText 支持有限的 HTML 子集：<font color/size/face>、<b>/<i>/<u>、
+// <br>、<p align>、<span class/style> 与实体。这里把 HTML 解析成带样式的 TextRun
+// 序列，渲染端按 run 取字体/字号/颜色绘制；同时产出纯文本供 measuredWidth 等使用。
+struct HtmlRunStyle {
+    std::string font;
+    int size = 0;
+    bool hasSize = false;
+    std::uint32_t color = 0;
+    bool hasColor = false;
+    bool bold = false, italic = false, underline = false;
+    int align = -1;
+};
+
+static std::string htmlTrim(const std::string& s) {
+    std::size_t b = 0, e = s.size();
+    while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n')) ++b;
+    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n')) --e;
+    std::string out = s.substr(b, e - b);
+    if (out.size() >= 2 && (out.front() == '"' || out.front() == '\'') && out.back() == out.front())
+        out = out.substr(1, out.size() - 2);
+    return out;
+}
+
+static std::string htmlLower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+static bool htmlParseColor(const std::string& raw, std::uint32_t& out) {
+    std::string v = htmlTrim(raw);
+    if (v.empty()) return false;
+    if (v[0] == '#') {
+        const std::string h = v.substr(1);
+        if (h.size() == 3) {
+            out = 0xFF000000u |
+                  (static_cast<std::uint32_t>(std::stoul(std::string(2, h[0]), nullptr, 16)) << 16) |
+                  (static_cast<std::uint32_t>(std::stoul(std::string(2, h[1]), nullptr, 16)) << 8) |
+                  static_cast<std::uint32_t>(std::stoul(std::string(2, h[2]), nullptr, 16));
+            return true;
+        }
+        if (h.size() == 6 || h.size() == 8) {
+            const std::uint32_t rgb = static_cast<std::uint32_t>(std::stoul(h.substr(0, 6), nullptr, 16));
+            out = 0xFF000000u | rgb;
+            return true;
+        }
+        return false;
+    }
+    if (htmlLower(v).rfind("rgb(", 0) == 0) {
+        const std::size_t close = v.find(')');
+        std::string body = v.substr(4, close == std::string::npos ? std::string::npos : close - 4);
+        int r = 0, g = 0, b = 0;
+        if (std::sscanf(body.c_str(), "%d,%d,%d", &r, &g, &b) != 3) return false;
+        out = 0xFF000000u | (static_cast<std::uint32_t>(r & 0xFF) << 16) |
+              (static_cast<std::uint32_t>(g & 0xFF) << 8) | static_cast<std::uint32_t>(b & 0xFF);
+        return true;
+    }
+    char* end = nullptr;
+    const unsigned long n = std::strtoul(v.c_str(), &end, 10);
+    if (end && *end == 0) { out = 0xFF000000u | static_cast<std::uint32_t>(n); return true; }
+    return false;
+}
+
+static int htmlParsePx(const std::string& raw) {
+    std::string v = htmlTrim(raw);
+    char* end = nullptr;
+    const double n = std::strtod(v.c_str(), &end);
+    if (end == v.c_str()) return 0;
+    if (v.find("pt", static_cast<std::size_t>(end - v.c_str())) != std::string::npos)
+        return static_cast<int>(n * 4.0 / 3.0 + 0.5);
+    return static_cast<int>(n + 0.5);
+}
+
+static void htmlApplyDecl(HtmlRunStyle& st, const std::string& keyRaw, const std::string& valRaw) {
+    const std::string key = htmlLower(htmlTrim(keyRaw));
+    const std::string val = htmlTrim(valRaw);
+    if (key.empty() || val.empty()) return;
+    if (key == "color") {
+        std::uint32_t c = 0;
+        if (htmlParseColor(val, c)) { st.color = c; st.hasColor = true; }
+    } else if (key == "fontsize") {
+        const int px = htmlParsePx(val);
+        if (px > 0) { st.size = px; st.hasSize = true; }
+    } else if (key == "fontfamily") {
+        st.font = htmlTrim(val);
+    } else if (key == "fontweight") {
+        st.bold = htmlLower(val) == "bold" || std::atoi(val.c_str()) >= 600;
+    } else if (key == "fontstyle") {
+        st.italic = htmlLower(val) == "italic" || htmlLower(val) == "oblique";
+    } else if (key == "textdecoration") {
+        st.underline = htmlLower(val).find("underline") != std::string::npos;
+    } else if (key == "textalign") {
+        const std::string a = htmlLower(val);
+        st.align = a == "right" ? 1 : (a == "center" ? 2 : (a == "left" ? 0 : st.align));
+    }
+}
+
+// CSS 声明串：`a: b; c: d`（也接受 style="..." 的内联形式）。
+static void htmlApplyCssDecls(HtmlRunStyle& st, const std::string& decls) {
+    std::size_t p = 0;
+    while (p < decls.size()) {
+        std::size_t semi = decls.find(';', p);
+        const std::string one = decls.substr(p, semi == std::string::npos ? std::string::npos : semi - p);
+        const std::size_t colon = one.find(':');
+        if (colon != std::string::npos)
+            htmlApplyDecl(st, one.substr(0, colon), one.substr(colon + 1));
+        if (semi == std::string::npos) break;
+        p = semi + 1;
+    }
+}
+
+static void htmlApplyStyleObject(HtmlRunStyle& st, const std::shared_ptr<Object>& style) {
+    if (!style) return;
+    auto get = [&](const char* k) -> std::string {
+        auto it = style->props.find(k);
+        return it == style->props.end() ? std::string() : it->second.toString();
+    };
+    if (!get("color").empty()) htmlApplyDecl(st, "color", get("color"));
+    if (!get("fontSize").empty()) htmlApplyDecl(st, "fontSize", get("fontSize"));
+    if (!get("fontFamily").empty()) htmlApplyDecl(st, "fontFamily", get("fontFamily"));
+    if (!get("fontWeight").empty()) htmlApplyDecl(st, "fontWeight", get("fontWeight"));
+    if (!get("fontStyle").empty()) htmlApplyDecl(st, "fontStyle", get("fontStyle"));
+    if (!get("textDecoration").empty()) htmlApplyDecl(st, "textDecoration", get("textDecoration"));
+    if (!get("textAlign").empty()) htmlApplyDecl(st, "textAlign", get("textAlign"));
+}
+
+// 按 CSS 选择器优先级应用：* < tag < .class < tag.class。
+static void htmlApplySheet(HtmlRunStyle& st, const std::shared_ptr<Object>& sheet,
+                           const std::string& tag, const std::string& cls) {
+    if (!sheet) return;
+    auto it = sheet->props.find("$css");
+    if (it == sheet->props.end() || it->second.kind != VKind::Object || !it->second.obj) return;
+    const auto& css = it->second.obj->props;
+    auto apply = [&](const std::string& sel) {
+        auto s = css.find(sel);
+        if (s != css.end() && s->second.kind == VKind::Object) htmlApplyStyleObject(st, s->second.obj);
+    };
+    apply("*");
+    if (!tag.empty()) apply(tag);
+    // class 属性可含多个以空格分隔的名字
+    std::size_t p = 0;
+    while (p < cls.size()) {
+        std::size_t sp = cls.find_first_of(" \t", p);
+        const std::string one = cls.substr(p, sp == std::string::npos ? std::string::npos : sp - p);
+        if (!one.empty()) apply("." + one);
+        if (sp == std::string::npos) break;
+        p = sp + 1;
+    }
+    if (!tag.empty() && !cls.empty()) {
+        std::size_t sp = cls.find_first_of(" \t");
+        apply(tag + "." + cls.substr(0, sp));
+    }
+}
+
+static void htmlAppendUtf8(std::string& out, unsigned cp) {
+    if (cp < 0x80) out += static_cast<char>(cp);
+    else if (cp < 0x800) {
+        out += static_cast<char>(0xC0 | (cp >> 6));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += static_cast<char>(0xE0 | (cp >> 12));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        out += static_cast<char>(0xF0 | (cp >> 18));
+        out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+}
+
+// HTML 实体：命名实体 + 十进制/十六进制数字实体（输出 UTF-8）。
+static std::string htmlDecodeEntities(const std::string& s) {
+    std::string out;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] != '&') { out += s[i]; continue; }
+        const std::size_t e = s.find(';', i);
+        if (e == std::string::npos || e - i > 12) { out += s[i]; continue; }
+        const std::string ent = s.substr(i + 1, e - i - 1);
+        if (ent == "amp") out += '&';
+        else if (ent == "lt") out += '<';
+        else if (ent == "gt") out += '>';
+        else if (ent == "quot") out += '"';
+        else if (ent == "apos") out += '\'';
+        else if (ent == "nbsp") out += ' ';
+        else if (!ent.empty() && ent[0] == '#') {
+            const bool hex = ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X');
+            const unsigned cp = static_cast<unsigned>(std::strtoul(ent.c_str() + (hex ? 2 : 1), nullptr, hex ? 16 : 10));
+            if (cp) htmlAppendUtf8(out, cp);
+        } else out += s.substr(i, e - i + 1);
+        i = e;
+    }
+    return out;
+}
+
+static bool htmlStyleEqual(const HtmlRunStyle& a, const TextRun& r) {
+    return r.font == a.font && r.size == a.size &&
+           r.hasColor == a.hasColor && (!a.hasColor || r.color == a.color) &&
+           r.bold == a.bold && r.italic == a.italic && r.underline == a.underline &&
+           r.align == a.align;
+}
+
+static void htmlParseRuns(const std::string& html, const std::shared_ptr<Object>& sheet,
+                          int defSize, std::uint32_t defColor, const std::string& defFont,
+                          std::vector<TextRun>& out, std::string& plain) {
+    out.clear();
+    plain.clear();
+    HtmlRunStyle base;
+    base.font = defFont;
+    base.size = defSize > 0 ? defSize : 12;
+    base.hasSize = true;
+    base.color = defColor;
+    base.hasColor = true;
+    std::vector<HtmlRunStyle> stack;
+    stack.push_back(base);
+    auto addText = [&](const std::string& raw) {
+        if (raw.empty()) return;
+        const std::string text = htmlDecodeEntities(raw);
+        if (text.empty()) return;
+        plain += text;
+        const HtmlRunStyle& st = stack.back();
+        if (!out.empty() && htmlStyleEqual(st, out.back())) {
+            out.back().text += text;
+            return;
+        }
+        TextRun r;
+        r.text = text;
+        r.font = st.font;
+        r.size = st.size;
+        r.color = st.color;
+        r.hasColor = st.hasColor;
+        r.bold = st.bold; r.italic = st.italic; r.underline = st.underline;
+        r.align = st.align;
+        out.push_back(std::move(r));
+    };
+    // 解析一个标签的属性串（值可带引号）。
+    auto parseAttrs = [](const std::string& body) {
+        std::map<std::string, std::string> attrs;
+        std::size_t p = 0;
+        while (p < body.size()) {
+            while (p < body.size() && std::isspace(static_cast<unsigned char>(body[p]))) ++p;
+            const std::size_t ks = p;
+            while (p < body.size() && !std::isspace(static_cast<unsigned char>(body[p])) &&
+                   body[p] != '=') ++p;
+            const std::string key = htmlLower(body.substr(ks, p - ks));
+            while (p < body.size() && std::isspace(static_cast<unsigned char>(body[p]))) ++p;
+            std::string val;
+            if (p < body.size() && body[p] == '=') {
+                ++p;
+                while (p < body.size() && std::isspace(static_cast<unsigned char>(body[p]))) ++p;
+                if (p < body.size() && (body[p] == '"' || body[p] == '\'')) {
+                    const char q = body[p++];
+                    const std::size_t vs = p;
+                    while (p < body.size() && body[p] != q) ++p;
+                    val = body.substr(vs, p - vs);
+                    if (p < body.size()) ++p;
+                } else {
+                    const std::size_t vs = p;
+                    while (p < body.size() && !std::isspace(static_cast<unsigned char>(body[p]))) ++p;
+                    val = body.substr(vs, p - vs);
+                }
+            }
+            if (!key.empty()) attrs[key] = val;
+        }
+        return attrs;
+    };
+    std::size_t i = 0;
+    while (i < html.size()) {
+        if (html[i] != '<') {
+            const std::size_t lt = html.find('<', i);
+            addText(html.substr(i, lt == std::string::npos ? std::string::npos : lt - i));
+            if (lt == std::string::npos) break;
+            i = lt;
+            continue;
+        }
+        if (html.compare(i, 4, "<!--") == 0) {
+            const std::size_t e = html.find("-->", i + 4);
+            i = e == std::string::npos ? html.size() : e + 3;
+            continue;
+        }
+        const std::size_t gt = html.find('>', i + 1);
+        if (gt == std::string::npos) { addText(html.substr(i)); break; }
+        std::string body = html.substr(i + 1, gt - i - 1);
+        i = gt + 1;
+        bool closing = false;
+        if (!body.empty() && body[0] == '/') { closing = true; body.erase(body.begin()); }
+        if (!body.empty() && body.back() == '/') body.pop_back();
+        std::size_t sp = 0;
+        while (sp < body.size() && !std::isspace(static_cast<unsigned char>(body[sp]))) ++sp;
+        const std::string tag = htmlLower(body.substr(0, sp));
+        if (tag.empty()) continue;
+        const std::string attrBody = sp < body.size() ? body.substr(sp) : std::string();
+        if (tag == "br") { addText("\n"); continue; }
+        if (closing) {
+            if (tag == "p") addText("\n");
+            if (stack.size() > 1) stack.pop_back();
+            continue;
+        }
+        HtmlRunStyle next = stack.back();
+        const auto attrs = parseAttrs(attrBody);
+        bool push = false;
+        if (tag == "p") {
+            if (!plain.empty() && plain.back() != '\n') addText("\n");
+            push = true;
+            auto al = attrs.find("align");
+            if (al != attrs.end()) {
+                const std::string a = htmlLower(htmlTrim(al->second));
+                next.align = a == "right" ? 1 : (a == "center" ? 2 : 0);
+            }
+        } else if (tag == "font") {
+            push = true;
+            auto c = attrs.find("color");
+            if (c != attrs.end()) { std::uint32_t v = 0; if (htmlParseColor(c->second, v)) { next.color = v; next.hasColor = true; } }
+            auto s = attrs.find("size");
+            if (s != attrs.end()) {
+                // HTML size=1..7 是相对档位；数字大于 7 时按像素处理。
+                const int n = htmlParsePx(s->second);
+                if (n > 7) { next.size = n; next.hasSize = true; }
+                else if (n > 0) { next.size = 9 + n * 2; next.hasSize = true; }
+            }
+            auto f = attrs.find("face");
+            if (f != attrs.end() && !f->second.empty()) next.font = htmlTrim(f->second);
+        } else if (tag == "b" || tag == "strong") {
+            push = true; next.bold = true;
+        } else if (tag == "i" || tag == "em") {
+            push = true; next.italic = true;
+        } else if (tag == "u") {
+            push = true; next.underline = true;
+        } else if (tag == "span" || tag == "a" || tag == "div" || tag == "li") {
+            push = true;
+            auto cl = attrs.find("class");
+            const std::string cls = cl == attrs.end() ? std::string() : htmlTrim(cl->second);
+            htmlApplySheet(next, sheet, tag, cls);
+            auto st = attrs.find("style");
+            if (st != attrs.end()) htmlApplyCssDecls(next, st->second);
+        }
+        if (push) stack.push_back(next);
+    }
+}
 static bool parseXmlElement(const std::string& s, std::size_t& p, XmlNode& out, int depth) {
     if (depth > 32) return false;
     xmlSkipWs(s, p);
@@ -2463,6 +2814,15 @@ Value Vm::getPropertyImpl(std::shared_ptr<Object> obj, const std::string& name) 
             return Value::object(objectForDisplay(c));
         }
     }
+    // 2.55) E4X：`xml.@attr` 取节点属性（takeRuntimeName 已为属性 multiname 补 '@'）。
+    if (!name.empty() && name[0] == '@' && obj->props.count("$xmlAttrs")) {
+        const std::string an = name.substr(1);
+        auto at = obj->props.find("$xmlAttrs");
+        if (at == obj->props.end() || at->second.kind != VKind::Object || !at->second.obj)
+            return Value::undefined();
+        auto av = at->second.obj->props.find(an);
+        return av == at->second.obj->props.end() ? Value::undefined() : av->second;
+    }
     // 2.6) E4X：XML 对象上未显式定义的点号属性解析为同名子元素；
     // 单个命中返回 XML 节点本身，多个命中返回 XMLList。
     if (obj->props.count("$xmlChildren") && !name.empty() && name[0] != '@' && name != "*") {
@@ -2760,9 +3120,36 @@ void Vm::setProperty(std::shared_ptr<Object> obj, const std::string& name, const
         }
         // 运行时 TextField 文本属性
         if (name == "text" || name == "htmlText") {
-            obj->display->textData = v.toString();
+            if (name == "htmlText") {
+                obj->display->htmlSource = v.toString();
+                std::shared_ptr<Object> sheet;
+                auto sh = obj->props.find("styleSheet");
+                if (sh != obj->props.end() && sh->second.kind == VKind::Object) sheet = sh->second.obj;
+                std::string plain;
+                htmlParseRuns(obj->display->htmlSource, sheet, obj->display->textSize,
+                              obj->display->textColor, obj->display->textFont,
+                              obj->display->textRuns, plain);
+                obj->display->textData = plain;
+            } else {
+                obj->display->textRuns.clear();
+                obj->display->htmlSource.clear();
+                obj->display->textData = v.toString();
+            }
             obj->display->hasText = true;
             obj->props[name] = v; return;
+        }
+        if (name == "styleSheet") {
+            obj->props[name] = v;
+            // StyleSheet 常在 htmlText 之后赋值：拿到表后按原始 HTML 重新解析。
+            if (obj->display && !obj->display->htmlSource.empty()) {
+                std::shared_ptr<Object> sheet = v.kind == VKind::Object ? v.obj : nullptr;
+                std::string plain;
+                htmlParseRuns(obj->display->htmlSource, sheet, obj->display->textSize,
+                              obj->display->textColor, obj->display->textFont,
+                              obj->display->textRuns, plain);
+                obj->display->textData = plain;
+            }
+            return;
         }
         if (name == "textColor") {
             obj->display->textColor = static_cast<uint32_t>(v.toUInt());
@@ -4063,7 +4450,7 @@ void Vm::registerNativeClasses() {
                            "Sound", "SoundChannel", "URLLoader", "URLRequest", "XML",
                            "XMLList", "RegExp", "ByteArray", "Vector", "Dictionary",
                            "SharedObject", "Error", "MouseEvent", "KeyboardEvent",
-                           "TextFormat", "Point", "Rectangle", "Matrix", "ColorTransform",
+                           "TextFormat", "StyleSheet", "Point", "Rectangle", "Matrix", "ColorTransform",
                            "SoundTransform",
                            "Tween", "TweenLite", "TweenMax", "NetConnection", "NetStream"}) {
         auto c = mkClass(nm, ObjKind::Generic);
@@ -4238,6 +4625,124 @@ void Vm::registerNativeClasses() {
         auto noop = [](std::shared_ptr<Object>, const std::vector<Value>&) -> Value {
             return Value::undefined();
         };
+
+        // ---- StyleSheet：parseCSS / setStyle / getStyle / styleNames ----
+        // 本地化模块常用 `new StyleSheet()` + parseCSS(css) + tf.styleSheet = sheet
+        // + tf.htmlText = html 的组合；缺类时 styleSheet 为 undefined，htmlText 里的
+        // <span class="..."> 样式全部丢失。
+        if (auto cd = classDefOf("StyleSheet")) {
+            globals_->props["flash.text.StyleSheet"] = Value::object(classObj("StyleSheet"));
+            cd->ctor = [](std::shared_ptr<Object> self, const std::vector<Value>&) -> Value {
+                if (!self) return Value::undefined();
+                auto css = std::make_shared<Object>();
+                css->className = "Object";
+                self->props["$css"] = Value::object(css);
+                return Value::undefined();
+            };
+            auto cssOf = [](const std::shared_ptr<Object>& self) -> std::shared_ptr<Object> {
+                if (!self) return nullptr;
+                auto it = self->props.find("$css");
+                if (it == self->props.end() || it->second.kind != VKind::Object || !it->second.obj) {
+                    auto css = std::make_shared<Object>();
+                    css->className = "Object";
+                    self->props["$css"] = Value::object(css);
+                    return css;
+                }
+                return it->second.obj;
+            };
+            addMethod(cd, "parseCSS", [cssOf](std::shared_ptr<Object> self,
+                                               const std::vector<Value>& a) -> Value {
+                auto css = cssOf(self);
+                if (!css || a.empty()) return Value::undefined();
+                std::string s = a[0].toString();
+                // 去注释
+                for (;;) {
+                    const std::size_t b = s.find("/*");
+                    if (b == std::string::npos) break;
+                    const std::size_t e = s.find("*/", b + 2);
+                    s.erase(b, e == std::string::npos ? std::string::npos : e + 2 - b);
+                }
+                std::size_t p = 0;
+                while (p < s.size()) {
+                    const std::size_t lb = s.find('{', p);
+                    if (lb == std::string::npos) break;
+                    const std::size_t rb = s.find('}', lb + 1);
+                    if (rb == std::string::npos) break;
+                    const std::string selectors = htmlTrim(s.substr(p, lb - p));
+                    const std::string decls = s.substr(lb + 1, rb - lb - 1);
+                    p = rb + 1;
+                    if (selectors.empty()) continue;
+                    auto styleObj = std::make_shared<Object>();
+                    styleObj->className = "Object";
+                    std::size_t dp = 0;
+                    while (dp < decls.size()) {
+                        const std::size_t semi = decls.find(';', dp);
+                        const std::string one = decls.substr(dp, semi == std::string::npos ? std::string::npos : semi - dp);
+                        const std::size_t colon = one.find(':');
+                        if (colon != std::string::npos) {
+                            const std::string k = htmlTrim(one.substr(0, colon));
+                            const std::string v = htmlTrim(one.substr(colon + 1));
+                            if (!k.empty()) styleObj->props[k] = Value::str(v);
+                        }
+                        if (semi == std::string::npos) break;
+                        dp = semi + 1;
+                    }
+                    std::size_t sp = 0;
+                    while (sp <= selectors.size()) {
+                        const std::size_t comma = selectors.find(',', sp);
+                        const std::string sel = htmlTrim(selectors.substr(
+                            sp, comma == std::string::npos ? std::string::npos : comma - sp));
+                        if (!sel.empty()) css->props[sel] = Value::object(styleObj);
+                        if (comma == std::string::npos) break;
+                        sp = comma + 1;
+                    }
+                }
+                return Value::undefined();
+            });
+            addMethod(cd, "setStyle", [cssOf](std::shared_ptr<Object> self,
+                                              const std::vector<Value>& a) -> Value {
+                auto css = cssOf(self);
+                if (!css || a.size() < 2) return Value::undefined();
+                const std::string sel = a[0].toString();
+                auto styleObj = std::make_shared<Object>();
+                styleObj->className = "Object";
+                if (a[1].kind == VKind::Object && a[1].obj)
+                    for (const auto& kv : a[1].obj->props)
+                        if (kv.first.empty() || kv.first[0] != '$') styleObj->props[kv.first] = kv.second;
+                css->props[sel] = Value::object(styleObj);
+                return Value::undefined();
+            });
+            addMethod(cd, "getStyle", [cssOf](std::shared_ptr<Object> self,
+                                              const std::vector<Value>& a) -> Value {
+                auto css = cssOf(self);
+                if (!css || a.empty()) return Value::nullv();
+                auto it = css->props.find(a[0].toString());
+                return it == css->props.end() ? Value::nullv() : it->second;
+            });
+            addMethod(cd, "clear", [cssOf](std::shared_ptr<Object> self,
+                                           const std::vector<Value>&) -> Value {
+                auto css = cssOf(self);
+                if (css) css->props.clear();
+                return Value::undefined();
+            });
+            {
+                Member g; g.kind = Member::Getter; g.name = "styleNames";
+                g.native = [cssOf](std::shared_ptr<Object> self,
+                                   const std::vector<Value>&) -> Value {
+                    auto arr = std::make_shared<Object>();
+                    arr->kind = ObjKind::Array;
+                    arr->className = "Array";
+                    int n = 0;
+                    if (auto css = cssOf(self))
+                        for (const auto& kv : css->props)
+                            if (!kv.first.empty() && kv.first[0] != '$')
+                                arr->props[std::to_string(n++)] = Value::str(kv.first);
+                    arr->props["$length"] = Value::intg(n);
+                    return Value::object(arr);
+                };
+                cd->instanceMembers.push_back(g);
+            }
+        }
 
         // ---- ByteArray：小端字节缓冲，与 applicationDomain.domainMemory 共享 ----
         if (auto cd = classDefOf("ByteArray")) {
