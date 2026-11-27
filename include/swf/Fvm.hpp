@@ -397,6 +397,8 @@ private:
     std::vector<std::shared_ptr<Object>> loaderInfos_;
     bool loaderEventsFired_ = false;
     void fireLoaderEvents();
+    // ---- 舞台归属事件：进入/离开显示树时派发 addedToStage / removedFromStage ----
+    void fireStageEvents();
 
     const abc::AbcFile& abc_;
     Movie& movie_;

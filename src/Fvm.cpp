@@ -3979,6 +3979,40 @@ void Vm::registerNativeClasses() {
         }
     }
 
+    // ---- ProgressEvent：Loader / URLLoader 的进度事件 ----
+    // preloader 普遍用 ProgressEvent.PROGRESS 注册监听并读 bytesLoaded/bytesTotal。
+    // 此前完全没有这个类：常量解析成 undefined，监听被注册在 "undefined" 键上，
+    // 加载事件永远收不到，预加载条恒停在 0%。
+    {
+        auto c = mkClass("ProgressEvent", ObjKind::Event);
+        c->classDef->ctor = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
+            if (!self) return Value::undefined();
+            initEventProps(self, a.empty() ? Value::str("progress") : a[0],
+                           a.size() > 1 && a[1].toBool(), a.size() > 2 && a[2].toBool());
+            self->props["bytesLoaded"] = a.size() > 3 ? a[3] : Value::intg(0);
+            self->props["bytesTotal"] = a.size() > 4 ? a[4] : Value::intg(0);
+            return Value::undefined();
+        };
+        for (const char* n : {"bytesLoaded", "bytesTotal"}) {
+            Member g; g.kind = Member::Getter; g.name = n;
+            g.native = [n](std::shared_ptr<Object> self, const std::vector<Value>&) -> Value {
+                if (!self) return Value::intg(0);
+                auto p = self->props.find(n);
+                return p == self->props.end() ? Value::intg(0) : p->second;
+            };
+            c->classDef->instanceMembers.push_back(g);
+        }
+        struct { const char* name; const char* val; } consts[] = {
+            {"PROGRESS", "progress"}, {"SOCKET_DATA", "socketData"},
+            {"STANDARD_ERROR", "standardError"}, {"STANDARD_WARNING", "standardWarning"},
+        };
+        for (const auto& k : consts) {
+            Member en; en.kind = Member::Method; en.name = k.name; en.isStatic = true;
+            en.defaultValue = Value::str(k.val);
+            c->classDef->staticMembers.push_back(en);
+        }
+    }
+
     // ---- 其余常用类（Shape / Bitmap / BitmapData / Loader / LoaderInfo / Sound /
     //      SoundChannel / URLLoader / XML / RegExp / ByteArray / Vector / Dictionary /
     //      SharedObject / Error / MouseEvent / KeyboardEvent ----
@@ -4733,16 +4767,57 @@ void Vm::registerNativeClasses() {
         }
         if (auto cd = classDefOf("Loader")) {
             globals_->props["flash.display.Loader"] = Value::object(classObj("Loader"));
+            // contentLoaderInfo 在构造时就存在（preloader 会先 addEventListener 再 load），
+            // 未开始加载时字节数为 0，只有 load() 之后才转为"本地整片加载"完成态。
             cd->ctor = [this](std::shared_ptr<Object> self, const std::vector<Value>&) -> Value {
-                if (self)
-                    self->props["contentLoaderInfo"] =
-                        Value::object(newObject(ObjKind::Generic, "LoaderInfo"));
+                if (self) {
+                    auto info = newObject(ObjKind::Generic, "LoaderInfo");
+                    info->props["bytesLoaded"] = Value::intg(0);
+                    info->props["bytesTotal"] = Value::intg(0);
+                    info->props["url"] = Value::str("");
+                    self->props["contentLoaderInfo"] = Value::object(info);
+                }
                 return Value::undefined();
             };
             addMethod(cd, "load", [this](std::shared_ptr<Object> self,
-                                         const std::vector<Value>&) -> Value {
-                if (self)
-                    self->props["content"] = Value::object(newObject(ObjKind::Sprite, "Sprite"));
+                                         const std::vector<Value>& a) -> Value {
+                if (!self) return Value::undefined();
+                // contentLoaderInfo 必须是同一个对象：监听器挂在它上面，事件也从它派发。
+                std::shared_ptr<Object> info;
+                auto it = self->props.find("contentLoaderInfo");
+                if (it != self->props.end() && it->second.kind == VKind::Object && it->second.obj)
+                    info = it->second.obj;
+                else {
+                    info = newObject(ObjKind::Generic, "LoaderInfo");
+                    self->props["contentLoaderInfo"] = Value::object(info);
+                }
+                // 入参可以是 URLRequest 也可以是字符串；本地无外部 I/O，URL 只用于
+                // 记录与报错路径（相对路径按"加载失败但仍完成"处理）。
+                std::string url;
+                if (!a.empty()) {
+                    if (a[0].kind == VKind::Object && a[0].obj) {
+                        auto u = a[0].obj->props.find("url");
+                        if (u != a[0].obj->props.end()) url = u->second.toString();
+                    } else if (!a[0].isNullOrUndef()) {
+                        url = a[0].toString();
+                    }
+                }
+                auto content = newObject(ObjKind::Sprite, "Sprite");
+                self->props["content"] = Value::object(content);
+                info->props["content"] = Value::object(content);
+                info->props["url"] = Value::str(url.empty() ? std::string("file://local.swf") : url);
+                // 本地整片加载语义：一次 load() 即视作完整下载（bytesLoaded == bytesTotal），
+                // 事件由 tick() 的 fireLoaderEvents 在监听器就绪后惰性补发，因此
+                // "先 load 后 addEventListener" 的 preloader 也能收到 init/progress/complete。
+                info->props["bytesLoaded"] = Value::intg(100);
+                info->props["bytesTotal"] = Value::intg(100);
+                info->props["$loaderFired"] = Value::boolean(false);
+                bool known = false;
+                for (auto& e : loaderInfos_)
+                    if (e == info) { known = true; break; }
+                if (!known) loaderInfos_.push_back(info);
+                if (std::getenv("SWF_AS_DEBUG"))
+                    std::fprintf(stderr, "[as] Loader.load url=%s\n", url.c_str());
                 return Value::undefined(); });
             addMethod(cd, "unload", noop);
             addMethod(cd, "unloadAndStop", noop);
@@ -6834,6 +6909,51 @@ void Vm::fireLoaderEvents() {
     }
 }
 
+// 舞台归属事件：ADDED_TO_STAGE / REMOVED_FROM_STAGE。
+// 此前的实现只有 Event.ADDED_TO_STAGE 常量，从不派发这两个事件；而 preloader
+// （如 lib.Loading 把初始化挂在 addedToStage 上）注册了监听却永远收不到，
+// 整个加载流程停在 0%。这里按"每帧对比舞台可达性"惰性派发：对象进入舞台树后
+// 补发 addedToStage，离开后补发 removedFromStage。惰性派发同时覆盖"构造函数里
+// 先注册监听、稍后才被挂到显示列表"的真实时序。
+void Vm::fireStageEvents() {
+    auto evC = globals_->props.find("Event");
+    if (evC == globals_->props.end() || evC->second.kind != VKind::Object || !evC->second.obj)
+        return;
+    // 舞台根自身不派发 addedToStage（Flash 语义），故只从根的子树开始收集。
+    std::unordered_set<const DisplayObject*> onStage;
+    std::vector<std::shared_ptr<DisplayObject>> stack;
+    for (auto& root : stage) {
+        if (!root) continue;
+        for (auto& c : root->children)
+            if (c) stack.push_back(c);
+    }
+    while (!stack.empty()) {
+        auto d = stack.back();
+        stack.pop_back();
+        if (!d || !onStage.insert(d.get()).second) continue;
+        for (auto& c : d->children)
+            if (c) stack.push_back(c);
+    }
+    const bool dbg = std::getenv("SWF_AS_DEBUG") != nullptr;
+    std::vector<std::shared_ptr<Object>> snap = objects_;
+    for (auto& o : snap) {
+        if (!o || !o->display) continue;
+        auto f = o->props.find("$onStage");
+        const bool was = f != o->props.end() && f->second.toBool();
+        const bool is = onStage.count(o->display.get()) != 0;
+        if (was == is) continue;
+        o->props["$onStage"] = Value::boolean(is);
+        const char* type = is ? "addedToStage" : "removedFromStage";
+        auto lit = o->listeners.find(type);
+        if (lit == o->listeners.end() || lit->second.empty()) continue;
+        if (dbg)
+            std::fprintf(stderr, "[evt] %s -> %s (listeners=%zu)\n",
+                         type, o->className.c_str(), lit->second.size());
+        callMethod(o, "dispatchEvent",
+                   {constructObject(evC->second, {Value::str(type)})});
+    }
+}
+
 void Vm::tick() {
     const bool dbg = std::getenv("SWF_AS_DEBUG") != nullptr;
     if (dbg) std::fprintf(stderr, "[as] tick begin stage=%zu objects=%zu\n", stage.size(), objects_.size());
@@ -6914,6 +7034,9 @@ void Vm::tick() {
     phAccum("timeline", phT); phT = nowMs();
     for (auto& d : stage) runFrameScripts(d);
     phAccum("frameScripts", phT); phT = nowMs();
+    // 显示树结构已就位（时间轴 + 帧脚本），补发舞台归属事件。
+    fireStageEvents();
+    phAccum("stageEvents", phT); phT = nowMs();
     // 拖动位置的应用时机必须是时间轴更新之后：applyTimelineFrame 每帧会把子实例的
     // x/y 重置回时间轴矩阵值，若拖动位置只在鼠标事件时更新，播放中的被拖对象会
     // 逐帧在“时间轴位置”和“鼠标位置”之间来回跳（表现为乱晃）。
