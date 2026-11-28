@@ -703,10 +703,16 @@ inline void registerFvmOps() {
                 static int ec3 = 0;
                 if (ec3++ < 12) std::fprintf(stderr, "[ease-call-ret] %s\n", r.toString().c_str());
             }
-            if(mname=="addChild"&&objv.obj->display&&!objv.obj->display->parent){
+            // stage.addChild(x)：真正挂到舞台上的对象才是舞台根。此前只要接收者
+            // 自身没有 parent 就把它当成根塞进 stage，导致大量"创建了但从未加入
+            // 显示列表"的孤立剪辑（组件、语言下拉框、门户皮肤）被当成舞台根渲染，
+            // 叠在画面上层（swf3 的 DEFAULT 输入框、swf4 的标题闪隐、swf5 的水印）。
+            if(mname=="addChild"&&objv.obj->kind==ObjKind::Stage&&!cargs.empty()&&
+               cargs[0].kind==VKind::Object&&cargs[0].obj&&cargs[0].obj->display){
+                auto d=cargs[0].obj->display;
                 bool dup=false;
-                for(auto& s:c.vm.stage) if(s.get()==objv.obj->display.get()){dup=true;break;}
-                if(!dup) c.vm.stage.push_back(objv.obj->display);
+                for(auto& s:c.vm.stage) if(s.get()==d.get()){dup=true;break;}
+                if(!dup) c.vm.stage.push_back(d);
             }
             c.push(r);
         } else if(objv.kind==VKind::String) c.push(c.vm.callMethod(c.vm.boxString(objv),mname,cargs));
@@ -792,10 +798,12 @@ inline void registerFvmOps() {
         }
         if(objv.kind==VKind::Object&&objv.obj){
             c.vm.callMethod(objv.obj,mname,cargs);
-            if(mname=="addChild"&&objv.obj->display&&!objv.obj->display->parent){
+            if(mname=="addChild"&&objv.obj->kind==ObjKind::Stage&&!cargs.empty()&&
+               cargs[0].kind==VKind::Object&&cargs[0].obj&&cargs[0].obj->display){
+                auto d=cargs[0].obj->display;
                 bool dup=false;
-                for(auto& s:c.vm.stage) if(s.get()==objv.obj->display.get()){dup=true;break;}
-                if(!dup) c.vm.stage.push_back(objv.obj->display);
+                for(auto& s:c.vm.stage) if(s.get()==d.get()){dup=true;break;}
+                if(!dup) c.vm.stage.push_back(d);
             }
         } else if(objv.kind==VKind::String) c.vm.callMethod(c.vm.boxString(objv),mname,cargs);
         else if(std::getenv("SWF_AS_DEBUG"))
@@ -868,6 +876,14 @@ inline void registerFvmOps() {
         for(auto it=c.scope.rbegin();it!=c.scope.rend();++it)
             if(declaresProperty(*it,name)){hitObj=*it;found=c.vm.getProperty(*it,name);break;}
         if(found.isUndefined()) found=c.vm.getProperty(c.vm.globalsObj(),name);
+        // 部分编译器（本样本即是）把实例成员和不带 this 的显示属性（parent/root/
+        // stage/loaderInfo 及类的 public 字段）编成 getlex。AVM2 方法的作用域
+        // 里含有 this，因此这里在作用域/全局都落空时回退到 thisObj 的属性。
+        if(found.isUndefined() && c.thisObj) {
+            Value tv = c.vm.getProperty(c.thisObj, name);
+            if(!tv.isUndefined()) found = tv;
+        }
+
         // 同名变量在作用域链里可能有多个持有者，findproperty 与 getlex 各取各的就会
         // 出现"写得进、读不出"（gs.TweenMax 的 timingSprite 正因此丢失，ticker 永不
         // 注册，换装悬停无动画）。SWF_SCOPE_DBG 下打印命中对象与链上全部候选
@@ -2483,6 +2499,13 @@ std::shared_ptr<Object> Vm::newObject(ObjKind kind, const std::string& cls) {
     auto o = std::make_shared<Object>();
     o->kind = kind;
     o->className = cls;
+    // LoaderInfo 实例必须挂在原生 LoaderInfo 类链上（继承 EventDispatcher），
+    // 否则 addEventListener/dispatchEvent 找不到，preloader 收不到 progress/complete。
+    if (cls == "LoaderInfo") {
+        auto p = globals_->props.find("LoaderInfo");
+        if (p != globals_->props.end() && p->second.kind == VKind::Object && p->second.obj)
+            o->cls = p->second.obj->classDef;
+    }
     if (kind == ObjKind::DisplayObject || kind == ObjKind::DisplayObjectContainer ||
         kind == ObjKind::InteractiveObject || kind == ObjKind::Sprite || kind == ObjKind::MovieClip ||
         kind == ObjKind::Stage || kind == ObjKind::TextField || kind == ObjKind::Bitmap ||
@@ -4015,6 +4038,92 @@ void Vm::registerNativeClasses() {
             return Value::str(s.substr(i0, i1 - i0));
         };
         c->classDef->instanceMembers.push_back(sub);
+        // AS3 String.substr(start, len)：start 为负时从末尾计，len 省略到串尾。
+        // 本样本的语言选择框用 `name.substr(2)` 取语言代码（l_de → de），缺这个方法
+        // 时整条本地化链路都被判成 'undefined' language not found。
+        Member sb; sb.kind = Member::Method; sb.name = "substr";
+        sb.native = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
+            auto p = self->props.find("$str");
+            std::string s = (p != self->props.end()) ? p->second.s : std::string();
+            int n = static_cast<int>(s.size());
+            int i0 = a.size() > 0 ? a[0].toInt() : 0;
+            if (i0 < 0) i0 = std::max(0, n + i0);
+            if (i0 > n) return Value::str("");
+            int len = a.size() > 1 ? a[1].toInt() : n - i0;
+            if (len <= 0) return Value::str("");
+            return Value::str(s.substr(i0, std::min(len, n - i0)));
+        };
+        c->classDef->instanceMembers.push_back(sb);
+        Member sl; sl.kind = Member::Method; sl.name = "slice";
+        sl.native = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
+            auto p = self->props.find("$str");
+            std::string s = (p != self->props.end()) ? p->second.s : std::string();
+            int n = static_cast<int>(s.size());
+            int i0 = a.size() > 0 ? a[0].toInt() : 0;
+            int i1 = a.size() > 1 ? a[1].toInt() : n;
+            if (i0 < 0) i0 += n;
+            if (i1 < 0) i1 += n;
+            i0 = std::max(0, std::min(i0, n));
+            i1 = std::max(0, std::min(i1, n));
+            if (i0 >= i1) return Value::str("");
+            return Value::str(s.substr(i0, i1 - i0));
+        };
+        c->classDef->instanceMembers.push_back(sl);
+        Member cca; cca.kind = Member::Method; cca.name = "charCodeAt";
+        cca.native = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
+            auto p = self->props.find("$str");
+            std::string s = (p != self->props.end()) ? p->second.s : std::string();
+            int i = a.empty() ? 0 : a[0].toInt();
+            if (i < 0 || i >= static_cast<int>(s.size())) return Value::num(std::nan(""));
+            return Value::intg(static_cast<unsigned char>(s[static_cast<std::size_t>(i)]));
+        };
+        c->classDef->instanceMembers.push_back(cca);
+        Member lio; lio.kind = Member::Method; lio.name = "lastIndexOf";
+        lio.native = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
+            auto p = self->props.find("$str");
+            std::string s = (p != self->props.end()) ? p->second.s : std::string();
+            if (a.empty()) return Value::intg(-1);
+            std::string pat = a[0].toString();
+            std::size_t from = (a.size() > 1 && a[1].toNumber() == a[1].toNumber())
+                                   ? static_cast<std::size_t>(std::max(0, a[1].toInt()))
+                                   : std::string::npos;
+            auto pos = s.rfind(pat, from);
+            return Value::intg(pos == std::string::npos ? -1 : static_cast<int32_t>(pos));
+        };
+        c->classDef->instanceMembers.push_back(lio);
+        Member spl; spl.kind = Member::Method; spl.name = "split";
+        spl.native = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
+            auto p = self->props.find("$str");
+            std::string s = (p != self->props.end()) ? p->second.s : std::string();
+            auto arr = std::make_shared<Object>();
+            arr->kind = ObjKind::Array;
+            arr->className = "Array";
+            std::vector<std::string> parts;
+            if (a.empty() || a[0].kind == VKind::Undefined) {
+                parts.push_back(s);
+            } else {
+                std::string sep = a[0].toString();
+                if (sep.empty()) {
+                    for (char ch : s) parts.push_back(std::string(1, ch));
+                } else {
+                    std::size_t start = 0;
+                    for (;;) {
+                        auto pos = s.find(sep, start);
+                        if (pos == std::string::npos) { parts.push_back(s.substr(start)); break; }
+                        parts.push_back(s.substr(start, pos - start));
+                        start = pos + sep.size();
+                    }
+                }
+            }
+            int limit = a.size() > 1 ? a[1].toInt() : -1;
+            if (limit >= 0 && static_cast<int>(parts.size()) > limit)
+                parts.resize(static_cast<std::size_t>(limit));
+            for (std::size_t i = 0; i < parts.size(); ++i)
+                arr->props[std::to_string(i)] = Value::str(parts[i]);
+            arr->props["$length"] = Value::intg(static_cast<int32_t>(parts.size()));
+            return Value::object(arr);
+        };
+        c->classDef->instanceMembers.push_back(spl);
         Member io; io.kind = Member::Method; io.name = "indexOf";
         io.native = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
             auto p = self->props.find("$str");
@@ -5955,7 +6064,7 @@ void Vm::registerFlashApi() {
     // ---- DisplayObject / Sprite / MovieClip（显示列表操作）----
     auto addDisplayMembers = [this](std::shared_ptr<ClassDef> cd, ObjKind k) {
         Member addChild; addChild.kind = Member::Method; addChild.name = "addChild";
-        addChild.native = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
+        addChild.native = [this](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
             if (std::getenv("SWF_AS_DEBUG"))
                 std::fprintf(stderr, "[as] addChild ENTER self=%s disp=%d argc=%zu child=%s childDisp=%d\n",
                              self ? self->className.c_str() : "-", (int)(self && self->display), a.size(),
@@ -5967,6 +6076,11 @@ void Vm::registerFlashApi() {
             child->parent = self->display;
             child->depth = -1;   // 脚本添加的对象没有 SWF PlaceObject depth
             self->display->children.push_back(child);
+            // Flash 语义：影片剪辑一进入显示列表（构造后 addChild）就已经持有其时间轴
+            // 第 1 帧的子实例。此前一律拖到下一帧才构建，构造函数里紧接着的
+            // `popup.l_br` 这类具名子实例访问全部拿到 undefined（语言选择框 19 个
+            // 国旗按钮被判为 "not a MovieClip"）。
+            if (!child->timelineBuilt) applyTimelineFrame(child, child->currentFrame);
             if (std::getenv("SWF_AS_DEBUG"))
                 std::fprintf(stderr, "[as] addChild parent=%s child=%s name='%s'\n",
                              self->className.c_str(), a[0].obj->className.c_str(), child->name.c_str());
@@ -5977,12 +6091,21 @@ void Vm::registerFlashApi() {
         removeChild.native = [](std::shared_ptr<Object> self, const std::vector<Value>& a) -> Value {
             if (!self || !self->display || a.empty() || !a[0].obj || !a[0].obj->display) return Value::undefined();
             auto& ch = self->display->children;
+            bool removed = false;
             for (auto it = ch.begin(); it != ch.end(); ++it)
                 if (it->get() == a[0].obj->display.get()) {
                     ch.erase(it);
                     a[0].obj->display->parent.reset();   // Flash：移除后 parent 变为 null
+                    removed = true;
                     break;
                 }
+            if (std::getenv("SWF_AS_DEBUG"))
+                std::fprintf(stderr, "[as] removeChild self=%s cid=%u child=%s cid=%u found=%d\n",
+                             self->className.c_str(),
+                             (unsigned)(self->display ? self->display->characterId : 0),
+                             a[0].obj->className.c_str(),
+                             (unsigned)(a[0].obj->display ? a[0].obj->display->characterId : 0),
+                             (int)removed);
             return a[0];
         };
         cd->instanceMembers.push_back(removeChild);
@@ -6305,6 +6428,16 @@ void Vm::registerFlashApi() {
         if (p != globals_->props.end() && p->second.kind == VKind::Object && p->second.obj)
             cd->superClass = p->second.obj->classDef;
     };
+    // LoaderInfo / Loader / URLLoader / Sound / NetStream 等在 AS3 中都继承
+    // EventDispatcher。此前它们只是无基类的空壳类，loaderInfo.addEventListener(...)
+    // 会静默失败：preloader 收不到 ProgressEvent/COMPLETE，进度条永远停在 0%。
+    for (const char* evtSub : {"LoaderInfo", "Loader", "URLLoader", "Sound",
+                               "SoundChannel", "NetConnection", "NetStream",
+                               "SharedObject"}) {
+        auto p = globals_->props.find(evtSub);
+        if (p != globals_->props.end() && p->second.kind == VKind::Object && p->second.obj)
+            inheritNative(p->second.obj->classDef, "EventDispatcher");
+    }
     {
         auto c = mkClass("DisplayObject", ObjKind::DisplayObject);
         inheritNative(c->classDef, "EventDispatcher");
